@@ -15,9 +15,10 @@ from typing import Any, cast
 
 import pytest
 
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.interface.tui import runtime as go_tui
 from strix.interface.tui import sidecar
+from strix.interface.tui.backend.protocol import PROTOCOL_CAPABILITIES, PROTOCOL_VERSION
 from strix.interface.tui.runtime import GoTuiRuntime
 from strix.report.state import ReportState
 
@@ -30,6 +31,7 @@ def args() -> argparse.Namespace:
         scan_mode="deep",
         max_budget_usd=None,
         max_turns=DEFAULT_MAX_TURNS,
+        max_agents=DEFAULT_MAX_AGENTS,
         scope_mode="auto",
         diff_base=None,
         local_sources=[],
@@ -245,16 +247,9 @@ async def test_runtime_does_not_initialize_or_scan_before_ready(
         await _send_message(
             child,
             {
-                "version": 3,
+                "version": PROTOCOL_VERSION,
                 "type": "ready",
-                "payload": {
-                    "capabilities": [
-                        "state-revisions",
-                        "collection-deltas",
-                        "structured-command-errors",
-                        "agents-collection",
-                    ]
-                },
+                "payload": {"capabilities": list(PROTOCOL_CAPABILITIES)},
             },
         )
         await asyncio.wait_for(run_task, timeout=2)
@@ -852,6 +847,7 @@ async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
 async def test_scan_passes_max_turns_and_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime_args = args()
     runtime_args.max_turns = 37
+    runtime_args.max_agents = 5
     runtime_args.max_budget_usd = 4.25
     runtime = GoTuiRuntime(runtime_args)
     runtime.scan_config = {"run_name": "test-run"}
@@ -873,6 +869,7 @@ async def test_scan_passes_max_turns_and_budget(monkeypatch: pytest.MonkeyPatch)
     await runtime._run_scan()
 
     assert captured["max_turns"] == 37
+    assert captured["max_agents"] == 5
     assert captured["max_budget_usd"] == 4.25
     assert runtime.controller.scan_state == "stopped"
 
@@ -905,6 +902,45 @@ async def test_setup_preflight_failure_does_not_start_scan(
     assert runtime.model_verified is False
     assert started is False
     assert runtime.scan_task is None
+
+
+@pytest.mark.asyncio
+async def test_setup_rechecks_same_model_after_credential_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(args())
+    connection = {
+        "model": "openai/gpt-5.4",
+        "api_key": "new-key",
+        "api_base": "https://gateway.example/v1",
+    }
+    runtime.model_verified = True
+    runtime.verified_connection = (
+        connection["model"],
+        "old-key",
+        connection["api_base"],
+    )
+    checked: list[str] = []
+
+    monkeypatch.setattr(
+        go_tui,
+        "load_settings",
+        lambda: SimpleNamespace(llm=SimpleNamespace(**connection)),
+    )
+
+    async def preflight(model: str) -> None:
+        checked.append(model)
+
+    monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
+
+    await runtime.ensure_model_verified()
+
+    assert checked == ["openai/gpt-5.4"]
+    assert runtime.verified_connection == (
+        "openai/gpt-5.4",
+        "new-key",
+        "https://gateway.example/v1",
+    )
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,9 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+o":
 		return m, send(m.client, "viewer.open", map[string]any{})
 	case "tab":
+		if m.focus == focusInput && m.completeSlashCommand() {
+			return m, nil
+		}
 		m.cycleFocus(1)
 		return m, nil
 	case "shift+tab":
@@ -610,7 +613,26 @@ func clampCycle(value, length int) int {
 }
 
 func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.modal == modalHelp {
+	if m.modal == modalAPIKey {
+		switch key.String() {
+		case "esc":
+			m.closeModal()
+			return m, nil
+		case "enter":
+			value := strings.TrimSpace(m.apiKeyInput.Value())
+			if value == "" {
+				m.apiKeyError = "API key cannot be empty"
+				return m, nil
+			}
+			m.closeModal()
+			return m, send(m.client, "config.update", map[string]any{"api_key": value})
+		}
+		var cmd tea.Cmd
+		m.apiKeyInput, cmd = m.apiKeyInput.Update(key)
+		m.apiKeyError = ""
+		return m, cmd
+	}
+	if m.modal == modalHelp || m.modal == modalConfig || m.modal == modalWorkspaceSearch {
 		if key.String() != "" {
 			m.closeModal()
 		}
@@ -690,6 +712,11 @@ func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) openModal(mode modalMode) {
 	m.modal = mode
 	m.input.Blur()
+	if mode == modalAPIKey {
+		m.apiKeyInput.SetValue("")
+		m.apiKeyError = ""
+		m.apiKeyInput.Focus()
+	}
 	if mode == modalConfirmMount {
 		// A consent prompt defaults to declining.
 		m.modalChoice = 1
@@ -705,6 +732,11 @@ func (m *Model) openModal(mode modalMode) {
 }
 
 func (m *Model) closeModal() {
+	if m.modal == modalAPIKey {
+		m.apiKeyInput.SetValue("")
+		m.apiKeyInput.Blur()
+		m.apiKeyError = ""
+	}
 	m.modal = modalNone
 	if m.focus == focusInput {
 		m.input.Focus()

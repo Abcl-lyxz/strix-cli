@@ -113,6 +113,44 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			_ = json.Unmarshal(result.Result, &data)
 			m.snapshot.ViewerStatus = data.Status
 			m.snapshot.ViewerURL = data.URL
+		case "config.update":
+			if m.snapshot.SetupMode {
+				m.setupMsg("Configuration saved", render.Col(green))
+			}
+		case "setup.configure":
+			if m.snapshot.SetupMode {
+				m.setupMsg("Scan settings updated", render.Col(green))
+			}
+		case "setup.add_target":
+			if m.snapshot.SetupMode {
+				m.setupMsg("Target added", render.Col(green))
+			}
+		case "setup.remove_target", "setup.clear_targets":
+			if m.snapshot.SetupMode {
+				m.setupMsg("Targets updated", render.Col(green))
+			}
+		case "setup.set_instruction":
+			if m.snapshot.SetupMode {
+				m.setupMsg("Instruction updated", render.Col(green))
+			}
+		case "workspace.find":
+			var data struct {
+				Query      string                 `json:"query"`
+				Root       string                 `json:"root"`
+				MatchCount int                    `json:"match_count"`
+				Truncated  bool                   `json:"truncated"`
+				Matches    []workspaceSearchMatch `json:"matches"`
+			}
+			if err := json.Unmarshal(result.Result, &data); err != nil {
+				m.errorText = err.Error()
+				return nil
+			}
+			m.searchQuery = data.Query
+			m.searchRoot = data.Root
+			m.searchMatchCount = data.MatchCount
+			m.searchTruncated = data.Truncated
+			m.searchMatches = data.Matches
+			m.openModal(modalWorkspaceSearch)
 		}
 	}
 	return nil

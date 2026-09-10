@@ -33,6 +33,8 @@ Target-specific workflows built on the same engine:
   strix -n -t ./ --scan-mode quick --max-budget 10  # headless scan; always use -n
   ```
   - Requires Docker running. Scans take minutes (`quick`) to hours (`deep`) — run in the background.
+  - Diagnose installation, Docker/VPN/proxy routing, model setup, and container HTTPS with `strix doctor --network`.
+  - Bound agent expansion with `--max-agents N` (default `12`, including the root); completed/stopped agents free slots.
   - Exit codes (headless): `0` clean, `1` fatal error, `2` vulnerabilities found. A `0` only covers what was analyzed — check `run.json` (`status`, `llm_usage.cost` vs the budget) before calling a run clean.
   - Artifacts in `strix_runs/<run-name>/`: `penetration_test_report.md`, `vulnerabilities/*.md`, `vulnerabilities.json`, `findings.sarif` (SARIF 2.1.0), `run.json`.
 

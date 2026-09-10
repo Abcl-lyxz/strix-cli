@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
+import os
 import webbrowser
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
-from strix.config import load_settings
+from strix.config import load_settings, persist_overrides
 from strix.config.models import is_recommended_or_frontier_model
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.interface.tui.backend.live_view import TuiLiveView
 from strix.interface.tui.backend.projection import (
     MAX_TERMINAL_EVENTS,
@@ -25,6 +27,7 @@ from strix.interface.tui.backend.projection import (
     terminal_projection,
 )
 from strix.interface.utils import is_subscription_run
+from strix.tools.workspace_search import search_local_workspace
 
 
 if TYPE_CHECKING:
@@ -34,6 +37,20 @@ if TYPE_CHECKING:
 
 
 _STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused"})
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+_LLM_ENV_ALIASES = frozenset(
+    {
+        "STRIX_LLM",
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "LLM_API_BASE",
+        "OPENAI_API_BASE",
+        "OPENAI_BASE_URL",
+        "LITELLM_BASE_URL",
+        "OLLAMA_API_BASE",
+        "STRIX_REASONING_EFFORT",
+    }
+)
 
 ChangeCallback = Callable[[], None]
 StartCallback = Callable[[], Awaitable[None]]
@@ -88,6 +105,12 @@ class TuiController:
             raw_turns
             if isinstance(raw_turns, int) and not isinstance(raw_turns, bool) and raw_turns > 0
             else DEFAULT_MAX_TURNS
+        )
+        raw_agents = getattr(args, "max_agents", DEFAULT_MAX_AGENTS)
+        self.max_agents = (
+            raw_agents
+            if isinstance(raw_agents, int) and not isinstance(raw_agents, bool) and raw_agents >= 2
+            else DEFAULT_MAX_AGENTS
         )
         requested_scope = str(args.scope_mode)
         self.scope_mode = requested_scope if requested_scope in SCOPE_MODES else "auto"
@@ -181,8 +204,27 @@ class TuiController:
     def snapshot(self) -> dict[str, Any]:
         """Return small mutable state; histories are streamed as collections."""
         model = ""
+        api_key_configured = False
+        api_base = ""
+        reasoning_effort = "high"
+        telemetry_enabled = True
+        streaming_enabled = True
+        prompt_cache = True
+        llm_timeout = 300
+        max_tool_calls_per_turn = 32
+        max_context_images = 3
         with contextlib.suppress(Exception):
-            model = (load_settings().llm.model or "").strip()
+            settings = load_settings()
+            model = (settings.llm.model or "").strip()
+            api_key_configured = bool((settings.llm.api_key or "").strip())
+            api_base = _display_api_base((settings.llm.api_base or "").strip())
+            reasoning_effort = settings.llm.reasoning_effort
+            telemetry_enabled = settings.telemetry.enabled
+            streaming_enabled = not settings.llm.disable_streaming
+            prompt_cache = settings.llm.prompt_cache
+            llm_timeout = settings.llm.timeout
+            max_tool_calls_per_turn = settings.llm.max_tool_calls_per_turn
+            max_context_images = settings.runtime.max_context_images
         usage: dict[str, Any] = {}
         if self.report_state is not None:
             usage = dict(self.report_state.get_total_llm_usage())
@@ -208,10 +250,23 @@ class TuiController:
             "scan_mode": self.scan_mode,
             "max_budget_usd": self.max_budget_usd,
             "max_turns": self.max_turns,
+            "max_agents": self.max_agents,
             "scope_mode": self.scope_mode,
             "diff_base": terminal_projection(self.diff_base, max_string=256),
             "model": terminal_projection(model, max_string=256),
             "model_warning": terminal_projection(model_warning, max_string=512),
+            # Credentials are write-only over the TUI protocol.  A snapshot
+            # reveals presence, never the key itself.
+            "api_key_configured": api_key_configured,
+            "api_base": terminal_projection(api_base, max_string=512),
+            "reasoning_effort": reasoning_effort,
+            "telemetry_enabled": telemetry_enabled,
+            "streaming_enabled": streaming_enabled,
+            "prompt_cache": prompt_cache,
+            "llm_timeout": llm_timeout,
+            "max_tool_calls_per_turn": max_tool_calls_per_turn,
+            "max_context_images": max_context_images,
+            "config_env_override": any(alias in os.environ for alias in _LLM_ENV_ALIASES),
             "caido_url": terminal_projection(
                 getattr(self.report_state, "caido_url", None), max_string=1024
             ),
@@ -297,11 +352,16 @@ class TuiController:
     async def handle(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         handlers = {
             "setup.add_target": self._add_target,
+            "setup.remove_target": self._remove_target,
+            "setup.clear_targets": self._clear_targets,
             "setup.set_instruction": self._set_instruction,
+            "setup.configure": self._configure_setup,
             "setup.start": self._start,
             "setup.confirm_mount": self._confirm_mount,
+            "config.update": self._update_config,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
+            "workspace.find": self._find_workspace,
             "viewer.open": self._open_viewer,
             "app.quit": self._quit,
         }
@@ -319,6 +379,21 @@ class TuiController:
             self.targets.append(target)
         return {"target": target, "total": len(self.targets)}
 
+    async def _remove_target(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_setup_mutable()
+        target = self._required_string(payload, "target")
+        try:
+            self.targets.remove(target)
+        except ValueError as exc:
+            raise ValueError(f"Unknown target: {target}") from exc
+        return {"target": target, "total": len(self.targets)}
+
+    async def _clear_targets(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_setup_mutable()
+        removed = len(self.targets)
+        self.targets.clear()
+        return {"removed": removed, "total": 0}
+
     async def _set_instruction(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._require_setup_mutable()
         instruction = payload.get("instruction", "")
@@ -326,6 +401,163 @@ class TuiController:
             raise TypeError("instruction must be a string")
         self.instruction = instruction.strip()
         return {"instruction": self.instruction}
+
+    async def _configure_setup(  # noqa: PLR0912 - one atomic multi-field command
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update one or more scan controls while the launch screen is active."""
+        self._require_setup_mutable()
+        supported = {
+            "scan_mode",
+            "max_budget_usd",
+            "max_turns",
+            "max_agents",
+            "scope_mode",
+            "diff_base",
+        }
+        unknown = set(payload) - supported
+        if unknown:
+            raise ValueError(f"Unknown scan setting: {sorted(unknown)[0]}")
+        if not payload:
+            raise ValueError("No scan setting supplied")
+
+        if "scan_mode" in payload:
+            value = payload["scan_mode"]
+            if not isinstance(value, str) or value not in SCAN_MODES:
+                raise ValueError(f"scan_mode must be one of: {', '.join(SCAN_MODES)}")
+            self.scan_mode = value
+        if "max_budget_usd" in payload:
+            value = payload["max_budget_usd"]
+            if value is None:
+                self.max_budget_usd = None
+            elif (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ValueError("max_budget_usd must be a positive number or null")
+            else:
+                self.max_budget_usd = float(value)
+        if "max_turns" in payload:
+            self.max_turns = self._positive_int(payload["max_turns"], "max_turns")
+        if "max_agents" in payload:
+            value = self._positive_int(payload["max_agents"], "max_agents")
+            if value < 2:
+                raise ValueError("max_agents must be at least 2")
+            self.max_agents = value
+        if "scope_mode" in payload:
+            value = payload["scope_mode"]
+            if not isinstance(value, str) or value not in SCOPE_MODES:
+                raise ValueError(f"scope_mode must be one of: {', '.join(SCOPE_MODES)}")
+            self.scope_mode = value
+        if "diff_base" in payload:
+            value = payload["diff_base"]
+            if value is not None and not isinstance(value, str):
+                raise TypeError("diff_base must be a string or null")
+            self.diff_base = value.strip() if isinstance(value, str) and value.strip() else None
+
+        return {
+            "scan_mode": self.scan_mode,
+            "max_budget_usd": self.max_budget_usd,
+            "max_turns": self.max_turns,
+            "max_agents": self.max_agents,
+            "scope_mode": self.scope_mode,
+            "diff_base": self.diff_base,
+        }
+
+    async def _update_config(  # noqa: PLR0912 - validates one bounded config schema
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Validate and persist user configuration from the launch TUI."""
+        self._require_setup_mutable()
+        supported = {
+            "model",
+            "api_key",
+            "api_base",
+            "reasoning_effort",
+            "telemetry_enabled",
+            "streaming_enabled",
+            "prompt_cache",
+            "llm_timeout",
+            "max_tool_calls_per_turn",
+            "max_context_images",
+        }
+        unknown = set(payload) - supported
+        if unknown:
+            raise ValueError(f"Unknown configuration setting: {sorted(unknown)[0]}")
+        if not payload:
+            raise ValueError("No configuration setting supplied")
+
+        updates: dict[str, Any] = {}
+        if "model" in payload:
+            updates["STRIX_LLM"] = self._optional_bounded_string(
+                payload["model"], "model", maximum=512
+            )
+        if "api_key" in payload:
+            api_key = self._optional_bounded_string(
+                payload["api_key"], "api_key", maximum=32 * 1024
+            )
+            if api_key is not None and ("\r" in api_key or "\n" in api_key):
+                raise ValueError("api_key must be a single line")
+            updates["LLM_API_KEY"] = api_key
+        if "api_base" in payload:
+            api_base = self._optional_bounded_string(
+                payload["api_base"], "api_base", maximum=2 * 1024
+            )
+            if api_base is not None:
+                parsed = urlparse(api_base)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError("api_base must be an http:// or https:// URL")
+                if parsed.username is not None or parsed.password is not None:
+                    raise ValueError("api_base must not contain credentials; use /apikey instead")
+            updates["LLM_API_BASE"] = api_base
+        if "reasoning_effort" in payload:
+            value = payload["reasoning_effort"]
+            if not isinstance(value, str) or value not in _REASONING_EFFORTS:
+                raise ValueError(
+                    "reasoning_effort must be one of: " + ", ".join(sorted(_REASONING_EFFORTS))
+                )
+            updates["STRIX_REASONING_EFFORT"] = value
+        for field, alias in (
+            ("telemetry_enabled", "STRIX_TELEMETRY"),
+            ("prompt_cache", "STRIX_PROMPT_CACHE"),
+        ):
+            if field in payload:
+                value = payload[field]
+                if not isinstance(value, bool):
+                    raise TypeError(f"{field} must be a boolean")
+                updates[alias] = value
+        if "streaming_enabled" in payload:
+            value = payload["streaming_enabled"]
+            if not isinstance(value, bool):
+                raise TypeError("streaming_enabled must be a boolean")
+            updates["LLM_DISABLE_STREAMING"] = not value
+        for field, alias, allow_zero in (
+            ("llm_timeout", "LLM_TIMEOUT", False),
+            ("max_tool_calls_per_turn", "LLM_MAX_TOOL_CALLS_PER_TURN", True),
+            ("max_context_images", "STRIX_MAX_CONTEXT_IMAGES", True),
+        ):
+            if field in payload:
+                value = payload[field]
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < (0 if allow_zero else 1)
+                ):
+                    qualifier = "a non-negative integer" if allow_zero else "a positive integer"
+                    raise ValueError(f"{field} must be {qualifier}")
+                updates[alias] = value
+
+        persist_overrides(updates)
+        settings = load_settings()
+        return {
+            "saved": True,
+            "model": settings.llm.model or "",
+            "api_key_configured": bool(settings.llm.api_key),
+            "api_base": _display_api_base(settings.llm.api_base or ""),
+            "reasoning_effort": settings.llm.reasoning_effort,
+        }
 
     async def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.scan_started or self._start_in_progress:
@@ -337,7 +569,7 @@ class TuiController:
             raise TypeError("mount_working_dir must be a boolean")
         model = (load_settings().llm.model or "").strip()
         if not model:
-            raise ValueError("No model configured. Set STRIX_LLM first.")
+            raise ValueError("No model configured. Use /model provider/model in the TUI.")
         if self._on_start is None:
             raise RuntimeError("Scan start is unavailable")
         if not self.targets and not mount_working_dir:
@@ -448,6 +680,88 @@ class TuiController:
             raise RuntimeError(f"Agent '{agent_id}' is no longer active")
         return {"stopped": True}
 
+    def _workspace_roots(self) -> list[Path]:
+        """Return existing local roots in user-facing priority order."""
+        candidates: list[Any] = []
+        if self.workspace_mount:
+            candidates.append(self.workspace_mount)
+        candidates.extend(
+            source.get("source_path")
+            for source in getattr(self.args, "local_sources", None) or []
+            if isinstance(source, dict)
+        )
+        for target in getattr(self.args, "targets_info", None) or []:
+            if not isinstance(target, dict):
+                continue
+            details = target.get("details")
+            if isinstance(details, dict):
+                candidates.extend((details.get("cloned_repo_path"), details.get("target_path")))
+        # Targets entered on the setup screen have not gone through
+        # ``prepare_run`` yet, but a local path can still be searched directly.
+        candidates.extend(self.targets)
+
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, str | Path) or not str(candidate).strip():
+                continue
+            try:
+                path = Path(candidate).expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if not path.is_dir() or path in seen:
+                continue
+            seen.add(path)
+            roots.append(path)
+        if roots:
+            return roots
+        current = Path.cwd().resolve()
+        return [current] if current.is_dir() else []
+
+    async def _find_workspace(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run a literal workspace lookup without consuming an agent turn."""
+        query = self._required_string(payload, "query")
+        roots = self._workspace_roots()
+        if not roots:
+            raise RuntimeError("No local workspace is available to search")
+
+        limit = 50
+        matches: list[dict[str, Any]] = []
+        total = 0
+        truncated = False
+        searched: list[str] = []
+        multiple_roots = len(roots) > 1
+        for root in roots:
+            remaining = max(1, limit - len(matches))
+            result = await asyncio.to_thread(
+                search_local_workspace,
+                root,
+                query,
+                max_results=remaining,
+            )
+            searched.append(str(root))
+            total += int(result.get("match_count", 0) or 0)
+            truncated = truncated or bool(result.get("truncated"))
+            for match in result.get("matches", []):
+                if not isinstance(match, dict) or len(matches) >= limit:
+                    continue
+                projected = dict(match)
+                if multiple_roots:
+                    projected["path"] = f"{root.name}/{projected.get('path', '')}"
+                matches.append(projected)
+            if len(matches) >= limit:
+                truncated = True
+                break
+
+        return {
+            "query": query,
+            "root": searched[0] if len(searched) == 1 else f"{len(searched)} local roots",
+            "match_count": total,
+            "returned_count": len(matches),
+            "truncated": truncated or total > len(matches),
+            "matches": matches,
+        }
+
     async def _open_viewer(self, _payload: dict[str, Any]) -> dict[str, Any]:
         if self.viewer_url:
             with contextlib.suppress(Exception):
@@ -528,6 +842,41 @@ class TuiController:
             raise ValueError(f"{name} must be a non-empty string")
         return value.strip()
 
+    @staticmethod
+    def _positive_int(value: Any, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _optional_bounded_string(value: Any, name: str, *, maximum: int) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string or null")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(f"{name} must be non-empty or null")
+        if len(cleaned) > maximum:
+            raise ValueError(f"{name} is too long")
+        return cleaned
+
     def _require_setup_mutable(self) -> None:
         if not self.setup_mode or self.scan_started or self._start_in_progress:
             raise RuntimeError("Setup can no longer be changed after the scan starts")
+
+
+def _display_api_base(value: str) -> str:
+    """Project an API URL without query, fragment, or embedded credentials."""
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    with contextlib.suppress(ValueError):
+        if parsed.port is not None:
+            host += f":{parsed.port}"
+    return f"{parsed.scheme}://{host}{parsed.path}"

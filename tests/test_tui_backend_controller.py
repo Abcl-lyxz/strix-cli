@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 from strix.config import apply_config_override, loader
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.interface.tui.backend.controller import TuiController
 
 
@@ -30,6 +31,7 @@ def args() -> argparse.Namespace:
         scan_mode="deep",
         max_budget_usd=None,
         max_turns=DEFAULT_MAX_TURNS,
+        max_agents=DEFAULT_MAX_AGENTS,
         scope_mode="auto",
         diff_base=None,
         local_sources=[],
@@ -40,18 +42,29 @@ def args() -> argparse.Namespace:
 
 
 @pytest.fixture(autouse=True)
-def isolated_config(tmp_path: Path) -> None:
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
         "STRIX_LLM",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "LLM_API_KEY",
         "LLM_API_BASE",
+        "OPENAI_BASE_URL",
+        "LITELLM_BASE_URL",
+        "OLLAMA_API_BASE",
         "AZURE_API_KEY",
         "AZURE_API_BASE",
         "AZURE_API_VERSION",
+        "STRIX_REASONING_EFFORT",
+        "STRIX_TELEMETRY",
+        "LLM_DISABLE_STREAMING",
+        "STRIX_PROMPT_CACHE",
+        "LLM_TIMEOUT",
+        "LLM_MAX_TOOL_CALLS_PER_TURN",
+        "STRIX_MAX_CONTEXT_IMAGES",
     ):
-        os.environ.pop(key, None)
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key.lower(), raising=False)
     apply_config_override(tmp_path / "config.json")
 
 
@@ -67,8 +80,140 @@ async def test_setup_state_is_serializable() -> None:
     assert snapshot["scan_mode"] == "deep"
     assert snapshot["max_budget_usd"] is None
     assert snapshot["max_turns"] == 500
+    assert snapshot["max_agents"] == DEFAULT_MAX_AGENTS
     assert snapshot["scope_mode"] == "auto"
     assert snapshot["diff_base"] is None
+    assert snapshot["api_key_configured"] is False
+    assert snapshot["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+async def test_tui_find_searches_workspace_without_an_agent_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "module.py").write_text("value = 'ade'\n", encoding="utf-8")
+    coordinator = _SendingCoordinator()
+    controller = TuiController(args(), coordinator=coordinator)
+
+    result = await controller.handle("workspace.find", {"query": "ade"})
+
+    assert result["match_count"] == 1
+    assert result["matches"][0]["path"] == "module.py"
+    assert coordinator.messages == []
+
+
+@pytest.mark.asyncio
+async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> None:
+    controller = TuiController(args())
+
+    result = await controller.handle(
+        "config.update",
+        {
+            "model": "openrouter/openai/gpt-5.4",
+            "api_key": "sk-do-not-echo",
+            "api_base": "https://gateway.example/v1?token=also-hidden",
+            "reasoning_effort": "medium",
+        },
+    )
+
+    assert result == {
+        "saved": True,
+        "model": "openrouter/openai/gpt-5.4",
+        "api_key_configured": True,
+        "api_base": "https://gateway.example/v1",
+        "reasoning_effort": "medium",
+    }
+    assert "sk-do-not-echo" not in str(result)
+    snapshot = controller.snapshot()
+    assert snapshot["model"] == "openrouter/openai/gpt-5.4"
+    assert snapshot["api_key_configured"] is True
+    assert snapshot["api_base"] == "https://gateway.example/v1"
+    assert "sk-do-not-echo" not in str(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_tui_config_supports_runtime_model_controls() -> None:
+    controller = TuiController(args())
+
+    await controller.handle(
+        "config.update",
+        {
+            "telemetry_enabled": False,
+            "streaming_enabled": False,
+            "prompt_cache": False,
+            "llm_timeout": 45,
+            "max_tool_calls_per_turn": 11,
+            "max_context_images": 0,
+        },
+    )
+
+    snapshot = controller.snapshot()
+    assert snapshot["telemetry_enabled"] is False
+    assert snapshot["streaming_enabled"] is False
+    assert snapshot["prompt_cache"] is False
+    assert snapshot["llm_timeout"] == 45
+    assert snapshot["max_tool_calls_per_turn"] == 11
+    assert snapshot["max_context_images"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_config_rejects_credential_in_base_url() -> None:
+    controller = TuiController(args())
+
+    with pytest.raises(ValueError, match="must not contain credentials"):
+        await controller.handle("config.update", {"api_base": "https://secret@example.com/v1"})
+
+
+@pytest.mark.asyncio
+async def test_tui_config_rejects_multiline_api_keys() -> None:
+    controller = TuiController(args())
+
+    with pytest.raises(ValueError, match="single line"):
+        await controller.handle("config.update", {"api_key": "first\nsecond"})
+
+
+@pytest.mark.asyncio
+async def test_setup_configuration_updates_all_scan_controls() -> None:
+    controller = TuiController(args())
+
+    result = await controller.handle(
+        "setup.configure",
+        {
+            "scan_mode": "quick",
+            "max_budget_usd": 4.5,
+            "max_turns": 75,
+            "max_agents": 6,
+            "scope_mode": "diff",
+            "diff_base": "origin/main",
+        },
+    )
+
+    assert result == {
+        "scan_mode": "quick",
+        "max_budget_usd": 4.5,
+        "max_turns": 75,
+        "max_agents": 6,
+        "scope_mode": "diff",
+        "diff_base": "origin/main",
+    }
+    assert controller.snapshot()["max_agents"] == 6
+
+
+@pytest.mark.asyncio
+async def test_setup_targets_can_be_removed_or_cleared() -> None:
+    controller = TuiController(args())
+    await controller.handle("setup.add_target", {"target": "https://one.example"})
+    await controller.handle("setup.add_target", {"target": "https://two.example"})
+
+    removed = await controller.handle("setup.remove_target", {"target": "https://one.example"})
+    cleared = await controller.handle("setup.clear_targets", {})
+
+    assert removed["total"] == 1
+    assert cleared == {"removed": 1, "total": 0}
+    assert controller.snapshot()["targets"] == []
 
 
 @pytest.mark.asyncio

@@ -1,45 +1,39 @@
 <p align="center">
-  <a href="https://strix.ai/">
+  <a href="https://github.com/Abcl-lyxz/strix-cli">
     <img src="https://github.com/usestrix/.github/raw/main/imgs/cover.png" alt="Strix Banner" width="100%">
   </a>
 </p>
 
 <div align="center">
 
-# Strix
+# Strix CLI
 
-### The open-source AI pentesting tool. Autonomous AI hackers that find and fix your app’s vulnerabilities.
+### A cleaner, smarter, command-first edition of the open-source Strix AI pentesting agent.
 
 <br/>
 
-
-<a href="https://docs.strix.ai"><img src="https://img.shields.io/badge/Docs-docs.strix.ai-2b9246?style=for-the-badge&logo=gitbook&logoColor=white" alt="Docs"></a>
-<a href="https://strix.ai"><img src="https://img.shields.io/badge/Website-strix.ai-f0f0f0?style=for-the-badge&logoColor=000000" alt="Website"></a>
-[![](https://dcbadge.limes.pink/api/server/strix-ai)](https://discord.gg/strix-ai)
-
-<a href="https://app.strix.ai?utm_source=github&utm_medium=readme&utm_content=badge_cloud"><img src="https://img.shields.io/badge/Strix%20Cloud-app.strix.ai-2b9246?style=for-the-badge&logoColor=white" alt="Strix Cloud"></a>
-<a href="https://strix.ai/demo?utm_source=github&utm_medium=readme&utm_content=badge_demo"><img src="https://img.shields.io/badge/Try%20Strix%20Enterprise-555555?style=for-the-badge&logoColor=white" alt="Try Strix Enterprise"></a>
-
-<a href="https://deepwiki.com/usestrix/strix"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
-<a href="https://github.com/usestrix/strix"><img src="https://img.shields.io/github/stars/usestrix/strix?style=flat-square" alt="GitHub Stars"></a>
+<a href="https://github.com/usestrix/strix"><img src="https://img.shields.io/badge/Based_on-Strix-2b9246?style=flat-square" alt="Based on Strix"></a>
+<a href="https://github.com/Abcl-lyxz/strix-cli"><img src="https://img.shields.io/github/stars/Abcl-lyxz/strix-cli?style=flat-square" alt="GitHub Stars"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-3b82f6?style=flat-square" alt="License"></a>
-<a href="https://pypi.org/project/strix-agent/"><img src="https://img.shields.io/pypi/v/strix-agent?style=flat-square" alt="PyPI Version"></a>
-
-
-<a href="https://discord.gg/strix-ai"><img src="https://github.com/usestrix/.github/raw/main/imgs/Discord.png" height="40" alt="Join Discord"></a>
-<a href="https://x.com/strix_ai"><img src="https://github.com/usestrix/.github/raw/main/imgs/X.png" height="40" alt="Follow on X"></a>
-
-
-<a href="https://trendshift.io/repositories/15362?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-15362" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/15362/weekly" alt="usestrix%2Fstrix | Trendshift" width="250" height="55"/></a>
-<a href="https://trendshift.io/repositories/15362" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15362" alt="usestrix/strix | Trendshift" width="250" height="55"/></a>
 
 </div>
 
-
-> [!TIP]
-> **New!** Strix integrates seamlessly with GitHub Actions and CI/CD pipelines. Automatically scan for vulnerabilities on every pull request and block insecure code before it reaches production - [Get started with no setup required](https://app.strix.ai?utm_source=github&utm_medium=readme&utm_content=tip_ci).
+> [!IMPORTANT]
+> This is an independent enhanced edition based on the original
+> [usestrix/strix](https://github.com/usestrix/strix) project. It preserves the
+> Apache 2.0 license and upstream attribution while adding a more interactive,
+> streamlined workflow in my own style.
 
 ---
+
+## What This Edition Improves
+
+- **Full interactive TUI** with a command palette, setup controls, live agent navigation, and compact modals
+- **Safer configuration** with a masked `/apikey` popup and private persisted settings
+- **Smarter code navigation** through deterministic `/find` and agent-side bounded workspace search
+- **Lower context waste** by routing exact lookups through code search before loading whole files
+- **Stronger Windows support** with Docker Desktop discovery, WSL-aware diagnostics, and clearer startup checks
+- **Better run control** with configurable agent, turn, budget, scope, streaming, cache, and context limits
 
 
 ## Strix Overview
@@ -75,25 +69,45 @@ Strix are autonomous AI penetration testing agents that act just like real hacke
 ## 🚀 Quick Start
 
 **Prerequisites:**
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- Go 1.24+ (the editable install builds the TUI)
 - Docker (running)
 - An LLM API key from any [supported provider](https://docs.strix.ai/llm-providers/overview) (OpenAI, Anthropic, Google, etc.)
 
 ### Installation & First Scan
 
 ```bash
-# Install Strix
-curl -sSL https://strix.ai/install | bash
+# Clone this enhanced edition
+git clone https://github.com/Abcl-lyxz/strix-cli.git
+cd strix-cli
 
-# Configure your AI provider
-export STRIX_LLM="openrouter/z-ai/glm-5.3"
-export LLM_API_KEY="your-api-key"
+# Install it as an editable user-level command
+uv tool install --editable . --force
 
-# Run your first security assessment
-strix --target ./app-directory
+# Open the interactive setup (no environment variables required)
+strix
+
+# In the TUI:
+# /model openrouter/z-ai/glm-5.3
+# /apikey  (enter the key in the secure popup)
+# /target ./app-directory
+# /start
 ```
 
 > [!NOTE]
 > First run automatically pulls the sandbox Docker image. Results are saved to `strix_runs/<run-name>`
+
+Type `/` in the TUI for a searchable command palette. Model credentials are saved in the private
+`~/.strix/cli-config.json` file; the API key is masked and never returned to the UI. Environment
+variables remain supported for headless and CI runs.
+
+Use `/find <text>` for a fast, bounded repository lookup that does not consume an AI turn.
+
+If Docker runs inside Ubuntu/WSL, install and run Strix in that same distribution so it uses the
+local Unix socket rather than an exposed Docker HTTP endpoint. Diagnose Docker, VPN/proxy, model,
+and container-network access with `strix doctor --network`. PowerShell users can forward the
+Windows `strix` command into that WSL installation with `scripts/strix-wsl.ps1`.
 
 ---
 
@@ -236,6 +250,9 @@ strix -t https://github.com/org/app -t https://your-app.com
 
 # Targets from a file, one target per non-empty, non-comment line
 strix --target-list ./targets.txt
+
+# Bound model spend, turns per agent, and the live agent graph
+strix -t ./app --max-budget 10 --max-turns 200 --max-agents 6
 ```
 
 See the [CLI reference](https://docs.strix.ai/usage/cli) for every option, including scan modes, diff scope, instruction files, and budgets.

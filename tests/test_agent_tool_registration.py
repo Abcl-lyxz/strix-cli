@@ -114,6 +114,16 @@ def test_wait_for_agents_is_available_in_both_modes() -> None:
         assert "wait_for_agents" in [t.name for t in agent.tools]
 
 
+def test_workspace_search_is_scoped_to_whitebox_agents() -> None:
+    whitebox = factory.build_strix_agent(is_root=True, is_whitebox=True)
+    blackbox = factory.build_strix_agent(is_root=True, is_whitebox=False)
+
+    assert "workspace_search" in [tool.name for tool in whitebox.tools]
+    assert "workspace_search" not in [tool.name for tool in blackbox.tools]
+    assert "workspace_search" in str(whitebox.instructions)
+    assert "workspace_search" not in str(blackbox.instructions)
+
+
 def test_strict_tool_schemas_can_be_disabled_per_route() -> None:
     """Claude routes cap strict tools; the toolset must be sendable without strict."""
     agent = factory.build_strix_agent(is_root=True, strict_tool_schemas=False)

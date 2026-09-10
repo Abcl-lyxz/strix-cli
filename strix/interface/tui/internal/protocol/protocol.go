@@ -2,13 +2,14 @@ package protocol
 
 import "encoding/json"
 
-const Version = 3
+const Version = 4
 
 var Capabilities = []string{
 	"state-revisions",
 	"collection-deltas",
 	"structured-command-errors",
 	"agents-collection",
+	"interactive-configuration",
 }
 
 type Envelope struct {
@@ -68,10 +69,21 @@ type Snapshot struct {
 	ScanMode            string           `json:"scan_mode"`
 	MaxBudgetUSD        *float64         `json:"max_budget_usd"`
 	MaxTurns            int              `json:"max_turns"`
+	MaxAgents           int              `json:"max_agents"`
 	ScopeMode           string           `json:"scope_mode"`
 	DiffBase            string           `json:"diff_base"`
 	Model               string           `json:"model"`
 	ModelWarning        string           `json:"model_warning"`
+	APIKeyConfigured    bool             `json:"api_key_configured"`
+	APIBase             string           `json:"api_base"`
+	ReasoningEffort     string           `json:"reasoning_effort"`
+	TelemetryEnabled    bool             `json:"telemetry_enabled"`
+	StreamingEnabled    bool             `json:"streaming_enabled"`
+	PromptCache         bool             `json:"prompt_cache"`
+	LLMTimeout          int              `json:"llm_timeout"`
+	MaxToolCallsPerTurn int              `json:"max_tool_calls_per_turn"`
+	MaxContextImages    int              `json:"max_context_images"`
+	ConfigEnvOverride   bool             `json:"config_env_override"`
 	CaidoURL            string           `json:"caido_url"`
 	Messages            []Message        `json:"messages"`
 	Agents              []Agent          `json:"-"`

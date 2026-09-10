@@ -1,7 +1,6 @@
 """Startup environment validation and Docker image management."""
 
 import logging
-import shutil
 import sys
 
 from rich.console import Console
@@ -9,6 +8,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strix.config import IntegrationSettings, codex, load_settings
+from strix.interface.docker_cli import find_docker_cli
 from strix.interface.utils import (
     check_docker_connection,
     image_exists,
@@ -164,16 +164,25 @@ def validate_environment() -> None:
 
 
 def check_docker_installed() -> None:
-    if shutil.which("docker") is None:
+    if find_docker_cli() is None:
         logger.debug("Docker CLI not found in PATH")
         console = Console()
         error_text = Text()
         error_text.append("DOCKER NOT INSTALLED", style="bold red")
         error_text.append("\n\n", style="white")
         error_text.append("The 'docker' CLI was not found in your PATH.\n", style="white")
-        error_text.append(
-            "Please install Docker and ensure the 'docker' command is available.\n\n", style="white"
-        )
+        if sys.platform == "win32":
+            error_text.append(
+                "Install Docker Desktop, or run Strix inside the same WSL distribution where "
+                "Docker Engine is installed.\n\n",
+                style="white",
+            )
+        else:
+            error_text.append(
+                "Please install Docker and ensure the 'docker' command is available.\n\n",
+                style="white",
+            )
+        error_text.append("Run `strix doctor --network` for a full diagnosis.", style="dim cyan")
 
         panel = Panel(
             error_text,

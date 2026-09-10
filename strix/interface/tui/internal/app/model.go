@@ -8,6 +8,7 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -64,6 +65,9 @@ const (
 	modalStop
 	modalConfirmMount
 	modalVulnerability
+	modalConfig
+	modalWorkspaceSearch
+	modalAPIKey
 )
 
 type focusMode int
@@ -86,11 +90,19 @@ const (
 	scrollbarMcp
 )
 
+type workspaceSearchMatch struct {
+	Path   string `json:"path"`
+	Line   int    `json:"line"`
+	Column int    `json:"column"`
+	Text   string `json:"text"`
+}
+
 type Model struct {
 	client                 *Client
 	width, height          int
 	snapshot               protocol.Snapshot
 	input                  textarea.Model
+	apiKeyInput            textinput.Model
 	viewport               viewport.Model
 	viewportContent        string
 	vulnViewport           viewport.Model
@@ -134,6 +146,12 @@ type Model struct {
 	seenMessages           map[string]bool
 	vulnerabilityCopied    bool
 	vulnerabilityCopyError string
+	searchQuery            string
+	searchRoot             string
+	searchMatchCount       int
+	searchTruncated        bool
+	searchMatches          []workspaceSearchMatch
+	apiKeyError            string
 }
 
 var (
@@ -223,6 +241,20 @@ func newChatInput() textarea.Model {
 	return input
 }
 
+func newAPIKeyInput() textinput.Model {
+	input := textinput.New()
+	input.Prompt = "› "
+	input.Placeholder = "Paste API key"
+	input.CharLimit = 32 * 1024
+	input.Width = 44
+	input.EchoMode = textinput.EchoPassword
+	input.EchoCharacter = '•'
+	input.PromptStyle = lipgloss.NewStyle().Foreground(green)
+	input.TextStyle = lipgloss.NewStyle().Foreground(white)
+	input.Cursor.Style = lipgloss.NewStyle().Foreground(brightGreen)
+	return input
+}
+
 // composerBounds returns the floor and ceiling row counts for the composer at
 // the current terminal height. A short terminal shrinks the ceiling so a long
 // prompt cannot crowd out everything above it.
@@ -274,10 +306,11 @@ func composerHeight(input textarea.Model) int {
 
 func New(client *Client) Model {
 	input := newChatInput()
+	apiKeyInput := newAPIKeyInput()
 	input.Placeholder = setupPlaceholder
 	input.Focus()
 	return Model{
-		client: client, input: input, viewport: viewport.New(80, 20), vulnViewport: viewport.New(80, 20),
+		client: client, input: input, apiKeyInput: apiKeyInput, viewport: viewport.New(80, 20), vulnViewport: viewport.New(80, 20),
 		collapsedAgents: map[string]bool{}, expandedEvents: map[string]bool{}, blockCache: map[string]renderedBlock{}, showSplash: true, splashStarted: time.Now(), followOutput: true,
 		collectionRevisions: map[string]int{}, collectionAssemblies: map[string]*collectionAssembly{}, resyncRequested: map[string]bool{}, resyncRequests: map[string]string{},
 		seenMessages: map[string]bool{},

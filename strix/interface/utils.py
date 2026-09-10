@@ -875,9 +875,11 @@ def _truncate_file_list(
 def build_diff_scope_instruction(scopes: list[RepoDiffScope]) -> str:
     lines = [
         "The user is requesting a review of a Pull Request.",
-        "Instruction: Direct your analysis primarily at the changes in the listed files. "
-        "You may reference other files in the repository for context (imports, definitions, "
-        "usage), but report findings only if they relate to the listed changes.",
+        (
+            "Instruction: Direct your analysis primarily at the changes in the listed files. "
+            "You may reference other files in the repository for context (imports, definitions, "
+            "usage), but report findings only if they relate to the listed changes."
+        ),
         "For Added files, review the entire file content.",
         "For Modified files, focus primarily on the changed areas.",
     ]
@@ -1602,7 +1604,8 @@ def check_docker_connection() -> Any:
     from docker.errors import DockerException
 
     try:
-        return docker.from_env()
+        client = docker.from_env()
+        client.ping()
     except DockerException as exc:
         report_error("docker_unavailable", exc)
         console = Console()
@@ -1610,10 +1613,27 @@ def check_docker_connection() -> Any:
         error_text.append("DOCKER NOT AVAILABLE", style="bold red")
         error_text.append("\n\n", style="white")
         error_text.append("Cannot connect to Docker daemon.\n", style="white")
-        error_text.append(
-            "Please ensure Docker Desktop is installed and running, and try running strix again.\n",
-            style="white",
-        )
+        docker_host = os.environ.get("DOCKER_HOST", "").strip()
+        if docker_host.lower().startswith(("tcp://", "http://", "https://")):
+            error_text.append(
+                "DOCKER_HOST uses a TCP endpoint, which can be blocked when a VPN or firewall "
+                "changes routes. Prefer running Strix in the same environment as Docker and "
+                "using its local Unix socket or Windows named pipe. If TCP is required, secure "
+                "it with TLS.\n",
+                style="white",
+            )
+        elif sys.platform == "win32":
+            error_text.append(
+                "Start Docker Desktop and verify `docker version`. If Docker runs only inside "
+                "WSL, install and run Strix in that same WSL distribution.\n",
+                style="white",
+            )
+        else:
+            error_text.append(
+                "Start Docker Engine and verify `docker version` as the current user.\n",
+                style="white",
+            )
+        error_text.append("\nRun `strix doctor --network` for a full diagnosis.", style="dim cyan")
 
         panel = Panel(
             error_text,
@@ -1624,6 +1644,8 @@ def check_docker_connection() -> Any:
         )
         console.print("\n", panel, "\n")
         raise RuntimeError("Docker not available") from None
+    else:
+        return client
 
 
 def image_exists(client: Any, image_name: str) -> bool:
@@ -1715,10 +1737,26 @@ def validate_config_file(config_path: str) -> Path:
 # sources, so a large file makes session bring-up slower.
 
 
-def _workspace_file_dest(spec: str, source: Path) -> str:
+def _split_workspace_file_spec(spec: str) -> tuple[str, str | None]:
+    """Split ``PATH[:DEST]`` without mistaking a Windows drive for a separator."""
+    stripped = spec.strip()
+    direct_source = Path(stripped).expanduser()
+    if direct_source.is_file():
+        return stripped, None
+
+    raw, sep, dest = stripped.rpartition(":")
+    if not sep or not dest.strip():
+        return stripped, None
+    # ``C:\\path`` has one colon, which belongs to the drive designator. A
+    # destination-bearing Windows spec has another colon after the path.
+    if len(raw) == 1 and raw.isalpha():
+        return stripped, None
+    return raw.strip(), dest.strip()
+
+
+def _workspace_file_dest(declared_dest: str | None, source: Path, spec: str) -> str:
     """Return the workspace-relative destination declared by ``spec``."""
-    _, sep, dest = spec.rpartition(":")
-    candidate = dest.strip() if sep and dest.strip() else source.name
+    candidate = declared_dest or source.name
     if candidate.startswith("/") or Path(candidate).is_absolute():
         if not candidate.startswith("/workspace/"):
             raise ValueError(
@@ -1748,8 +1786,7 @@ def resolve_workspace_files(specs: list[str] | None) -> list[dict[str, str]]:
     resolved: list[dict[str, str]] = []
     seen: dict[str, str] = {}
     for spec in specs or []:
-        raw, sep, dest = spec.rpartition(":")
-        source_text = raw if sep and dest.strip() else spec
+        source_text, declared_dest = _split_workspace_file_spec(spec)
         source = Path(source_text.strip()).expanduser()
         if not source.is_file():
             raise ValueError(f"'{source}' is not an existing file")
@@ -1758,7 +1795,7 @@ def resolve_workspace_files(specs: list[str] | None) -> list[dict[str, str]]:
                 pass
         except OSError as error:
             raise ValueError(f"Cannot read '{source}': {error}") from error
-        workspace_rel = _workspace_file_dest(spec, source)
+        workspace_rel = _workspace_file_dest(declared_dest, source, spec)
         if workspace_rel in seen:
             raise ValueError(
                 f"Two workspace files target /workspace/{workspace_rel}: "

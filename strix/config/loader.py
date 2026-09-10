@@ -90,6 +90,56 @@ def persist_current() -> None:
     write_secret_text(target, json.dumps({"env": env_block}, indent=2))
 
 
+def persist_overrides(updates: Mapping[str, Any]) -> None:
+    """Persist explicit setting overrides and invalidate the settings cache.
+
+    ``updates`` is keyed by environment-style setting aliases (for example
+    ``STRIX_LLM`` or ``LLM_API_KEY``).  Every alias for the same field is
+    removed before the canonical key is written, so a stale sibling alias can
+    never win later.  ``None`` removes a value.  The same secret-file writer as
+    :func:`persist_current` keeps credentials private and replaces the file
+    atomically.
+
+    This is the write path used by interactive configuration surfaces.  It is
+    intentionally limited to aliases declared by :class:`Settings`; callers
+    cannot smuggle arbitrary environment variables into the config file.
+    """
+    global _cached  # noqa: PLW0603
+    if not updates:
+        return
+
+    alias_groups = _setting_alias_groups()
+    target = _override or _DEFAULT_PATH
+    env_block = _read_env_block(target)
+    for requested, value in updates.items():
+        key = str(requested).upper()
+        aliases = alias_groups.get(key)
+        if aliases is None:
+            raise ValueError(f"Unsupported persisted setting: {requested}")
+        for alias in aliases:
+            env_block.pop(alias, None)
+        if value is not None:
+            env_block[aliases[0]] = value
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_secret_text(target, json.dumps({"env": env_block}, indent=2))
+    _cached = None
+
+
+def _setting_alias_groups() -> dict[str, tuple[str, ...]]:
+    """Map every declared settings alias to its complete sibling group."""
+    groups: dict[str, tuple[str, ...]] = {}
+    for sub_finfo in Settings.model_fields.values():
+        sub_cls = sub_finfo.annotation
+        if not (isinstance(sub_cls, type) and issubclass(sub_cls, BaseModel)):
+            continue
+        for finfo in sub_cls.model_fields.values():
+            aliases = tuple(dict.fromkeys(alias.upper() for alias in _aliases_for(finfo)))
+            for alias in aliases:
+                groups[alias] = aliases
+    return groups
+
+
 def _aliases_for(finfo: FieldInfo) -> list[str]:
     """Collect every env-var name that should populate ``finfo``."""
     aliases: list[str] = []

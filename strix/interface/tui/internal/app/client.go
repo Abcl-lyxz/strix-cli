@@ -134,7 +134,7 @@ func (c *Client) Read() (protocol.Envelope, error) {
 	return envelope, nil
 }
 
-// Handshake validates the exact v3 hello and acknowledges readiness. main calls
+// Handshake validates the exact protocol hello and acknowledges readiness. main calls
 // this before constructing Bubble Tea, so mismatch errors never enter alt screen.
 func (c *Client) Handshake() error {
 	if connection, ok := c.conn.(interface{ SetDeadline(time.Time) error }); ok {

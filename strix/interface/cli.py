@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strix.config import load_settings
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.runner import run_strix_scan
 from strix.report.state import ReportState, set_global_report_state
 from strix.runtime import session_manager
@@ -98,6 +98,7 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
         "scope_mode": getattr(args, "scope_mode", "auto"),
         "diff_base": getattr(args, "diff_base", None),
         "resume_instruction": getattr(args, "user_explicit_instruction", None) or "",
+        "max_agents": getattr(args, "max_agents", DEFAULT_MAX_AGENTS),
     }
 
     report_state = ReportState(args.run_name)
@@ -203,6 +204,7 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
                     interactive=bool(getattr(args, "interactive", False)),
                     max_budget_usd=getattr(args, "max_budget_usd", None),
                     max_turns=getattr(args, "max_turns", DEFAULT_MAX_TURNS),
+                    max_agents=getattr(args, "max_agents", DEFAULT_MAX_AGENTS),
                     status_sink=_note_startup_phase,
                 )
             finally:

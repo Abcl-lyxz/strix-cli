@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 Status = Literal["running", "waiting", "completed", "stopped", "crashed", "failed", "budget_paused"]
 
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "stopped", "crashed", "failed"})
+ACTIVE_STATUSES: frozenset[str] = frozenset({"running", "waiting", "budget_paused"})
 
 # Why an agent parked. The user can message any agent, so this - not the agent's
 # position in the tree - decides whether waiting is bounded: only an agent waiting
@@ -47,10 +48,17 @@ class AgentRuntime:
     user_wake_required: bool = False
 
 
+class AgentLimitReachedError(RuntimeError):
+    """Raised when a scan tries to exceed its configured live-agent limit."""
+
+
 class AgentCoordinator:
     """Single owner for graph state, SDK runtimes, messages, and resume snapshots."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_active_agents: int | None = None) -> None:
+        if max_active_agents is not None and max_active_agents < 1:
+            raise ValueError("max_active_agents must be at least 1")
+        self.max_active_agents = max_active_agents
         self.statuses: dict[str, Status] = {}
         self.parent_of: dict[str, str | None] = {}
         self.names: dict[str, str] = {}
@@ -162,6 +170,15 @@ class AgentCoordinator:
         skills: list[str] | None = None,
     ) -> None:
         async with self._lock:
+            active_count = sum(status in ACTIVE_STATUSES for status in self.statuses.values())
+            if agent_id not in self.statuses and (
+                self.max_active_agents is not None and active_count >= self.max_active_agents
+            ):
+                raise AgentLimitReachedError(
+                    f"Agent limit reached ({active_count}/{self.max_active_agents} active, "
+                    "including the root). Wait for or stop an agent before spawning another, "
+                    "or restart with a larger --max-agents value."
+                )
             self.statuses[agent_id] = "running"
             self.parent_of[agent_id] = parent_id
             self.names[agent_id] = name
@@ -319,6 +336,19 @@ class AgentCoordinator:
                     "agent.send dropped: target=%s is %s and cannot be woken",
                     target_agent_id,
                     self.statuses[target_agent_id],
+                )
+                return False
+            target_is_terminal = self.statuses[target_agent_id] in TERMINAL_STATUSES
+            active_count = sum(status in ACTIVE_STATUSES for status in self.statuses.values())
+            if (
+                target_is_terminal
+                and self.max_active_agents is not None
+                and active_count >= self.max_active_agents
+            ):
+                logger.info(
+                    "agent.send dropped: waking target=%s would exceed active limit %d",
+                    target_agent_id,
+                    self.max_active_agents,
                 )
                 return False
             runtime = self.runtimes.setdefault(target_agent_id, AgentRuntime())
@@ -524,6 +554,7 @@ class AgentCoordinator:
                 "budget_stopped": self._budget_stopped,
                 "reserve_stopped": self._reserve_stopped,
                 "budget_paused": self._budget_paused,
+                "max_active_agents": self.max_active_agents,
             }
 
     async def restore(self, snap: dict[str, Any]) -> None:

@@ -291,9 +291,7 @@ func TestAgentsCollectionPreservesSelectedIDAcrossUpsertsAndDeletes(t *testing.T
 	}
 }
 
-// Typing a slash must not surface a command list; the start screen takes prompts
-// and targets only.
-func TestSetupOffersNoSlashCommands(t *testing.T) {
+func TestSetupOffersSearchableSlashCommands(t *testing.T) {
 	model := New(nil)
 	model.width, model.height = 100, 50
 	model.showSplash = false
@@ -302,9 +300,9 @@ func TestSetupOffersNoSlashCommands(t *testing.T) {
 	model.input.SetValue("/")
 	model.resizeViewport()
 	view := ansi.Strip(model.View())
-	for _, gone := range []string{"/target", "/start", "/clear", "/prompt", "/quit", "/help"} {
-		if strings.Contains(view, gone) {
-			t.Fatalf("a slash command menu still appears for %q: %s", gone, view)
+	for _, want := range []string{"Commands", "/target", "/model", "/apikey", "/help"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("slash command palette is missing %q: %s", want, view)
 		}
 	}
 }

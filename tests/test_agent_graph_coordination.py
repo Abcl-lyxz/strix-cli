@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from agents.tool_context import ToolContext
 
-from strix.core.agents import AgentCoordinator
+from strix.core.agents import AgentCoordinator, AgentLimitReachedError
 from strix.report.state import ReportState, set_global_report_state
 from strix.tools.agents_graph.tools import agent_finish, send_message_to_agent, wait_for_agents
 
@@ -41,6 +41,36 @@ async def _graph(*, interactive: bool) -> AgentCoordinator:
     await coordinator.attach_runtime("root", resumable=interactive)
     await coordinator.attach_runtime("child", resumable=interactive)
     return coordinator
+
+
+@pytest.mark.asyncio
+async def test_live_agent_limit_is_atomic_and_terminal_agents_free_slots() -> None:
+    coordinator = AgentCoordinator(max_active_agents=2)
+    await coordinator.register("root", "strix", parent_id=None)
+    await coordinator.register("child", "First specialist", parent_id="root")
+
+    with pytest.raises(AgentLimitReachedError, match="2/2 active"):
+        await coordinator.register("blocked", "Blocked specialist", parent_id="root")
+
+    await coordinator.set_status("child", "completed")
+    await coordinator.register("replacement", "Replacement specialist", parent_id="root")
+
+    assert coordinator.statuses["replacement"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_live_agent_limit_also_blocks_waking_a_terminal_agent() -> None:
+    coordinator = AgentCoordinator(max_active_agents=2)
+    await coordinator.register("root", "strix", parent_id=None)
+    await coordinator.register("child", "First specialist", parent_id="root")
+    await coordinator.attach_runtime("child", resumable=True)
+    await coordinator.set_status("child", "completed")
+    await coordinator.register("replacement", "Replacement specialist", parent_id="root")
+
+    delivered = await coordinator.send("child", {"from": "user", "content": "continue"})
+
+    assert delivered is False
+    assert coordinator.statuses["child"] == "completed"
 
 
 async def _call(

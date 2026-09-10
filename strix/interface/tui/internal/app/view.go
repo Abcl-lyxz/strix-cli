@@ -486,12 +486,15 @@ func (m Model) mainView() string {
 	}
 	input := lipgloss.NewStyle().Width(chatWidth - 2).Height(m.input.Height()).
 		Border(lipgloss.RoundedBorder()).BorderForeground(inputBorder).PaddingLeft(1).
-		Render(m.highlightInputSelection(m.input.View()))
+		Render(m.highlightInputSelection(m.inputView()))
 
 	// Chat column: chat history, optional status row, then input — all chat-width.
 	leftParts := []string{chat}
 	if m.statusVisible() {
 		leftParts = append(leftParts, m.statusView(chatWidth))
+	}
+	if palette := m.commandPaletteView(chatWidth); palette != "" {
+		leftParts = append(leftParts, palette)
 	}
 	leftParts = append(leftParts, input)
 	leftColumn := strings.Join(leftParts, "\n")

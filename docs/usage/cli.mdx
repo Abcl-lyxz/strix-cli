@@ -9,6 +9,34 @@ description: "Command-line options for Strix"
 strix (--target <target> | --target-list <path>) [options]
 ```
 
+Running `strix` with no target opens the interactive launch screen. It also
+opens automatically when a target was supplied but no model is configured.
+Type `/` to search commands and press Tab to complete one.
+
+## Interactive TUI Commands
+
+| Command | Purpose |
+|---|---|
+| `/config [clear]` | Show active non-secret configuration, or clear the saved model connection |
+| `/model <provider/model>` | Set the LiteLLM model route |
+| `/apikey [key\|clear]` | Open a secure key popup, save an inline key, or remove it |
+| `/baseurl <url\|clear>` | Configure an OpenAI-compatible or local endpoint |
+| `/reasoning <level>` | Set reasoning effort |
+| `/target`, `/untarget`, `/targets` | Manage launch targets |
+| `/find <text>` | Search the local workspace without consuming an AI turn |
+| `/instruction <text\|clear>` | Set the opening instruction |
+| `/mode`, `/budget`, `/turns`, `/agents` | Control scan depth and resource limits |
+| `/scope`, `/diff-base` | Control full/diff repository scope |
+| `/telemetry`, `/streaming`, `/cache` | Toggle model/runtime behavior |
+| `/timeout`, `/toolcalls`, `/images` | Set advanced request/context limits |
+| `/start`, `/status`, `/viewer` | Launch or inspect a run |
+| `/agent`, `/findings`, `/trace`, `/follow` | Navigate a live run |
+| `/stop`, `/clear`, `/quit`, `/help` | Control the selected agent or application |
+
+Configuration and launch-setting commands are available before a scan starts;
+navigation and agent controls remain available during a live run. Environment
+variables still take precedence over values saved by the TUI.
+
 ## Options
 
 <ParamField path="--target, -t" type="string">
@@ -117,6 +145,16 @@ strix (--target <target> | --target-list <path>) [options]
   Must be greater than `0`.
 </ParamField>
 
+<ParamField path="--max-agents" type="integer" default="12">
+  Maximum number of non-terminal agents in the live graph, including the root
+  agent. This bounds parallel agent expansion and its associated model/API and
+  host-resource pressure. Completed and stopped agents free their slots.
+
+  The minimum is `2` so the orchestration-only root can launch at least one
+  hands-on specialist. When the limit is reached, agents are instructed to wait
+  for or stop an existing agent before creating another.
+</ParamField>
+
 ## Examples
 
 ```bash
@@ -132,8 +170,8 @@ strix --target api.example.com --instruction "Focus on IDOR and auth bypass"
 # CI/CD mode
 strix -n --target ./ --scan-mode quick
 
-# Cap cost and per-agent turns
-strix --target https://example.com --max-budget 25 --max-turns 300
+# Cap cost, per-agent turns, and the live agent graph
+strix --target https://example.com --max-budget 25 --max-turns 300 --max-agents 6
 
 # Force diff-scope against a specific base ref
 strix -n --target ./ --scan-mode quick --scope-mode diff --diff-base origin/main

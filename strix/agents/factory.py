@@ -70,6 +70,7 @@ from strix.tools.todo.tools import (
     update_todo,
 )
 from strix.tools.web_search.tool import web_get_contents, web_search
+from strix.tools.workspace_search.tool import workspace_search
 
 
 if TYPE_CHECKING:
@@ -685,6 +686,12 @@ def build_strix_agent(
         )
 
     agent_tools = [*_EXTRA_TOOLS, *(extra_tools or [])]
+    # Code search is useful for white-box work and only white-box work. Keep it
+    # out of URL/IP-only agents so they do not pay for another irrelevant tool
+    # schema on every model call. This is the first role-scoped tool bundle;
+    # other large families can move behind the same boundary incrementally.
+    if is_whitebox:
+        agent_tools.append(workspace_search)
     if interactive:
         # Yielding to the user is only meaningful when one is attached.
         agent_tools.append(respond_to_user)
@@ -701,11 +708,12 @@ def build_strix_agent(
     ]
 
     logger.info(
-        "Built %s agent '%s' (skills=%d, tools=%d, scan_mode=%s, whitebox=%s)",
+        "Built %s agent '%s' (skills=%d, tools=%d, prompt_chars=%d, scan_mode=%s, whitebox=%s)",
         "root" if is_root else "child",
         name,
         len(skills or []),
         len(tools),
+        len(instructions),
         scan_mode,
         is_whitebox,
     )

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from strix.config import load_settings, persist_current
+from strix.config.settings import DEFAULT_MAX_AGENTS
 from strix.core.agents import AgentCoordinator
 from strix.core.hooks import BudgetExceededError
 from strix.core.runner import run_strix_scan
@@ -62,7 +63,9 @@ class GoTuiRuntime:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.live_view = TuiLiveView()
-        self.coordinator = AgentCoordinator()
+        self.coordinator = AgentCoordinator(
+            max_active_agents=getattr(args, "max_agents", DEFAULT_MAX_AGENTS)
+        )
         self.report_state: ReportState | None = None
         self.scan_config: dict[str, Any] = {}
         self.scan_task: asyncio.Task[None] | None = None
@@ -70,6 +73,7 @@ class GoTuiRuntime:
         self._last_sync_fingerprint = ""
         self._error_noted_agents: set[str] = set()
         self.model_verified = False
+        self.verified_connection: tuple[str, str, str] | None = None
         self._setup_preflight: asyncio.Task[None] | None = None
         self.controller = TuiController(
             args,
@@ -95,6 +99,7 @@ class GoTuiRuntime:
             "scope_mode": self.args.scope_mode,
             "diff_base": self.args.diff_base,
             "resume_instruction": self.args.user_explicit_instruction or "",
+            "max_agents": getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
             "workspace_mount": getattr(self.args, "workspace_mount", None) or "",
             "workspace_subdir": getattr(self.args, "workspace_subdir", None) or "",
         }
@@ -138,7 +143,13 @@ class GoTuiRuntime:
         preflight = self._setup_preflight
         if preflight is not None and not preflight.done():
             await asyncio.shield(preflight)
-        if self.model_verified:
+        current = load_settings().llm
+        current_connection = (
+            (current.model or "").strip(),
+            getattr(current, "api_key", None) or "",
+            getattr(current, "api_base", None) or "",
+        )
+        if self.model_verified and self.verified_connection == current_connection:
             return
         try:
             await self._preflight_model()
@@ -148,11 +159,19 @@ class GoTuiRuntime:
             raise RuntimeError(f"Model connection failed: {exc}") from exc
 
     async def _preflight_model(self) -> None:
-        model = (load_settings().llm.model or "").strip()
+        llm = load_settings().llm
+        model = (llm.model or "").strip()
+        if not model:
+            raise RuntimeError("No model configured. Use /model in the TUI first.")
         self.controller.add_message("Verifying model connection...")
         set_scan_phase("preflight")
         await preflight_model_connection(model)
         self.model_verified = True
+        self.verified_connection = (
+            model,
+            getattr(llm, "api_key", None) or "",
+            getattr(llm, "api_base", None) or "",
+        )
 
     def _start_preparation(self) -> asyncio.Task[None]:
         """Kick off the work that runs behind the freshly painted TUI."""
@@ -171,6 +190,7 @@ class GoTuiRuntime:
         candidate.user_instruction = self.controller.instruction or None
         candidate.max_budget_usd = self.controller.max_budget_usd
         candidate.max_turns = self.controller.max_turns
+        candidate.max_agents = self.controller.max_agents
         candidate.scope_mode = self.controller.scope_mode
         candidate.diff_base = self.controller.diff_base
         existing_targets = [
@@ -244,6 +264,7 @@ class GoTuiRuntime:
                 coordinator=self.coordinator,
                 interactive=True,
                 max_turns=self.args.max_turns,
+                max_agents=getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
                 max_budget_usd=self.args.max_budget_usd,
                 event_sink=self.capture_event,
                 mcp_status_sink=self.capture_mcp_status,

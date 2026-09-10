@@ -67,6 +67,7 @@ _ROOT_SUBCOMMAND_HELP = """
 Additional commands:
   strix cloud ...          Use the managed Strix platform
   strix auth ...           Manage model-subscription sign-in
+  strix doctor [--network] Diagnose installation, Docker, VPN/proxy, and model setup
   strix view [RUN]         View a completed or running scan
   strix completions SHELL  Generate zsh, bash, or fish tab completion
 """
@@ -418,6 +419,14 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
     telemetry_start(args)
 
 
+def _ensure_interactive_setup_for_model(args: argparse.Namespace) -> None:
+    """Route a missing model into the TUI instead of failing before it opens."""
+    if not (load_settings().llm.model or "").strip():
+        # Preserve any CLI target in the launch screen while configuration is
+        # completed. A configured direct launch keeps its fast path.
+        args.needs_setup = True
+
+
 def main() -> None:
     configure_dependency_logging()
 
@@ -446,6 +455,12 @@ def main() -> None:
 
         sys.exit(run_auth(sys.argv[2:]))
 
+    # Diagnostics must work even when Docker or the model configuration is broken.
+    if len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        from strix.interface.doctor import run_doctor
+
+        sys.exit(run_doctor(sys.argv[2:]))
+
     # Generate native shell completion scripts before scan argument parsing.
     if len(sys.argv) > 1 and sys.argv[1] in ("completion", "completions"):
         from strix.interface.completions import run_completions
@@ -471,7 +486,14 @@ def main() -> None:
 
     check_docker_installed()
     pull_docker_image()
-    validate_environment()
+
+    if args.non_interactive:
+        # Headless runs still fail fast with the traditional environment/config
+        # guidance. Interactive runs configure the same persisted settings from
+        # the launch TUI, so they must be allowed to reach it with no model yet.
+        validate_environment()
+    else:
+        _ensure_interactive_setup_for_model(args)
 
     # Everything below imports the scan engine; do not race the warm-up thread.
     wait_for_import_warmup()

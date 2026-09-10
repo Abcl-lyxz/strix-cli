@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from strix.config import apply_config_override
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.interface.scan_setup import attach_workspace_mount, build_targets_info
 from strix.interface.update_check import self_update
@@ -48,6 +48,13 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be an integer greater than 0")
+    return parsed
+
+
+def _agent_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed < 2:
+        raise argparse.ArgumentTypeError("must be at least 2 (root agent + one specialist)")
     return parsed
 
 
@@ -274,6 +281,18 @@ Strix Cloud:
         help=(
             "Maximum turns per agent (> 0, default %(default)s). Each agent is force-stopped "
             "when it reaches this limit, with graduated wrap-up warnings as it is approached."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-agents",
+        dest="max_agents",
+        metavar="N",
+        type=_agent_limit,
+        default=DEFAULT_MAX_AGENTS,
+        help=(
+            "Maximum non-terminal agents in the live graph, including the root agent "
+            "(>= 2, default %(default)s). A completed or stopped agent frees a slot."
         ),
     )
 

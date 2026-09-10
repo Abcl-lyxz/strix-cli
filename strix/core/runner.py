@@ -25,7 +25,7 @@ from strix.config.models import (
     supports_strict_tool_schemas,
     uses_chat_completions_tool_schema,
 )
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.agents import AgentCoordinator
 from strix.core.execution import (
     respawn_subagents,
@@ -197,6 +197,7 @@ async def run_strix_scan(
     coordinator: AgentCoordinator | None = None,
     interactive: bool = False,
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_agents: int = DEFAULT_MAX_AGENTS,
     max_budget_usd: float | None = None,
     model: str | None = None,
     cleanup_on_exit: bool = True,
@@ -228,6 +229,9 @@ async def run_strix_scan(
         if status_sink is not None:
             status_sink(phase)
 
+    if max_agents < 1:
+        raise ValueError("max_agents must be at least 1")
+
     if scan_id is None:
         scan_id = f"scan-{uuid.uuid4().hex[:8]}"
 
@@ -243,11 +247,12 @@ async def run_strix_scan(
     is_resume = agents_path.exists()
 
     logger.info(
-        "%s Strix scan %s (image=%s, max_turns=%d, interactive=%s, run_dir=%s)",
+        "%s Strix scan %s (image=%s, max_turns=%d, max_agents=%d, interactive=%s, run_dir=%s)",
         "Resuming" if is_resume else "Starting",
         scan_id,
         image,
         max_turns,
+        max_agents,
         interactive,
         run_dir,
     )
@@ -266,7 +271,9 @@ async def run_strix_scan(
         logger.info("Sending non-strict tool schemas: %s caps strict tools", resolved_model)
 
     if coordinator is None:
-        coordinator = AgentCoordinator()
+        coordinator = AgentCoordinator(max_active_agents=max_agents)
+    else:
+        coordinator.max_active_agents = max_agents
     coordinator.set_snapshot_path(agents_path)
 
     from strix.tools.coverage.tools import hydrate_coverage_from_disk

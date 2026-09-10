@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_MAX_TURNS = 500
+DEFAULT_MAX_AGENTS = 12
 
 _BASE_CONFIG = SettingsConfigDict(
     case_sensitive=False,

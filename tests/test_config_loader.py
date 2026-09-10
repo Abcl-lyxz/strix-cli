@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,6 +30,10 @@ _LLM_ENV_KEYS = [
     "STRIX_REASONING_EFFORT",
     "STRIX_FORCE_REQUIRED_TOOL_CHOICE",
     "LLM_TIMEOUT",
+    "LLM_DISABLE_STREAMING",
+    "LLM_MAX_TOOL_CALLS_PER_TURN",
+    "STRIX_PROMPT_CACHE",
+    "STRIX_MAX_CONTEXT_IMAGES",
     "PERPLEXITY_API_KEY",
     "EXA_API_KEY",
     "STRIX_WEB_SEARCH_PROVIDER",
@@ -413,4 +418,56 @@ def test_persist_current_sets_0600_mode(tmp_path: Path, monkeypatch: pytest.Monk
 
     loader.persist_current()
 
-    assert target.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_persist_overrides_writes_explicit_values_and_invalidates_cache(tmp_path: Path) -> None:
+    target = tmp_path / "cli-config.json"
+    target.write_text(
+        json.dumps({"env": {"OPENAI_API_KEY": "old", "PERPLEXITY_API_KEY": "keep"}}),
+        encoding="utf-8",
+    )
+    loader.apply_config_override(target)
+    before = loader.load_settings()
+
+    loader.persist_overrides(
+        {
+            "STRIX_LLM": "openrouter/openai/gpt-5.4",
+            "LLM_API_KEY": "new-secret",
+            "STRIX_REASONING_EFFORT": "medium",
+        }
+    )
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "env": {
+            "PERPLEXITY_API_KEY": "keep",
+            "STRIX_LLM": "openrouter/openai/gpt-5.4",
+            "LLM_API_KEY": "new-secret",
+            "STRIX_REASONING_EFFORT": "medium",
+        }
+    }
+    assert loader.load_settings() is not before
+    assert loader.load_settings().llm.api_key == "new-secret"
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_persist_overrides_none_removes_all_field_aliases(tmp_path: Path) -> None:
+    target = tmp_path / "cli-config.json"
+    target.write_text(
+        json.dumps({"env": {"OPENAI_API_BASE": "https://old.example/v1"}}),
+        encoding="utf-8",
+    )
+    loader.apply_config_override(target)
+
+    loader.persist_overrides({"LLM_API_BASE": None})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {}}
+
+
+def test_persist_overrides_rejects_unknown_settings(tmp_path: Path) -> None:
+    loader.apply_config_override(tmp_path / "cli-config.json")
+
+    with pytest.raises(ValueError, match="Unsupported persisted setting"):
+        loader.persist_overrides({"NOT_A_STRIX_SETTING": "value"})

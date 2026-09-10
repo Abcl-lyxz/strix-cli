@@ -48,7 +48,11 @@ def resolve_litellm_model(model: str) -> str | None:
                 if isinstance(model_cost.get(key), dict)
             }
             if len(matches) == 1 or len(prices) == 1:
-                return matches[0]
+                # Prefer the shallowest provider-qualified key. Direct providers
+                # use ``provider/model`` while relays commonly add another path
+                # segment (for example ``openrouter/x-ai/model``). This keeps
+                # bare-name pricing deterministic as LiteLLM adds relay aliases.
+                return min(matches, key=lambda key: (key.count("/"), key))
         return None  # noqa: TRY300
     except Exception:  # noqa: BLE001
         return None

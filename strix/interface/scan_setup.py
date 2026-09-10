@@ -63,7 +63,8 @@ async def preflight_model_connection(
     *,
     settings: Settings | None = None,
 ) -> None:
-    """Verify the configured model route before starting a scan."""
+    """Verify the configured model route using the run's real transport mode."""
+    from agents.model_settings import ModelSettings
     from agents.models.interface import ModelTracing
 
     from strix.config.models import StrixProvider, configure_sdk_model_defaults
@@ -79,22 +80,36 @@ async def preflight_model_connection(
         prompt_cache=False,
         extra_headers=resolved_settings.llm.extra_headers,
         has_tools=False,
-    )
-    await asyncio.wait_for(
-        model.get_response(
-            system_instructions="You are a helpful assistant.",
-            input="Reply with just 'OK'.",
-            model_settings=request_settings,
-            tools=[],
-            output_schema=None,
-            handoffs=[],
-            tracing=ModelTracing.DISABLED,
-            previous_response_id=None,
-            conversation_id=None,
-            prompt=None,
-        ),
-        timeout=resolved_settings.llm.timeout,
-    )
+    ).resolve(ModelSettings(max_tokens=32))
+    request: dict[str, Any] = {
+        "system_instructions": "You are a helpful assistant.",
+        "input": "Reply with just 'OK'.",
+        "model_settings": request_settings,
+        "tools": [],
+        "output_schema": None,
+        "handoffs": [],
+        "tracing": ModelTracing.DISABLED,
+        "previous_response_id": None,
+        "conversation_id": None,
+        "prompt": None,
+    }
+
+    async def perform_check() -> None:
+        if resolved_settings.llm.disable_streaming:
+            await model.get_response(**request)
+            return
+        # Match the transport used by a normal scan. Some OpenAI-compatible
+        # gateways support streaming reliably but leave non-streaming requests
+        # open indefinitely, so a non-streaming-only preflight rejects a route
+        # that the agent itself can use.
+        async for _event in model.stream_response(**request):
+            pass
+
+    timeout = min(float(resolved_settings.llm.timeout), 45.0)
+    try:
+        await asyncio.wait_for(perform_check(), timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(f"model connection check timed out after {timeout:g}s") from exc
 
 
 def build_targets_info(args: argparse.Namespace) -> None:

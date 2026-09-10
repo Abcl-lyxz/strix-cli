@@ -24,6 +24,7 @@
             "group": "Usage",
             "pages": [
               "usage/cli",
+              "usage/doctor",
               "usage/scan-modes",
               "usage/instructions",
               "usage/viewer"

@@ -3,7 +3,14 @@ title: "Configuration"
 description: "Environment variables for Strix"
 ---
 
-Configure Strix using environment variables or a config file.
+Configure Strix from its interactive TUI, with environment variables, or with a
+config file. Run `strix`, type `/config` to inspect the active non-secret values,
+and use `/model`, `/apikey`, `/baseurl`, or `/reasoning` to change them. Type `/`
+for the complete searchable command palette.
+
+The TUI masks API keys and writes them to `~/.strix/cli-config.json` with private
+file permissions. It never sends a stored key back to the terminal client.
+Environment variables take precedence over saved values.
 
 ## LLM Configuration
 

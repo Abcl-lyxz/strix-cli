@@ -13,6 +13,9 @@ import (
 )
 
 func (m Model) submit(value string) (tea.Model, tea.Cmd) {
+	if model, cmd, handled := m.submitSlashCommand(value); handled {
+		return model, cmd
+	}
 	if m.snapshot.SetupMode {
 		return m.submitSetupPrompt(value)
 	}
@@ -137,7 +140,13 @@ func (m Model) layout() (showSidebar bool, sidebarWidth, chatWidth, chatHeight i
 	if m.statusVisible() {
 		statusH = 1
 	}
-	chatHeight = max(4, m.height-statusH-(m.input.Height()+2))
+	paletteH := 0
+	if !m.snapshot.SetupMode {
+		if palette := m.commandPaletteView(chatWidth); palette != "" {
+			paletteH = lipgloss.Height(palette) + 1
+		}
+	}
+	chatHeight = max(4, m.height-statusH-(m.input.Height()+2)-paletteH)
 	return
 }
 
@@ -335,11 +344,14 @@ func (m Model) setupRestingHeight(fit setupFit, height int) int {
 // the target list, feedback and the key hints. Sections
 // are separated by a blank line; the composer and its summary read as one unit.
 func (m Model) setupBody(fit setupFit) string {
-	parts := make([]string, 0, 6)
+	parts := make([]string, 0, 7)
 	if header := m.setupHeaderView(fit); header != "" {
 		parts = append(parts, header)
 	}
 	parts = append(parts, m.setupComposer(fit.width))
+	if palette := m.commandPaletteView(fit.width); palette != "" {
+		parts = append(parts, palette)
+	}
 	if log := m.setupLogView(fit); log != "" {
 		parts = append(parts, log)
 	}
@@ -416,7 +428,7 @@ func (m Model) setupComposer(width int) string {
 	// Width covers the padding but not the border, so a box of the given total
 	// width sets width-2 here and hands the interior the width-4 that is left.
 	inner := max(1, width-4)
-	body := m.highlightInputSelection(m.input.View())
+	body := m.highlightInputSelection(m.inputView())
 	body += "\n\n" + m.setupSummaryView(inner)
 	if targets := m.setupTargetsView(inner); targets != "" {
 		body += "\n" + targets
@@ -443,10 +455,16 @@ func (m Model) setupSummaryView(width int) string {
 		}
 	} else {
 		chips = append(chips, render.Col(amber).Render("○ no model")+
-			render.Dim().Render(" · set STRIX_LLM or configure one in your config"))
+			render.Dim().Render(" · type /model provider/model"))
+	}
+	if m.snapshot.APIKeyConfigured {
+		chips = append(chips, render.Dim().Render("key saved"))
 	}
 	if m.snapshot.MaxBudgetUSD != nil {
 		chips = append(chips, render.Dim().Render(fmt.Sprintf("$%.2f budget", *m.snapshot.MaxBudgetUSD)))
+	}
+	if m.snapshot.MaxAgents > 0 {
+		chips = append(chips, render.Dim().Render(fmt.Sprintf("%d agents max", m.snapshot.MaxAgents)))
 	}
 	return truncate(strings.Join(chips, render.Dim().Render(" · ")), max(1, width))
 }
@@ -493,7 +511,7 @@ func (m Model) setupHintsView(width int) string {
 	key := lipgloss.NewStyle().Foreground(white).Render
 	label := render.Dim().Render
 	hint := func(k, text string) string { return key(k) + label(" "+text) }
-	left := hint("enter", "launch scan") + label("   ") + hint("ctrl+c", "quit")
+	left := hint("enter", "launch scan") + label("   ") + hint("/", "commands") + label("   ") + hint("ctrl+c", "quit")
 	if lipgloss.Width(left) > inner {
 		left = hint("enter", "launch scan")
 	}

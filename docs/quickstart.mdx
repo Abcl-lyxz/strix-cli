@@ -25,12 +25,23 @@ description: "Install Strix and run your first security scan"
 
 ## Configuration
 
-Set your LLM provider:
+Start Strix and configure your provider directly in the TUI:
 
 ```bash
-export STRIX_LLM="openrouter/z-ai/glm-5.3"
-export LLM_API_KEY="your-api-key"
+strix
 ```
+
+Then enter:
+
+```text
+/model openrouter/z-ai/glm-5.3
+/apikey
+```
+
+Enter your key in the small masked popup. It is saved privately in
+`~/.strix/cli-config.json`. Type `/config` to inspect the non-secret settings or
+`/` to search all available commands. Environment variables are still supported
+and take precedence, which is useful for CI and headless runs.
 
 <Tip>
 For best results, use `openrouter/z-ai/glm-5.3` (the default pick), `openai/gpt-5.4`, `anthropic/claude-opus-4-6`, or `openai/gpt-5.2`.
@@ -41,6 +52,9 @@ For best results, use `openrouter/z-ai/glm-5.3` (the default pick), `openai/gpt-
 ```bash
 strix --target ./your-app
 ```
+
+You can also stay on the launch screen and use `/target ./your-app`, adjust
+`/mode`, `/budget`, `/turns`, `/agents`, and `/scope`, then run `/start`.
 
 <Note>
 First run pulls the Docker sandbox image automatically. Results are saved to `strix_runs/<run-name>`.
