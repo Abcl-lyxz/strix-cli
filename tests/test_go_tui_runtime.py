@@ -215,6 +215,7 @@ async def test_runtime_does_not_initialize_or_scan_before_ready(
     runtime_args = args()
     runtime_args.needs_setup = False
     runtime = GoTuiRuntime(runtime_args)
+    monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
     calls: list[str] = []
@@ -1037,6 +1038,7 @@ async def test_prepare_and_start_reports_ordinary_connection_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = GoTuiRuntime(_direct_launch_args())
+    monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
     started: list[str] = []
 
     async def preflight(_model: str) -> None:
@@ -1058,6 +1060,7 @@ async def test_prepare_and_start_runs_the_scan_after_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = GoTuiRuntime(_direct_launch_args())
+    monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
     order: list[str] = []
 
     async def preflight(_model: str) -> None:
