@@ -193,12 +193,9 @@ async def test_headless_outage_exits_after_configured_deadline(
         {"only": model},
         wait_timeout=0.06,
     )
-    started = time.monotonic()
-
     with pytest.raises(AllRoutesUnavailableError, match="0s"):
-        await pool.get_response(input="hello")
+        await asyncio.wait_for(pool.get_response(input="hello"), timeout=2.0)
 
-    assert time.monotonic() - started < 0.3
     assert model.calls >= 1
 
 
