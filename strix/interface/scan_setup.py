@@ -62,17 +62,35 @@ async def preflight_model_connection(
     model_name: str,
     *,
     settings: Settings | None = None,
+    selected_routes: list[str] | None = None,
 ) -> None:
     """Verify the configured model route using the run's real transport mode."""
     from agents.model_settings import ModelSettings
     from agents.models.interface import ModelTracing
 
     from strix.config.models import StrixProvider, configure_sdk_model_defaults
+    from strix.config.routes import load_routes
     from strix.core.inputs import make_model_settings
+    from strix.routing import RoutedModel, RoutePool
 
     resolved_settings = load_settings() if settings is None else settings
     configure_sdk_model_defaults(resolved_settings)
-    model = StrixProvider().get_model(model_name)
+    route_pool = None
+    try:
+        routes = load_routes(resolved_settings, selected=selected_routes)
+    except (AttributeError, TypeError, ValueError):
+        # Tests and embedders may pass a minimal settings object with no route
+        # section. The direct single-model preflight remains supported.
+        routes = []
+    matching = [route for route in routes if not model_name or route.model == model_name]
+    if matching:
+        route_pool = RoutePool(
+            matching,
+            wait_timeout=min(float(resolved_settings.llm.timeout), 45.0),
+        )
+    model = (
+        RoutedModel(route_pool) if route_pool is not None else StrixProvider().get_model(model_name)
+    )
     request_settings = make_model_settings(
         None,
         model_name=model_name,
@@ -107,9 +125,13 @@ async def preflight_model_connection(
 
     timeout = min(float(resolved_settings.llm.timeout), 45.0)
     try:
-        await asyncio.wait_for(perform_check(), timeout=timeout)
-    except TimeoutError as exc:
-        raise TimeoutError(f"model connection check timed out after {timeout:g}s") from exc
+        try:
+            await asyncio.wait_for(perform_check(), timeout=timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(f"model connection check timed out after {timeout:g}s") from exc
+    finally:
+        if route_pool is not None:
+            await route_pool.close()
 
 
 def build_targets_info(args: argparse.Namespace) -> None:

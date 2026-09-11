@@ -35,7 +35,9 @@ from strix.core.sessions import (
     strip_all_images_from_session,
 )
 from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.notifications import NotificationAction, notify
 from strix.resilience import full_jitter_delay, retry_after_seconds
+from strix.routing import AllRoutesUnavailableError
 
 
 if TYPE_CHECKING:
@@ -55,6 +57,7 @@ StreamEventSink = Callable[[str, Any], None]
 
 _INPUT_REJECTION_CODES = frozenset({400, 404, 422})
 _MAX_COMPACTIONS_PER_CYCLE = 2
+_MAX_AGENT_CRASH_RESTARTS = 2
 
 
 @cache
@@ -88,6 +91,11 @@ def _structured_provider_refusal(result: Any) -> str | None:
 
 
 def _run_config_model(run_config: RunConfig) -> str | None:
+    provider = getattr(run_config, "model_provider", None)
+    pool = getattr(provider, "pool", None)
+    context_model = getattr(pool, "context_model", None)
+    if callable(context_model):
+        return cast("str", context_model())
     return run_config.model if isinstance(run_config.model, str) else None
 
 
@@ -118,6 +126,7 @@ async def _compact_session(
         instructions=_agent_instructions(agent),
         tools_text=_agent_tools_text(agent),
         force=force,
+        model_provider=getattr(run_config, "model_provider", None),
     )
 
 
@@ -161,22 +170,37 @@ async def _salvage_stream_to_session(
     pre_run_items: list[Any],
     stream: Any,
     agent_id: str,
-) -> None:
+) -> bool:
     """Persist a crashed run's full history so a revived agent loses no context."""
     if stream is None:
-        return
+        return False
     try:
         replay = list(stream.to_input_list())
     except Exception:
         logger.exception("could not build salvage history for %s", agent_id)
-        return
+        return False
     desired = list(pre_run_items) + replay
     if len(desired) <= len(pre_run_items):
-        return
+        return False
     try:
         await replace_session_items(session, desired)
     except Exception:
         logger.exception("salvaging crashed run history failed for %s", agent_id)
+        return False
+    return True
+
+
+def _successful_turn_event(event: Any) -> tuple[bool, bool]:
+    """Return (turn completed, tool output committed) for an SDK stream event."""
+    if getattr(event, "type", "") == "raw_response_event":
+        completed = getattr(getattr(event, "data", None), "type", "") == "response.completed"
+        return completed, False
+    if getattr(event, "type", "") != "run_item_stream_event":
+        return False, False
+    item_type = getattr(getattr(event, "item", None), "type", "")
+    return item_type in {"message_output_item", "tool_call_output_item"}, (
+        item_type == "tool_call_output_item"
+    )
 
 
 async def _seed_and_prepare_first_input(
@@ -190,7 +214,7 @@ async def _seed_and_prepare_first_input(
     return initial_input
 
 
-async def run_agent_loop(
+async def run_agent_loop(  # noqa: PLR0912
     *,
     agent: Any,
     initial_input: Any,
@@ -251,7 +275,12 @@ async def run_agent_loop(
     while True:
         timeout = await _plain_waiting_timeout(coordinator, agent_id)
         try:
-            woke = await coordinator.wait_for_message(agent_id, timeout=timeout)
+            woke, route_ready = await _wait_for_resume(
+                coordinator,
+                agent_id,
+                context=context,
+                timeout=timeout,
+            )
         except asyncio.CancelledError:
             return result
 
@@ -263,7 +292,9 @@ async def run_agent_loop(
             await coordinator.set_status(agent_id, "stopped")
             raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
-        if woke:
+        if route_ready:
+            logger.info("model route recovered; auto-resuming agent %s", agent_id)
+        elif woke:
             # Real input is real progress, so the nudge budget starts over. A bare
             # auto-resume is not: it must not hand a wedged agent a fresh budget.
             await coordinator.reset_recovery(agent_id)
@@ -291,7 +322,10 @@ async def run_agent_loop(
                 interrupt=False,
             )
 
-        await coordinator.consume_pending(agent_id)
+        pending_count, _pending_items = await coordinator.consume_pending(agent_id)
+        if route_ready and pending_count:
+            await coordinator.reset_recovery(agent_id)
+            await coordinator.reset_idle_resumes(agent_id)
         with contextlib.suppress(BudgetPausedError):
             result = await _run_until_lifecycle(
                 agent,
@@ -306,6 +340,43 @@ async def run_agent_loop(
                 event_sink=event_sink,
                 hooks=hooks,
             )
+
+
+async def _wait_for_resume(
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    *,
+    context: dict[str, Any],
+    timeout: float | None,
+) -> tuple[bool, bool]:
+    """Wait for agent input or recovered provider capacity.
+
+    The second return value is true only when a provider-waiting agent should
+    retry its unchanged session. The race preserves ordinary user/agent wakeups
+    and does not add a synthetic transcript message for route recovery.
+    """
+    async with coordinator._lock:
+        wait_kind = coordinator.wait_kinds.get(agent_id)
+    route_pool = context.get("route_pool")
+    wait_for_route = getattr(route_pool, "wait_until_available", None)
+    if wait_kind != "provider" or not callable(wait_for_route):
+        return await coordinator.wait_for_message(agent_id, timeout=timeout), False
+
+    message_task = asyncio.create_task(coordinator.wait_for_message(agent_id))
+    route_task = asyncio.create_task(wait_for_route())
+    try:
+        done, _pending = await asyncio.wait(
+            {message_task, route_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if message_task in done:
+            return message_task.result(), False
+        return False, True
+    finally:
+        for task in (message_task, route_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(message_task, route_task, return_exceptions=True)
 
 
 async def spawn_child_agent(
@@ -641,6 +712,10 @@ async def _run_cycle_parked(
         )
     except (BudgetExceededError, BudgetPausedError, SubagentBudgetReservedError):
         raise
+    except AllRoutesUnavailableError:
+        # `_run_cycle` already checkpointed the waiting state. Keep it parked so
+        # an interactive resume/configuration change can wake the same session.
+        return None
     except Exception as exc:
         logger.exception("error escaped the run cycle for %s; parking as failed", agent_id)
         await coordinator.set_status(agent_id, "failed", error=str(exc) or type(exc).__name__)
@@ -666,9 +741,11 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     compactions = 0
     model_retries = 0
     model_retry_started_at: float | None = None
+    crash_restarts = 0
     while True:
         stream: Any = None
         pre_run_items: list[Any] = []
+        tool_output_committed = False
         try:
             await coordinator.mark_running(agent_id)
             if session is not None:
@@ -697,6 +774,15 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             try:
                 try:
                     async for event in stream.stream_events():
+                        turn_completed, tool_completed = _successful_turn_event(event)
+                        if turn_completed:
+                            # Recovery budgets are per turn, not per agent
+                            # lifetime. A successful model/tool boundary proves
+                            # this session is healthy again.
+                            crash_restarts = 0
+                            model_retries = 0
+                            model_retry_started_at = None
+                        tool_output_committed = tool_output_committed or tool_completed
                         if event_sink is not None:
                             try:
                                 event_sink(agent_id, event)
@@ -742,6 +828,19 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             await coordinator.trigger_budget_stop()
             raise
         except Exception as exc:
+            if isinstance(exc, AllRoutesUnavailableError):
+                await coordinator.park_waiting(agent_id, wait_kind="provider")
+                notify(
+                    "agent.waiting",
+                    title=f"Agent {agent_id} is waiting for a model route",
+                    detail=str(exc),
+                    severity="warning",
+                    agent_id=agent_id,
+                    route_id=None,
+                    dedupe_key=f"agent-route-wait:{agent_id}",
+                    actions=(NotificationAction("open_agent", "View agent", agent_id),),
+                )
+                raise
             if (
                 image_strips < 3
                 and session is not None
@@ -780,7 +879,16 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
                     input_data = []
                     continue
-            if model_retries < _MAX_TRANSIENT_MODEL_RETRIES and _is_transient_model_error(exc):
+            safe_tool_state = not tool_output_committed
+            if tool_output_committed and session is not None:
+                safe_tool_state = await _salvage_stream_to_session(
+                    session, pre_run_items, stream, agent_id
+                )
+            if (
+                safe_tool_state
+                and model_retries < _MAX_TRANSIENT_MODEL_RETRIES
+                and _is_transient_model_error(exc)
+            ):
                 now = time.monotonic()
                 if model_retry_started_at is None:
                     model_retry_started_at = now
@@ -821,12 +929,48 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 status = "failed"
             else:
                 status = "crashed"
+            if status == "crashed" and crash_restarts < _MAX_AGENT_CRASH_RESTARTS:
+                crash_restarts += 1
+                notify(
+                    "agent.crashed",
+                    title=f"Agent {agent_id} crashed",
+                    detail=str(exc) or type(exc).__name__,
+                    severity="error",
+                    agent_id=agent_id,
+                    dedupe_key=f"agent-crash:{agent_id}",
+                    actions=(NotificationAction("open_agent", "View agent", agent_id),),
+                )
+                logger.exception(
+                    "agent %s crashed; restarting same session (%d/%d)",
+                    agent_id,
+                    crash_restarts,
+                    _MAX_AGENT_CRASH_RESTARTS,
+                )
+                notify(
+                    "agent.restarted",
+                    title=f"Agent {agent_id} restarted",
+                    severity="warning",
+                    agent_id=agent_id,
+                    dedupe_key=f"agent-restart:{agent_id}",
+                )
+                input_data = [] if session is not None else input_data
+                await asyncio.sleep(_transient_model_retry_delay(crash_restarts))
+                continue
             logger.exception("agent run failed for %s; marking %s", agent_id, status)
             # Settle the status and wake the parent before the exception unwinds a
             # non-interactive agent's task: a child that dies still owes its parent a
             # report, and the parent would otherwise wait out its timeout on a message
             # the dead child can no longer send.
             await coordinator.set_status(agent_id, status, error=str(exc) or type(exc).__name__)
+            notify(
+                f"agent.{status}",
+                title=f"Agent {agent_id} {status}",
+                detail=str(exc) or type(exc).__name__,
+                severity="error",
+                agent_id=agent_id,
+                dedupe_key=f"agent-terminal:{agent_id}:{status}",
+                actions=(NotificationAction("open_agent", "View agent", agent_id),),
+            )
             await notify_parent_on_terminal(coordinator, agent_id, status)
             if not interactive:
                 raise

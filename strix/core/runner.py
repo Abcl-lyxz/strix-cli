@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -18,13 +19,13 @@ from openai import RateLimitError
 
 from strix.agents.factory import build_strix_agent, make_child_factory
 from strix.agents.prompt import render_system_prompt
-from strix.config import load_settings
+from strix.config import config_path, load_settings
 from strix.config.models import (
-    StrixProvider,
     configure_sdk_model_defaults,
     supports_strict_tool_schemas,
     uses_chat_completions_tool_schema,
 )
+from strix.config.routes import load_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.agents import AgentCoordinator
 from strix.core.execution import (
@@ -44,6 +45,12 @@ from strix.core.inputs import (
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.core.sessions import open_agent_session
 from strix.report.state import get_global_report_state
+from strix.routing import (
+    AllRoutesUnavailableError,
+    RouteConfig,
+    RoutePool,
+    SmartRouteProvider,
+)
 from strix.runtime import session_manager
 from strix.telemetry import set_scan_phase
 from strix.telemetry.logging import set_scan_id, setup_scan_logging
@@ -77,6 +84,34 @@ StreamEventSink = Callable[[str, Any], None]
 # snapshot of the whole roster (not a per-
 # connection delta) so every call carries a consistent, current picture.
 McpStatusSink = Callable[[list[dict[str, Any]]], None]
+
+
+def _route_reloader(
+    selected: object,
+) -> Callable[[], tuple[object, list[RouteConfig]]]:
+    """Build a non-secret route snapshot watched by parked interactive agents."""
+    selected_names = (
+        [str(name) for name in selected]
+        if isinstance(selected, list) and all(isinstance(name, str) for name in selected)
+        else None
+    )
+
+    def reload() -> tuple[object, list[RouteConfig]]:
+        route_file = os.environ.get("STRIX_ROUTES_FILE", "").strip()
+        source = Path(route_file) if route_file else config_path()
+        try:
+            stat_result = source.stat()
+            revision: object = (
+                str(source),
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+                stat_result.st_size,
+            )
+        except OSError:
+            revision = (str(source), None)
+        return revision, load_routes(load_settings(), selected=selected_names)
+
+    return reload
 
 
 def _mcp_roster_payload(registry: McpRegistry) -> list[dict[str, Any]]:
@@ -259,16 +294,44 @@ async def run_strix_scan(
 
     settings = load_settings()
     configure_sdk_model_defaults(settings)
-    resolved_model = (model or settings.llm.model or "").strip()
-    if not resolved_model:
-        raise RuntimeError(
-            "No LLM model configured. Set STRIX_LLM env or pass model= to run_strix_scan().",
-        )
-    logger.info("LLM model resolved: %s", resolved_model)
-    chat_completions_tools = uses_chat_completions_tool_schema(resolved_model, settings)
-    strict_tool_schemas = supports_strict_tool_schemas(resolved_model)
+    routes = (
+        [
+            RouteConfig(
+                name="override",
+                model=model.strip(),
+                base_url=settings.llm.api_base,
+            )
+        ]
+        if model and model.strip()
+        else load_routes(settings, selected=scan_config.get("routes"))
+    )
+    resolved_model = min(routes, key=lambda route: (route.priority, route.name)).model
+    logger.info(
+        "LLM route pool resolved: %d route(s), primary model=%s",
+        len(routes),
+        resolved_model,
+    )
+    chat_completions_tools = any(
+        uses_chat_completions_tool_schema(route.model, settings)
+        for route in routes
+        if route.enabled
+    )
+    strict_tool_schemas = all(
+        supports_strict_tool_schemas(route.model) for route in routes if route.enabled
+    )
     if not strict_tool_schemas:
         logger.info("Sending non-strict tool schemas: %s caps strict tools", resolved_model)
+
+    route_pool = RoutePool(
+        routes,
+        wait_timeout=(
+            None
+            if interactive
+            else float(getattr(getattr(settings, "routing", None), "outage_timeout", 600))
+        ),
+        health_path=state_dir / "routes.json",
+        route_reloader=_route_reloader(scan_config.get("routes")),
+    )
 
     if coordinator is None:
         coordinator = AgentCoordinator(max_active_agents=max_agents)
@@ -375,7 +438,7 @@ async def run_strix_scan(
         )
         run_config = RunConfig(
             model=resolved_model,
-            model_provider=StrixProvider(),
+            model_provider=SmartRouteProvider(route_pool),
             model_settings=model_settings,
             sandbox=SandboxRunConfig(client=bundle["client"], session=bundle["session"]),
             trace_include_sensitive_data=False,
@@ -543,6 +606,7 @@ async def run_strix_scan(
             "spawn_child_agent": spawn_child_agent,
             "scan_targets": build_scan_targets(scan_config),
             "max_context_images": settings.runtime.max_context_images,
+            "route_pool": route_pool,
         }
 
         root_session = open_agent_session(root_id, agents_db)
@@ -633,15 +697,15 @@ async def run_strix_scan(
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
-    except RateLimitError as exc:
+    except (AllRoutesUnavailableError, RateLimitError) as exc:
         logger.warning(
-            "Scan %s stopped: persistent rate limit from the LLM provider (%s). "
-            "Resume with 'strix --resume %s' once the limit clears.",
+            "Scan %s checkpointed: every configured LLM route is unavailable (%s). "
+            "Resume with 'strix --resume %s' after a route recovers.",
             scan_id,
             exc,
             scan_id,
         )
-        _note_exit_reason("rate_limited")
+        _note_exit_reason("routes_unavailable")
         if root_id is not None:
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
@@ -665,6 +729,8 @@ async def run_strix_scan(
         if root_id is not None:
             with contextlib.suppress(Exception):
                 await coordinator.cancel_descendants(root_id)
+        with contextlib.suppress(Exception):
+            await route_pool.close()
         for s in sessions_to_close:
             with contextlib.suppress(Exception):
                 s.close()

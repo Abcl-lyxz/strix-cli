@@ -236,6 +236,13 @@ Strix Cloud:
     )
 
     parser.add_argument(
+        "--route",
+        action="append",
+        metavar="NAME",
+        help="Use only this configured model route for the run. Repeat to select a pool.",
+    )
+
+    parser.add_argument(
         "--mcp-config",
         type=str,
         metavar="PATH",

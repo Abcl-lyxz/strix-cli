@@ -115,6 +115,14 @@ class RuntimeSettings(BaseSettings):
     max_context_images: int = Field(default=3, ge=0, alias="STRIX_MAX_CONTEXT_IMAGES")
 
 
+class RoutingSettings(BaseSettings):
+    """Shared route-pool outage behavior."""
+
+    model_config = _BASE_CONFIG
+
+    outage_timeout: int = Field(default=600, ge=1, alias="STRIX_ROUTE_OUTAGE_TIMEOUT")
+
+
 class TelemetrySettings(BaseSettings):
     model_config = _BASE_CONFIG
 
@@ -175,6 +183,7 @@ class Settings(BaseSettings):
     dedupe: DedupeSettings = Field(default_factory=DedupeSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    routing: RoutingSettings = Field(default_factory=RoutingSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     integrations: IntegrationSettings = Field(default_factory=IntegrationSettings)
     viewer: ViewerSettings = Field(default_factory=ViewerSettings)

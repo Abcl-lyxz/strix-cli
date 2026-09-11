@@ -1,6 +1,7 @@
 import atexit
 import contextlib
 import logging
+import os
 import signal
 import sys
 import threading
@@ -15,6 +16,7 @@ from rich.text import Text
 from strix.config import load_settings
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.runner import run_strix_scan
+from strix.notifications import get_notification_service
 from strix.report.state import ReportState, set_global_report_state
 from strix.runtime import session_manager
 
@@ -40,6 +42,11 @@ def _resolve_sandbox_image() -> str:
 
 async def run_cli(args: Any) -> None:  # noqa: PLR0915
     console = Console()
+    if bool(getattr(args, "non_interactive", False)):
+        get_notification_service().configure_headless(
+            enabled=True,
+            structured=os.environ.get("STRIX_NOTIFICATION_FORMAT", "").lower() == "json",
+        )
 
     start_text = Text()
     start_text.append("Penetration test initiated", style="bold #22c55e")
@@ -99,6 +106,7 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
         "diff_base": getattr(args, "diff_base", None),
         "resume_instruction": getattr(args, "user_explicit_instruction", None) or "",
         "max_agents": getattr(args, "max_agents", DEFAULT_MAX_AGENTS),
+        "routes": getattr(args, "route", None) or [],
     }
 
     report_state = ReportState(args.run_name)

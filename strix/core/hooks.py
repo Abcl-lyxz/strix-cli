@@ -241,10 +241,13 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
             agent_id = agent_name or "unknown"
 
         try:
+            actual_model = getattr(response, "_strix_model_name", None)
+            actual_route = getattr(response, "_strix_route_name", None)
             report_state.record_sdk_usage(
                 agent_id=agent_id,
                 agent_name=agent_name,
-                model=self._model,
+                model=actual_model if isinstance(actual_model, str) else self._model,
+                route=actual_route if isinstance(actual_route, str) else None,
                 usage=response.usage,
             )
         except Exception:

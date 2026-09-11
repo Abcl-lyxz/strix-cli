@@ -30,7 +30,7 @@ ACTIVE_STATUSES: frozenset[str] = frozenset({"running", "waiting", "budget_pause
 # Why an agent parked. The user can message any agent, so this - not the agent's
 # position in the tree - decides whether waiting is bounded: only an agent waiting
 # on other agents is re-checked on a timer.
-WaitKind = Literal["user", "agents", "stalled"]
+WaitKind = Literal["user", "agents", "provider", "stalled"]
 
 
 @dataclass(slots=True)

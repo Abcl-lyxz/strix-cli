@@ -20,6 +20,8 @@ class LLMUsageLedger:
         self._total_usage = Usage()
         self._agent_usage: dict[str, Usage] = {}
         self._agent_metadata: dict[str, dict[str, str]] = {}
+        self._route_usage: dict[tuple[str, str], Usage] = {}
+        self._route_estimated_cost: dict[tuple[str, str], float] = {}
         self._observed_cost = 0.0
         self._estimated_cost = 0.0
         self._has_observed_cost = False
@@ -34,6 +36,7 @@ class LLMUsageLedger:
         usage: Usage | None,
         agent_name: str | None = None,
         model: str | None = None,
+        route: str | None = None,
     ) -> bool:
         if usage is None or not _usage_has_activity(usage):
             return False
@@ -47,11 +50,22 @@ class LLMUsageLedger:
             metadata["agent_name"] = agent_name
         if model:
             metadata["model"] = model
+        if route:
+            metadata["route"] = route
+
+        if route and model:
+            route_key = (route, model)
+            self._route_usage.setdefault(route_key, Usage()).add(usage)
 
         if not self.zero_cost:
             estimated = _estimate_litellm_cost(usage, model)
             if estimated:
                 self._estimated_cost += estimated
+                if route and model:
+                    route_key = (route, model)
+                    self._route_estimated_cost[route_key] = (
+                        self._route_estimated_cost.get(route_key, 0.0) + estimated
+                    )
 
         return True
 
@@ -72,6 +86,7 @@ class LLMUsageLedger:
         record = serialize_usage(self._total_usage)
         record["cost"] = self.total_cost
         record["agents"] = []
+        record["routes"] = []
 
         agent_tokens = {aid: _resolve_total_tokens(u) for aid, u in self._agent_usage.items()}
         total_tokens = sum(agent_tokens.values())
@@ -88,17 +103,31 @@ class LLMUsageLedger:
                     "agent_id": agent_id,
                     "agent_name": metadata.get("agent_name") or agent_id,
                     "model": metadata.get("model"),
+                    "route": metadata.get("route"),
                     "cost": _round_cost(agent_cost),
                 }
             )
             record["agents"].append(agent_record)
 
+        for (route, model), usage in sorted(self._route_usage.items()):
+            route_record = serialize_usage(usage)
+            route_record.update(
+                {
+                    "route": route,
+                    "model": model,
+                    "cost": _round_cost(self._route_estimated_cost.get((route, model), 0.0)),
+                }
+            )
+            record["routes"].append(route_record)
+
         return record
 
-    def hydrate(self, raw_usage: Any) -> None:
+    def hydrate(self, raw_usage: Any) -> None:  # noqa: PLR0912, PLR0915
         self._total_usage = Usage()
         self._agent_usage.clear()
         self._agent_metadata.clear()
+        self._route_usage.clear()
+        self._route_estimated_cost.clear()
         self._observed_cost = 0.0
         self._estimated_cost = 0.0
         self._has_observed_cost = False
@@ -135,7 +164,25 @@ class LLMUsageLedger:
                 metadata["agent_name"] = agent_name
             if isinstance(model, str) and model:
                 metadata["model"] = model
+            route = raw_agent.get("route")
+            if isinstance(route, str) and route:
+                metadata["route"] = route
             self._agent_metadata[agent_id] = metadata
+
+        for raw_route in raw_usage.get("routes") or []:
+            if not isinstance(raw_route, dict):
+                continue
+            route = raw_route.get("route")
+            model = raw_route.get("model")
+            if not isinstance(route, str) or not isinstance(model, str):
+                continue
+            key = (route, model)
+            try:
+                self._route_usage[key] = deserialize_usage(raw_route)
+            except Exception:
+                logger.exception("Failed to hydrate llm_usage for route %s", route)
+                continue
+            self._route_estimated_cost[key] = _float_or_zero(raw_route.get("cost"))
 
 
 def _resolve_total_tokens(usage: Usage) -> int:

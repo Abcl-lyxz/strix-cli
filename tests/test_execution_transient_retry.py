@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -90,6 +91,24 @@ def test_client_errors_are_not_transient() -> None:
 
 def test_turn_replay_budget_is_small_to_avoid_nested_retry_storms() -> None:
     assert execution._MAX_TRANSIENT_MODEL_RETRIES == 2
+
+
+def test_successful_tool_event_marks_turn_and_committed_tool_output() -> None:
+    event = SimpleNamespace(
+        type="run_item_stream_event",
+        item=SimpleNamespace(type="tool_call_output_item"),
+    )
+
+    assert execution._successful_turn_event(event) == (True, True)
+
+
+def test_partial_text_delta_does_not_reset_recovery_budget() -> None:
+    event = SimpleNamespace(
+        type="raw_response_event",
+        data=SimpleNamespace(type="response.output_text.delta"),
+    )
+
+    assert execution._successful_turn_event(event) == (False, False)
 
 
 class _FakeStream:
