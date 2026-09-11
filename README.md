@@ -307,11 +307,20 @@ export LLM_API_KEY="your-api-key"
 
 # Optional
 export LLM_API_BASE="your-api-base-url"  # if using a local model, e.g. Ollama, LMStudio
+
+# Optional custom Agent Skills (separate multiple roots with your OS path separator)
+export STRIX_SKILL_DIRS="/path/to/team-skills:/path/to/personal-skills"
 ```
 
 > [!NOTE]
 > Strix automatically saves your configuration to `~/.strix/cli-config.json`, so you don't have to re-enter it on every run.
 > See the [configuration reference](https://docs.strix.ai/advanced/configuration) for every environment variable.
+
+Strix also discovers project-local Agent Skills from `.agents/skills`, `.codex/skills`,
+and `.strix/skills`. Both `<category>/<name>.md` and the standard
+`<name>/SKILL.md` layout are supported. During a scan, agents can rank installed
+skills and search configured web providers for additional skills; remote results
+remain suggestions until you review and install them locally.
 
 #### Sign in with a ChatGPT subscription
 

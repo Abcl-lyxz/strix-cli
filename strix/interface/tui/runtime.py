@@ -49,6 +49,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_COMPILE_NOTICE = "Compiling the TUI from source (cached after the first run)..."
+
+
+def _print_compile_notice(stream: Any) -> None:
+    """Print startup status without assuming the parent supports ANSI escapes."""
+    print(_COMPILE_NOTICE, file=stream, flush=True)
+
 
 def _revision_count(report: dict[str, Any]) -> int:
     history = report.get("update_history")
@@ -453,11 +460,7 @@ class GoTuiRuntime:
             if cwd is not None:
                 # go run compiles the sidecar when the build cache is cold, so
                 # tell the terminal why nothing is on screen yet.
-                print(
-                    "\x1b[2mCompiling the TUI from source (cached after the first run)...\x1b[0m",
-                    file=original_stdout,
-                    flush=True,
-                )
+                _print_compile_notice(original_stdout)
             process, backend_socket = await launch_tui_process(command, env, cwd)
             await self.server.start(backend_socket)
             prepare_task = self._start_preparation()

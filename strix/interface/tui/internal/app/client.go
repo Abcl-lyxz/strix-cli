@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	maxCommandBytes    = 64 << 10
+	maxCommandBytes    = 512 << 10
 	maxCollectionBytes = 4 << 20
 )
 

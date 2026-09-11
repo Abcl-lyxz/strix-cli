@@ -6,8 +6,8 @@ import (
 )
 
 func TestProtocolVersionAndCapabilities(t *testing.T) {
-	if Version != 4 {
-		t.Fatalf("protocol version = %d, want 4", Version)
+	if Version != 5 {
+		t.Fatalf("protocol version = %d, want 5", Version)
 	}
 	wantCapabilities := []string{
 		"state-revisions",
@@ -15,6 +15,7 @@ func TestProtocolVersionAndCapabilities(t *testing.T) {
 		"structured-command-errors",
 		"agents-collection",
 		"interactive-configuration",
+		"large-user-prompts",
 	}
 	if !reflect.DeepEqual(Capabilities, wantCapabilities) {
 		t.Fatalf("capabilities = %#v, want %#v", Capabilities, wantCapabilities)

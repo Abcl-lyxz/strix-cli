@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 _STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused"})
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+_MAX_PROMPT_BYTES = 256 * 1024
 _LLM_ENV_ALIASES = frozenset(
     {
         "STRIX_LLM",
@@ -396,10 +397,7 @@ class TuiController:
 
     async def _set_instruction(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._require_setup_mutable()
-        instruction = payload.get("instruction", "")
-        if not isinstance(instruction, str):
-            raise TypeError("instruction must be a string")
-        self.instruction = instruction.strip()
+        self.instruction = self._prompt_text(payload, "instruction", allow_empty=True)
         return {"instruction": self.instruction}
 
     async def _configure_setup(  # noqa: PLR0912 - one atomic multi-field command
@@ -634,7 +632,7 @@ class TuiController:
 
     async def _send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = self._required_string(payload, "agent_id")
-        message = self._required_string(payload, "message")
+        message = self._prompt_text(payload, "message")
         if self.coordinator is None:
             raise RuntimeError("Agent coordinator is unavailable")
         if self.scan_loop is None or self.scan_loop.is_closed():
@@ -846,6 +844,19 @@ class TuiController:
     def _positive_int(value: Any, name: str) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _prompt_text(payload: dict[str, Any], name: str, *, allow_empty: bool = False) -> str:
+        value = payload.get(name, "" if allow_empty else None)
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string")
+        if not value.strip():
+            if allow_empty:
+                return ""
+            raise ValueError(f"{name} must be a non-empty string")
+        if len(value.encode("utf-8")) > _MAX_PROMPT_BYTES:
+            raise ValueError(f"{name} is too large (maximum 256 KiB)")
         return value
 
     @staticmethod

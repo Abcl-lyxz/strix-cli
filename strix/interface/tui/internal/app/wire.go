@@ -71,12 +71,17 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		var result protocol.CommandResult
 		if err := json.Unmarshal(envelope.Payload, &result); err != nil {
 			m.errorText = err.Error()
+			if m.client.Resolve(envelope.RequestID, expectedCommand) {
+				m.restoreDraft(m.takeDraft(envelope.RequestID, expectedCommand))
+			}
 			return nil
 		}
 		if result.Command != expectedCommand || !m.client.Resolve(envelope.RequestID, result.Command) {
 			return nil
 		}
+		draft := m.takeDraft(envelope.RequestID, result.Command)
 		if !result.OK {
+			m.restoreDraft(draft)
 			if result.Command == "collection.resync" {
 				if collection := m.resyncRequests[envelope.RequestID]; collection != "" {
 					m.resyncRequested[collection] = false

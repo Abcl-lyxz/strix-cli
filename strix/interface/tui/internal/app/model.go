@@ -22,6 +22,7 @@ type sentMsg struct {
 	requestID  string
 	command    string
 	collection string
+	draft      string
 	err        error
 }
 type splashTickMsg time.Time
@@ -117,6 +118,8 @@ type Model struct {
 	eventSpans             []eventSpan
 	setupLog               []string
 	pendingPrompt          string
+	pendingDrafts          map[string]string
+	outboundDrafts         map[string]string
 	errorText              string
 	fatalError             error
 	selectedAgent          int
@@ -202,8 +205,9 @@ const (
 // The composer opens at minInputLines rows for breathing room and grows with
 // its content up to maxInputLines.
 const (
-	minInputLines = 3
-	maxInputLines = 8
+	minInputLines  = 3
+	maxInputLines  = 8
+	maxPromptBytes = 256 << 10
 )
 
 // newChatInput builds the multi-line chat composer. Enter submits (handled by
@@ -212,8 +216,13 @@ const (
 func newChatInput() textarea.Model {
 	input := textarea.New()
 	input.ShowLineNumbers = false
-	input.CharLimit = 4096
-	input.MaxHeight = maxInputLines
+	// Storage limits must not double as display limits. Bubbles treats
+	// MaxHeight as a hard newline limit, so the previous value silently
+	// discarded every typed line after the eighth. The composer is still
+	// visually capped by syncInputHeight, while the submit path enforces a
+	// byte limit that matches the IPC protocol.
+	input.CharLimit = 0
+	input.MaxHeight = 0
 	input.SetHeight(1)
 	input.KeyMap.InsertNewline = key.NewBinding(
 		key.WithKeys("shift+enter", "alt+enter", "ctrl+j"),
@@ -313,7 +322,7 @@ func New(client *Client) Model {
 		client: client, input: input, apiKeyInput: apiKeyInput, viewport: viewport.New(80, 20), vulnViewport: viewport.New(80, 20),
 		collapsedAgents: map[string]bool{}, expandedEvents: map[string]bool{}, blockCache: map[string]renderedBlock{}, showSplash: true, splashStarted: time.Now(), followOutput: true,
 		collectionRevisions: map[string]int{}, collectionAssemblies: map[string]*collectionAssembly{}, resyncRequested: map[string]bool{}, resyncRequests: map[string]string{},
-		seenMessages: map[string]bool{},
+		seenMessages: map[string]bool{}, pendingDrafts: map[string]string{}, outboundDrafts: map[string]string{},
 	}
 }
 
@@ -340,14 +349,65 @@ func readWire(client *Client) tea.Cmd {
 }
 
 func send(client *Client, command string, payload any) tea.Cmd {
+	return sendWithDraft(client, command, payload, "")
+}
+
+func sendWithDraft(client *Client, command string, payload any, draft string) tea.Cmd {
 	return func() tea.Msg {
 		requestID, err := client.Send(command, payload)
 		collection := ""
 		if values, ok := payload.(map[string]any); ok {
 			collection, _ = values["collection"].(string)
 		}
-		return sentMsg{requestID: requestID, command: command, collection: collection, err: err}
+		return sentMsg{requestID: requestID, command: command, collection: collection, draft: draft, err: err}
 	}
+}
+
+// normalizePastedNewlines prevents a Windows CRLF pair from becoming two hard
+// line breaks in Bubbles' rune sanitizer, which handles CR and LF separately.
+func normalizePastedNewlines(msg tea.KeyMsg) tea.KeyMsg {
+	if !msg.Paste || msg.Type != tea.KeyRunes {
+		return msg
+	}
+	value := strings.ReplaceAll(string(msg.Runes), "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	msg.Runes = []rune(value)
+	return msg
+}
+
+func (m *Model) rememberDraft(command, draft string) {
+	if m.outboundDrafts == nil {
+		m.outboundDrafts = map[string]string{}
+	}
+	m.outboundDrafts[command] = draft
+}
+
+func (m *Model) takeDraft(requestID, command string) string {
+	draft := m.pendingDrafts[requestID]
+	if draft == "" {
+		draft = m.outboundDrafts[command]
+	}
+	delete(m.pendingDrafts, requestID)
+	delete(m.outboundDrafts, command)
+	return draft
+}
+
+func (m *Model) restoreDraft(draft string) {
+	if draft == "" {
+		return
+	}
+	current := m.input.Value()
+	switch {
+	case current == "":
+		m.input.SetValue(draft)
+	case current == draft:
+		return
+	default:
+		// A reply can fail after the user has started the next message. Keep both
+		// instead of overwriting either draft.
+		m.input.SetValue(draft + "\n" + current)
+	}
+	m.resizeViewport()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -388,12 +448,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sentMsg:
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
+			delete(m.outboundDrafts, msg.command)
+			m.restoreDraft(msg.draft)
 			if msg.command == "collection.resync" && msg.collection != "" {
 				m.resyncRequested[msg.collection] = false
 			}
-		} else if msg.command == "collection.resync" && msg.requestID != "" && msg.collection != "" {
-			if m.resyncRequested[msg.collection] {
-				m.resyncRequests[msg.requestID] = msg.collection
+		} else {
+			// A very fast backend response can be handled before this sentMsg.
+			// Only retain request state while the client still considers it pending.
+			if msg.draft != "" {
+				if m.client != nil {
+					_, pending := m.client.ExpectedCommand(msg.requestID)
+					if pending {
+						m.pendingDrafts[msg.requestID] = msg.draft
+					} else {
+						delete(m.outboundDrafts, msg.command)
+					}
+				} else {
+					delete(m.outboundDrafts, msg.command)
+				}
+			}
+			if msg.command == "collection.resync" && msg.requestID != "" && msg.collection != "" {
+				if m.resyncRequested[msg.collection] {
+					m.resyncRequests[msg.requestID] = msg.collection
+				}
 			}
 		}
 	case selectionCopiedMsg:
@@ -418,6 +496,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		msg = normalizePastedNewlines(msg)
 		if m.showSplash {
 			switch msg.String() {
 			case "ctrl+c", "ctrl+q", "q", "esc":

@@ -2,7 +2,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = 4
+const Version = 5
 
 var Capabilities = []string{
 	"state-revisions",
@@ -10,6 +10,7 @@ var Capabilities = []string{
 	"structured-command-errors",
 	"agents-collection",
 	"interactive-configuration",
+	"large-user-prompts",
 }
 
 type Envelope struct {

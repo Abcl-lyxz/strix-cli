@@ -91,13 +91,17 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.String() == "enter" && m.focus == focusInput {
-			value := strings.TrimSpace(m.input.Value())
+			value := m.input.Value()
+			if strings.TrimSpace(value) == "" {
+				return m, nil
+			}
+			if len([]byte(value)) > maxPromptBytes {
+				m.errorText = "Prompt is too large (maximum 256 KiB)"
+				return m, nil
+			}
 			m.input.SetValue("")
 			m.resizeViewport()
-			if value != "" {
-				return m.submit(value)
-			}
-			return m, nil
+			return m.submit(value)
 		}
 	case "pgup":
 		if m.focus == focusVulnerabilities && len(m.snapshot.Vulnerabilities) > 0 {

@@ -21,12 +21,14 @@ func (m Model) submit(value string) (tea.Model, tea.Cmd) {
 	}
 	if len(m.snapshot.Agents) == 0 {
 		m.errorText = "No agent is available"
+		m.restoreDraft(value)
 		return m, nil
 	}
 	if m.selectedAgent >= len(m.snapshot.Agents) {
 		m.selectedAgent = 0
 	}
-	return m, send(m.client, "agent.send_message", map[string]any{"agent_id": m.snapshot.Agents[m.selectedAgent].ID, "message": value})
+	m.rememberDraft("agent.send_message", value)
+	return m, sendWithDraft(m.client, "agent.send_message", map[string]any{"agent_id": m.snapshot.Agents[m.selectedAgent].ID, "message": value}, value)
 }
 
 // submitSetupPrompt handles free text the way a coding agent's prompt does:
@@ -57,7 +59,8 @@ func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
 		m.pendingPrompt = value
 		payload["mount_working_dir"] = true
 	}
-	commands = append(commands, send(m.client, "setup.start", payload))
+	m.rememberDraft("setup.start", value)
+	commands = append(commands, sendWithDraft(m.client, "setup.start", payload, value))
 	// Ordered, not batched: setup.start leaves setup mode, so it must be the
 	// last command to reach the backend. Batched sends race, and if setup.start
 	// wins the target and instruction commands land after the guard closes and

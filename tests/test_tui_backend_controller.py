@@ -88,6 +88,17 @@ async def test_setup_state_is_serializable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_instruction_preserves_multiline_whitespace() -> None:
+    controller = TuiController(args())
+    instruction = "  first line\nsecond line \n"
+
+    result = await controller.handle("setup.set_instruction", {"instruction": instruction})
+
+    assert result == {"instruction": instruction}
+    assert controller.snapshot()["instruction"] == instruction
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
 async def test_tui_find_searches_workspace_without_an_agent_turn(
     tmp_path: Path,
@@ -493,6 +504,23 @@ async def test_user_message_updates_live_agent_projection_immediately() -> None:
     agent = controller.live_view.agents["root"]
     assert agent["status"] == "waiting"
     assert "error_message" not in agent
+
+
+@pytest.mark.asyncio
+async def test_user_message_preserves_multiline_whitespace() -> None:
+    coordinator = _SendingCoordinator()
+    controller = TuiController(args(), coordinator=coordinator)
+    controller.setup_mode = False
+    controller.scan_started = True
+    controller.scan_loop = asyncio.get_running_loop()
+    controller.live_view.upsert_agent("root", name="Strix", status="waiting")
+    message = "  first line\nsecond line \n"
+
+    await controller.handle("agent.send_message", {"agent_id": "root", "message": message})
+
+    assert coordinator.messages == [
+        ("root", {"from": "user", "content": message, "type": "instruction"})
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,9 @@
 package app
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -9,6 +12,12 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/usestrix/strix/tui/internal/protocol"
 )
+
+type failingConn struct{}
+
+func (*failingConn) Read([]byte) (int, error)  { return 0, io.EOF }
+func (*failingConn) Write([]byte) (int, error) { return 0, errors.New("transport failed") }
+func (*failingConn) Close() error              { return nil }
 
 func inputModel(t *testing.T) Model {
 	t.Helper()
@@ -166,16 +175,167 @@ func TestCtrlJInsertsNewline(t *testing.T) {
 	}
 }
 
-func TestEnterSubmitsTrimmedMultilineMessage(t *testing.T) {
+func TestTypedNewlinesBeyondVisibleHeightArePreserved(t *testing.T) {
 	model := inputModel(t)
-	model.input.SetValue("first\nsecond ")
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model.input.SetValue("line 1")
+	for i := 2; i <= 20; i++ {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+		model = updated.(Model)
+		for _, r := range []rune("line " + string(rune('0'+i%10))) {
+			updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			model = updated.(Model)
+		}
+	}
+	if got := strings.Count(model.input.Value(), "\n") + 1; got != 20 {
+		t.Fatalf("composer preserved %d hard lines, want 20: %q", got, model.input.Value())
+	}
+	if got := model.input.Height(); got != maxInputLines {
+		t.Fatalf("composer display height = %d, want cap %d", got, maxInputLines)
+	}
+}
+
+func TestWindowsMultilinePasteNormalizesCRLFWithoutDroppingLines(t *testing.T) {
+	model := inputModel(t)
+	lines := make([]string, 20)
+	for index := range lines {
+		lines[index] = "line"
+	}
+	pasted := strings.Join(lines, "\r\n")
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(pasted), Paste: true})
+	model = updated.(Model)
+
+	want := strings.Join(lines, "\n")
+	if got := model.input.Value(); got != want {
+		t.Fatalf("pasted value changed:\n got %q\nwant %q", got, want)
+	}
+	if got := model.input.Height(); got != maxInputLines {
+		t.Fatalf("pasted composer display height = %d, want cap %d", got, maxInputLines)
+	}
+}
+
+func TestEnterSubmitsExactMultilineMessage(t *testing.T) {
+	connection := &recordingConn{}
+	model := inputModel(t)
+	model.client = newClient(connection)
+	model.snapshot.Agents = []protocol.Agent{{ID: "agent-1", Name: "Strix", Status: "running"}}
+	want := "  first\nsecond \n"
+	model.input.SetValue(want)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if got := model.input.Value(); got != "" {
 		t.Fatalf("composer not cleared after submit: %q", got)
 	}
 	if got := model.input.Height(); got != 1 {
 		t.Fatalf("composer height after submit = %d, want 1", got)
+	}
+	envelope := commandFromCmd(t, cmd, connection)
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Message != want {
+		t.Fatalf("submitted message = %q, want exact value %q", payload.Message, want)
+	}
+}
+
+func TestFailedSendRestoresExactDraft(t *testing.T) {
+	model := inputModel(t)
+	model.client = newClient(&failingConn{})
+	model.snapshot.Agents = []protocol.Agent{{ID: "agent-1", Name: "Strix", Status: "running"}}
+	want := "first\nsecond\nthird"
+	model.input.SetValue(want)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd == nil {
+		t.Fatal("submit returned no command")
+	}
+	sent, ok := cmd().(sentMsg)
+	if !ok || sent.err == nil {
+		t.Fatalf("send unexpectedly succeeded: %#v", sent)
+	}
+	updated, _ = model.Update(sent)
+	model = updated.(Model)
+	if got := model.input.Value(); got != want {
+		t.Fatalf("restored draft = %q, want %q", got, want)
+	}
+}
+
+func TestBackendRejectionRestoresExactDraft(t *testing.T) {
+	connection := &recordingConn{}
+	model := inputModel(t)
+	model.client = newClient(connection)
+	model.snapshot.Agents = []protocol.Agent{{ID: "agent-1", Name: "Strix", Status: "running"}}
+	want := "first\nsecond\nthird"
+	model.input.SetValue(want)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	sent, ok := cmd().(sentMsg)
+	if !ok || sent.err != nil {
+		t.Fatalf("send failed before backend response: %#v", sent)
+	}
+	updated, _ = model.Update(sent)
+	model = updated.(Model)
+	failed := protocol.CommandResult{
+		OK:      false,
+		Command: "agent.send_message",
+		Error:   &protocol.CommandError{Code: "temporarily_unavailable", Message: "try again"},
+	}
+	model.handleEnvelope(protocol.Envelope{
+		Version: protocol.Version, Type: "command_result", RequestID: sent.requestID, Payload: rawJSON(t, failed),
+	})
+
+	if got := model.input.Value(); got != want {
+		t.Fatalf("restored draft = %q, want %q", got, want)
+	}
+	if model.errorText != "try again" {
+		t.Fatalf("backend error = %q, want %q", model.errorText, "try again")
+	}
+}
+
+func TestMalformedBackendResultRestoresDraftAndReleasesCommand(t *testing.T) {
+	connection := &recordingConn{}
+	model := inputModel(t)
+	model.client = newClient(connection)
+	model.snapshot.Agents = []protocol.Agent{{ID: "agent-1", Name: "Strix", Status: "running"}}
+	want := "first\nsecond"
+	model.input.SetValue(want)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	sent := cmd().(sentMsg)
+	updated, _ = model.Update(sent)
+	model = updated.(Model)
+	model.handleEnvelope(protocol.Envelope{
+		Version: protocol.Version, Type: "command_result", RequestID: sent.requestID, Payload: []byte("{"),
+	})
+
+	if model.input.Value() != want {
+		t.Fatalf("malformed result lost draft: %q", model.input.Value())
+	}
+	if _, pending := model.client.ExpectedCommand(sent.requestID); pending {
+		t.Fatal("malformed result left command permanently pending")
+	}
+}
+
+func TestOversizedPromptIsKeptForEditing(t *testing.T) {
+	model := inputModel(t)
+	want := strings.Repeat("x", maxPromptBytes+1)
+	model.input.SetValue(want)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if cmd != nil {
+		t.Fatal("oversized prompt was submitted")
+	}
+	if model.input.Value() != want {
+		t.Fatal("oversized prompt was cleared")
+	}
+	if !strings.Contains(model.errorText, "256 KiB") {
+		t.Fatalf("missing size error: %q", model.errorText)
 	}
 }
 

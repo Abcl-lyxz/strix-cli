@@ -5,19 +5,20 @@ from __future__ import annotations
 from typing import Any
 
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 PROTOCOL_CAPABILITIES = (
     "state-revisions",
     "collection-deltas",
     "structured-command-errors",
     "agents-collection",
     "interactive-configuration",
+    "large-user-prompts",
 )
 
 # Commands and control messages are intentionally small. Event and finding
 # history uses a separate bounded collection stream so a resumed run can be
 # larger than any individual frame.
-MAX_COMMAND_BYTES = 64 * 1024
+MAX_COMMAND_BYTES = 512 * 1024
 MAX_COLLECTION_FRAME_BYTES = 4 * 1024 * 1024
 
 
