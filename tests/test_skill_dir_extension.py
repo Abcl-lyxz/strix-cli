@@ -1,11 +1,14 @@
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+import strix.agents.prompt as prompt_module
 import strix.skills as skills_mod
-from strix.agents.prompt import _resolve_skills, render_system_prompt
+from strix.agents.prompt import PromptRenderError, _resolve_skills, render_system_prompt
 from strix.skills import (
+    find_skills,
     get_all_skill_names,
     get_available_skills,
     load_skills,
@@ -38,6 +41,12 @@ def _write_root_skill(root: Path, name: str, body: str) -> None:
     (root / f"{name}.md").write_text(body, encoding="utf-8")
 
 
+def _write_standard_skill(root: Path, name: str, body: str) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+
+
 def test_no_registration_leaves_builtin_only() -> None:
     assert registered_skill_dirs() == ()
     builtin = get_strix_resource_path("skills")
@@ -68,6 +77,61 @@ def test_registered_dir_adds_new_skill(tmp_path: Path) -> None:
     assert "widget" in get_all_skill_names()
     assert get_available_skills()["extra"] == [{"name": "widget", "description": ""}]
     assert load_skills(["widget"]) == {"widget": "widget body"}
+
+
+def test_registered_dir_supports_standard_agent_skill_layout(tmp_path: Path) -> None:
+    _write_standard_skill(
+        tmp_path,
+        "kubernetes-audit",
+        "---\nname: kubernetes-audit\ndescription: Audit Kubernetes RBAC\n---\nworkflow body",
+    )
+    register_skill_dir(tmp_path)
+
+    assert {
+        "name": "kubernetes-audit",
+        "description": "Audit Kubernetes RBAC",
+    } in get_available_skills()["custom"]
+    assert load_skills(["custom/kubernetes-audit"]) == {"kubernetes-audit": "workflow body"}
+    assert load_skills(["kubernetes-audit"]) == {"kubernetes-audit": "workflow body"}
+
+
+def test_environment_skill_dirs_are_loaded_without_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_standard_skill(first, "cloud-audit", "first")
+    _write_standard_skill(second, "api-audit", "second")
+    monkeypatch.setenv("STRIX_SKILL_DIRS", f"{first}{os.pathsep}{second}")
+
+    assert load_skills(["cloud-audit", "api-audit"]) == {
+        "cloud-audit": "first",
+        "api-audit": "second",
+    }
+
+
+def test_project_agents_skill_dir_is_auto_discovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_standard_skill(tmp_path / ".agents" / "skills", "mobile-audit", "mobile body")
+    monkeypatch.chdir(tmp_path)
+
+    assert load_skills(["mobile-audit"]) == {"mobile-audit": "mobile body"}
+
+
+def test_find_skills_ranks_names_and_descriptions(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        "extra",
+        "kubernetes-rbac",
+        "---\ndescription: Audit Kubernetes cluster permissions\n---\nbody",
+    )
+    _write_skill(tmp_path, "extra", "unrelated", "---\ndescription: Browser cookies\n---\nbody")
+    register_skill_dir(tmp_path)
+
+    matches = find_skills("kubernetes permissions")
+
+    assert matches[0]["name"] == "extra/kubernetes-rbac"
 
 
 def test_available_skill_includes_frontmatter_description(tmp_path: Path) -> None:
@@ -239,6 +303,24 @@ def test_resolve_skills_always_includes_analysis_baseline() -> None:
 
     assert "analysis/counterevidence" in resolved
     assert "analysis/severity_calibration" in resolved
+
+
+def test_root_prompt_omits_hands_on_tool_manuals() -> None:
+    root = _resolve_skills(requested=None, is_root=True)
+    child = _resolve_skills(requested=None, is_root=False)
+
+    assert "tooling/agent_browser" not in root
+    assert "tooling/python" not in root
+    assert "coordination/root_agent" in root
+    assert "tooling/agent_browser" in child
+    assert "tooling/python" in child
+
+
+def test_prompt_render_failure_is_explicit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(prompt_module, "get_strix_resource_path", lambda *_parts: tmp_path)
+
+    with pytest.raises(PromptRenderError, match="failed to render"):
+        render_system_prompt()
 
 
 def test_resolve_skills_adds_diff_mode_only_when_diff_scoped() -> None:

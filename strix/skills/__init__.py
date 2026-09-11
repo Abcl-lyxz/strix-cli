@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from collections import Counter
 from collections.abc import Iterator
@@ -16,6 +17,8 @@ _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(?P<body>.*?)\n---\s*\n", re.DOTALL
 
 _INTERNAL_SKILL_CATEGORIES: frozenset[str] = frozenset({"scan_modes", "coordination", "analysis"})
 _ROOT_SKILL_CATEGORY = "root"
+_STANDARD_SKILL_CATEGORY = "custom"
+_MAX_SKILL_BYTES = 512 * 1024
 
 _EXTRA_SKILL_DIRS: list[Path] = []
 _SKILL_METADATA_CACHE: dict[tuple[Path, int, int], dict[str, str]] = {}
@@ -35,7 +38,7 @@ def register_skill_dir(path: str | Path) -> None:
     editing the package. The most recently registered directory has the
     highest precedence.
     """
-    resolved = Path(path)
+    resolved = Path(path).expanduser().resolve()
     if resolved not in _EXTRA_SKILL_DIRS:
         _EXTRA_SKILL_DIRS.append(resolved)
         logger.info("Registered extra skill dir: %s", resolved)
@@ -48,54 +51,117 @@ def registered_skill_dirs() -> tuple[Path, ...]:
 
 def skill_search_dirs() -> tuple[Path, ...]:
     """All existing skill roots, highest precedence first (built-in last)."""
-    roots = [d for d in registered_skill_dirs() if d.is_dir()]
+    roots = [*registered_skill_dirs(), *_configured_skill_dirs()]
     builtin = get_strix_resource_path("skills")
-    if builtin.is_dir():
-        roots.append(builtin)
-    return tuple(roots)
+    roots.append(builtin)
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return tuple(unique)
+
+
+def _configured_skill_dirs() -> tuple[Path, ...]:
+    """Discover opt-in and project-local custom skill roots."""
+    candidates = [
+        Path(value.strip())
+        for value in os.environ.get("STRIX_SKILL_DIRS", "").split(os.pathsep)
+        if value.strip()
+    ]
+    working_dir = Path.cwd()
+    candidates.extend(
+        (
+            working_dir / ".strix" / "skills",
+            working_dir / ".agents" / "skills",
+            working_dir / ".codex" / "skills",
+        )
+    )
+    return tuple(candidates)
+
+
+def _safe_skill_file(root: Path, candidate: Path) -> Path | None:
+    """Resolve a skill file without allowing a symlink to escape its root."""
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file() or not resolved.is_relative_to(resolved_root):
+        return None
+    return resolved
+
+
+def _iter_skill_entries_in_root(
+    root: Path, *, include_internal: bool = False
+) -> Iterator[tuple[str, str, Path]]:
+    """Yield legacy markdown and Agent Skills ``SKILL.md`` layouts."""
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return
+    for file_path in children:
+        if (
+            file_path.is_file()
+            and _is_selectable_root_skill_file(file_path)
+            and (safe := _safe_skill_file(root, file_path))
+        ):
+            yield (_ROOT_SKILL_CATEGORY, file_path.stem, safe)
+
+    for category_dir in children:
+        if not category_dir.is_dir() or category_dir.name.startswith("__"):
+            continue
+        # Standard Agent Skills layout: <root>/<skill>/SKILL.md.
+        if standard := _safe_skill_file(root, category_dir / "SKILL.md"):
+            yield (_STANDARD_SKILL_CATEGORY, category_dir.name, standard)
+            continue
+        if category_dir.name in _INTERNAL_SKILL_CATEGORIES and not include_internal:
+            continue
+        try:
+            category_children = sorted(category_dir.iterdir())
+        except OSError:
+            continue
+        for file_path in category_children:
+            if file_path.is_file() and _is_selectable_root_skill_file(file_path):
+                if safe := _safe_skill_file(root, file_path):
+                    yield (category_dir.name, file_path.stem, safe)
+            elif (
+                file_path.is_dir()
+                and not file_path.name.startswith("__")
+                and (standard := _safe_skill_file(root, file_path / "SKILL.md"))
+            ):
+                yield (category_dir.name, file_path.name, standard)
+
+
+def _iter_skill_entries(*, include_internal: bool = False) -> Iterator[tuple[str, str, Path]]:
+    seen: set[tuple[str, str]] = set()
+    for root in skill_search_dirs():
+        for category, name, file_path in _iter_skill_entries_in_root(
+            root, include_internal=include_internal
+        ):
+            key = (category, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield (category, name, file_path)
 
 
 def _iter_user_skill_files() -> Iterator[tuple[str, str]]:
     """Yield ``(category_name, skill_name)`` for every user-selectable skill."""
-    seen: set[tuple[str, str]] = set()
-    for skills_dir in skill_search_dirs():
-        for file_path in sorted(skills_dir.glob("*.md")):
-            if file_path.name.startswith("__") or file_path.name == "README.md":
-                continue
-            key = (_ROOT_SKILL_CATEGORY, file_path.stem)
-            if key in seen:
-                continue
-            seen.add(key)
-            yield key
-
-        for category_dir in sorted(skills_dir.iterdir()):
-            if not category_dir.is_dir() or category_dir.name.startswith("__"):
-                continue
-            if category_dir.name in _INTERNAL_SKILL_CATEGORIES:
-                continue
-            for file_path in sorted(category_dir.glob("*.md")):
-                key = (category_dir.name, file_path.stem)
-                if key in seen:
-                    continue
-                seen.add(key)
-                yield key
+    for category, name, _file_path in _iter_skill_entries():
+        yield (category, name)
 
 
 def _is_selectable_root_skill_file(file_path: Path) -> bool:
     return file_path.suffix == ".md" and not (
         file_path.name.startswith("__") or file_path.name == "README.md"
     )
-
-
-def _qualified_skill_file(skills_dir: Path, category: str, name: str) -> Path | None:
-    if category == _ROOT_SKILL_CATEGORY:
-        candidate = skills_dir / f"{name}.md"
-        if candidate.exists() and _is_selectable_root_skill_file(candidate):
-            return candidate
-        return None
-
-    candidate = skills_dir / category / f"{name}.md"
-    return candidate if candidate.exists() else None
 
 
 def get_all_skill_names() -> set[str]:
@@ -117,10 +183,9 @@ def _get_ambiguous_skill_names() -> set[str]:
 
 def _qualified_skill_file_for_name(skill_name: str) -> Path | None:
     category, _, name = skill_name.partition("/")
-    for skills_dir in skill_search_dirs():
-        candidate = _qualified_skill_file(skills_dir, category, name)
-        if candidate is not None:
-            return candidate
+    for entry_category, entry_name, file_path in _iter_skill_entries(include_internal=True):
+        if (entry_category, entry_name) == (category, name):
+            return file_path
     return None
 
 
@@ -130,30 +195,7 @@ def _qualified_skill_files(skill_name: str) -> list[Path]:
 
 
 def _bare_skill_files(skill_name: str) -> list[Path]:
-    seen: set[tuple[str, str]] = set()
-    candidates: list[Path] = []
-    for skills_dir in skill_search_dirs():
-        for category_dir in sorted(skills_dir.iterdir()):
-            if not category_dir.is_dir() or category_dir.name.startswith("__"):
-                continue
-            if category_dir.name in _INTERNAL_SKILL_CATEGORIES:
-                continue
-            key = (category_dir.name, skill_name)
-            if key in seen:
-                continue
-            candidate = category_dir / f"{skill_name}.md"
-            if candidate.exists():
-                seen.add(key)
-                candidates.append(candidate)
-
-        key = (_ROOT_SKILL_CATEGORY, skill_name)
-        if key in seen:
-            continue
-        root_candidate = _qualified_skill_file(skills_dir, _ROOT_SKILL_CATEGORY, skill_name)
-        if root_candidate is not None:
-            seen.add(key)
-            candidates.append(root_candidate)
-    return candidates
+    return [file_path for _category, name, file_path in _iter_skill_entries() if name == skill_name]
 
 
 def _parse_skill_content(content: str, source: Path | None = None) -> tuple[dict[str, str], str]:
@@ -185,6 +227,9 @@ def _read_skill_metadata(file_path: Path) -> dict[str, str]:
     cached = _SKILL_METADATA_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    if stat.st_size > _MAX_SKILL_BYTES:
+        logger.warning("Skill file is too large (%d bytes): %s", stat.st_size, file_path)
+        return {}
     try:
         content = file_path.read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -210,6 +255,30 @@ def get_available_skills() -> dict[str, list[dict[str, str]]]:
         description = " ".join(metadata.get("description", "").split())
         grouped.setdefault(category, []).append({"name": name, "description": description})
     return grouped
+
+
+def find_skills(query: str, limit: int = 8) -> list[dict[str, str]]:
+    """Rank installed skills by name and frontmatter description."""
+    terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold()) if len(term) > 1}
+    if not terms or limit <= 0:
+        return []
+    ranked: list[tuple[int, str, str, str]] = []
+    for category, entries in get_available_skills().items():
+        for entry in entries:
+            name = entry["name"]
+            description = entry["description"]
+            name_terms = set(re.findall(r"[a-z0-9]+", name.casefold()))
+            description_terms = set(re.findall(r"[a-z0-9]+", description.casefold()))
+            score = 8 * len(terms & name_terms) + 2 * len(terms & description_terms)
+            if query.casefold() in f"{category}/{name}".casefold():
+                score += 12
+            if score:
+                ranked.append((score, category, name, description))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [
+        {"name": f"{category}/{name}", "description": description}
+        for _score, category, name, description in ranked[:limit]
+    ]
 
 
 def validate_requested_skills(skill_list: list[str], max_skills: int = 5) -> str | None:
@@ -285,6 +354,9 @@ def load_skills(skill_names: list[str]) -> dict[str, str]:
         file_path = candidates[0]
 
         try:
+            if file_path.stat().st_size > _MAX_SKILL_BYTES:
+                logger.warning("Skill file is too large: %s", file_path)
+                continue
             content = file_path.read_text(encoding="utf-8")
         except (OSError, ValueError) as e:
             logger.warning("Failed to load skill %s: %s", skill_name, e)
