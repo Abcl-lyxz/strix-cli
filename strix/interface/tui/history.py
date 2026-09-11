@@ -35,9 +35,13 @@ def load_session_history(run_dir: Path, agent_ids: Any) -> list[tuple[str, dict[
             uri=True,
             check_same_thread=False,
         )
-        rows = conn.execute(
-            "select id, session_id, message_data, created_at from agent_messages order by id"
-        ).fetchall()
+        has_transcript = conn.execute(
+            "select 1 from sqlite_master where type='table' and name='transcript_entries'"
+        ).fetchone()
+        table = "transcript_entries" if has_transcript else "agent_messages"
+        # ``table`` is selected from the two-name fixed allowlist above.
+        query = f"select id, session_id, message_data, created_at from {table} order by id"  # nosec B608  # noqa: S608
+        rows = conn.execute(query).fetchall()
     except sqlite3.Error:
         logger.exception("Failed to hydrate TUI history from %s", agents_db)
         return []

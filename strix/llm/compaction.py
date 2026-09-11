@@ -9,6 +9,7 @@ pairing so the trimmed history is still valid provider input.
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -20,13 +21,20 @@ from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from strix.config import load_settings
 from strix.config.models import StrixProvider
 from strix.core.inputs import make_model_settings
-from strix.core.sessions import replace_session_items, session_write_lock
+from strix.core.sessions import (
+    deterministic_context_state,
+    record_context_checkpoint,
+    replace_session_items,
+    session_write_lock,
+)
 from strix.llm.context_budget import context_window, count_tokens, output_limit
+from strix.notifications import notify
 
 
 if TYPE_CHECKING:
     from agents.items import ModelResponse
     from agents.memory import Session
+    from agents.models.interface import ModelProvider
 
 
 logger = logging.getLogger(__name__)
@@ -261,7 +269,9 @@ def _summary_input_budget(model: str, previous: str | None) -> int:
     return max(0, room)
 
 
-def _build_summary_prompt(serialized_head: str, previous: str | None) -> str:
+def _build_summary_prompt(
+    serialized_head: str, previous: str | None, deterministic_state: str = ""
+) -> str:
     previous_block = (
         f"\n\nA previous checkpoint summary follows. Update it: keep what is "
         f"still true, drop what is now stale, and merge in the new "
@@ -269,9 +279,15 @@ def _build_summary_prompt(serialized_head: str, previous: str | None) -> str:
         if previous
         else ""
     )
+    state_block = (
+        "\n\nDurable run state captured before compaction (use as authoritative state):\n"
+        + deterministic_state
+        if deterministic_state
+        else ""
+    )
     return (
         f"{_SUMMARY_INSTRUCTIONS}{previous_block}\n\n"
-        f"Conversation to summarise:\n\n{serialized_head}"
+        f"Conversation to summarise:\n\n{serialized_head}{state_block}"
     )
 
 
@@ -299,7 +315,12 @@ def _extract_text(response: ModelResponse) -> str:
     return "".join(parts)
 
 
-async def _summarize(model: str, prompt: str, max_tokens: int) -> str | None:
+async def _summarize(
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    model_provider: ModelProvider | None = None,
+) -> str | None:
     llm = load_settings().llm
     model_settings = make_model_settings(
         None,
@@ -310,21 +331,19 @@ async def _summarize(model: str, prompt: str, max_tokens: int) -> str | None:
         has_tools=False,
     ).resolve(ModelSettings(max_tokens=max_tokens))
     try:
-        response = (
-            await StrixProvider()
-            .get_model(model)
-            .get_response(
-                system_instructions=None,
-                input=prompt,
-                model_settings=model_settings,
-                tools=[],
-                output_schema=None,
-                handoffs=[],
-                tracing=ModelTracing.DISABLED,
-                previous_response_id=None,
-                conversation_id=None,
-                prompt=None,
-            )
+        if model_provider is None:
+            model_provider = StrixProvider()
+        response = await model_provider.get_model(model).get_response(
+            system_instructions=None,
+            input=prompt,
+            model_settings=model_settings,
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
         )
     except Exception:
         logger.exception("compaction summary call failed for model %s", model)
@@ -336,13 +355,14 @@ async def _summarize(model: str, prompt: str, max_tokens: int) -> str | None:
     return content
 
 
-async def maybe_compact(
+async def maybe_compact(  # noqa: PLR0911
     session: Session,
     *,
     model: str,
     instructions: str = "",
     tools_text: str = "",
     force: bool = False,
+    model_provider: ModelProvider | None = None,
 ) -> bool:
     """Compact ``session`` if it is near the model's context window.
 
@@ -362,6 +382,15 @@ async def maybe_compact(
     reserve = max(context.compact_buffer_tokens, output_limit(model))
     budget = max(context.keep_tokens, window - reserve)
     used = count_tokens(model, "\n".join((instructions, tools_text, _serialize_items(items))))
+    if used >= int(budget * 0.85):
+        notify(
+            "context.capacity_low",
+            title="Agent context capacity is running low",
+            detail=f"Working context is using approximately {used} of {budget} input tokens.",
+            severity="info",
+            agent_id=str(getattr(session, "session_id", "")) or None,
+            dedupe_key=f"context-capacity:{getattr(session, 'session_id', '')}",
+        )
     if not force and used <= budget:
         return False
 
@@ -377,11 +406,25 @@ async def maybe_compact(
             )
         return False
 
-    serialized_head = _fit_to_tokens(model, _serialize_items(head), input_budget)
+    deterministic_state = deterministic_context_state(session)
+    state_text = json.dumps(
+        deterministic_state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    state_budget = max(128, input_budget // 3)
+    state_text = _fit_to_tokens(model, state_text, state_budget)
+    head_budget = max(0, input_budget - count_tokens(model, state_text) - 128)
+    if head_budget <= 0:
+        return False
+    serialized_head = _fit_to_tokens(model, _serialize_items(head), head_budget)
     summary = await _summarize(
         model,
-        _build_summary_prompt(serialized_head, previous),
+        _build_summary_prompt(serialized_head, previous, state_text),
         _summary_output_tokens(model),
+        model_provider,
     )
     if summary is None:
         return False
@@ -389,6 +432,22 @@ async def maybe_compact(
     new_items = [_checkpoint_item(summary), *recent]
     rewritten = await replace_session_items(session, new_items, expected_len=len(items))
     if rewritten:
+        await record_context_checkpoint(
+            session,
+            model=model,
+            summary=summary,
+            state=deterministic_state,
+            compacted_items=len(head),
+            recent_items=len(recent),
+        )
+        notify(
+            "context.compacted",
+            title="Agent context was compacted",
+            detail=f"Preserved {len(recent)} recent items and journaled {len(head)} older items.",
+            severity="info",
+            agent_id=str(getattr(session, "session_id", "")) or None,
+            dedupe_key=f"context-compacted:{getattr(session, 'session_id', '')}",
+        )
         logger.info(
             "compacted %s: %d items (~%d tok) -> %d items (summary + %d recent)",
             model,

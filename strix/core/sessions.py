@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakKeyDictionary
 
 from agents.items import ItemHelpers
 from agents.memory import SQLiteSession
 
+from strix.security import redact_secrets
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
     from agents.items import TResponseInputItem
     from agents.memory import Session
@@ -25,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 
 class _PooledConnectionSession(SQLiteSession):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._journal_suspended = 0
+        self._initialize_journal()
+
     @contextmanager
     def _locked_connection(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
@@ -38,6 +46,68 @@ class _PooledConnectionSession(SQLiteSession):
                 yield connection
             finally:
                 connection.close()
+
+    def _initialize_journal(self) -> None:
+        with self._locked_connection() as connection:
+            connection.executescript(
+                """
+                create table if not exists transcript_entries (
+                    id integer primary key autoincrement,
+                    session_id text not null,
+                    message_data text not null,
+                    source_message_id integer,
+                    created_at timestamp default current_timestamp
+                );
+                create index if not exists idx_transcript_session
+                    on transcript_entries(session_id, id);
+                create unique index if not exists idx_transcript_source
+                    on transcript_entries(source_message_id)
+                    where source_message_id is not null;
+                create table if not exists context_checkpoints (
+                    id integer primary key autoincrement,
+                    session_id text not null,
+                    model text not null,
+                    summary text not null,
+                    state_json text not null,
+                    compacted_items integer not null,
+                    recent_items integer not null,
+                    created_at timestamp default current_timestamp
+                );
+                """
+            )
+            # Backfill the history still available in pre-v1.7 databases once.
+            connection.execute(
+                """
+                insert or ignore into transcript_entries(
+                    session_id,message_data,source_message_id,created_at
+                ) select session_id,message_data,id,created_at from agent_messages
+                """
+            )
+            connection.commit()
+
+    @contextmanager
+    def suspend_journal(self) -> Iterator[None]:
+        self._journal_suspended += 1
+        try:
+            yield
+        finally:
+            self._journal_suspended = max(0, self._journal_suspended - 1)
+
+    async def add_items(self, items: list[TResponseInputItem]) -> None:
+        if not items:
+            return
+
+        def _append() -> None:
+            with self._locked_connection() as connection:
+                self._insert_items(connection, items)
+                if not self._journal_suspended:
+                    connection.executemany(
+                        "insert into transcript_entries(session_id,message_data) values (?,?)",
+                        [(self.session_id, redact_secrets(json.dumps(item))) for item in items],
+                    )
+                connection.commit()
+
+        await asyncio.to_thread(_append)
 
 
 def open_agent_session(agent_id: str, path: Path) -> SQLiteSession:
@@ -112,14 +182,15 @@ async def _rewrite_session(
             return False
         rebuilt_items = cast("list[TResponseInputItem]", rebuilt)
         original_items = cast("list[TResponseInputItem]", list(items))
-        await session.clear_session()
-        try:
-            await session.add_items(rebuilt_items)
-        except Exception:
-            logger.exception("session rewrite failed; restoring original items")
+        with _journal_suspension(session):
             await session.clear_session()
-            await session.add_items(original_items)
-            raise
+            try:
+                await session.add_items(rebuilt_items)
+            except Exception:
+                logger.exception("session rewrite failed; restoring original items")
+                await session.clear_session()
+                await session.add_items(original_items)
+                raise
         return True
 
 
@@ -145,15 +216,136 @@ async def replace_session_items(
             )
             return False
         rebuilt = cast("list[TResponseInputItem]", new_items)
-        await session.clear_session()
-        try:
-            await session.add_items(rebuilt)
-        except Exception:
-            logger.exception("session rewrite failed; restoring original items")
+        with _journal_suspension(session):
             await session.clear_session()
-            await session.add_items(original)
-            raise
+            try:
+                await session.add_items(rebuilt)
+            except Exception:
+                logger.exception("session rewrite failed; restoring original items")
+                await session.clear_session()
+                await session.add_items(original)
+                raise
         return True
+
+
+@contextmanager
+def _journal_suspension(session: Session) -> Iterator[None]:
+    suspend = getattr(session, "suspend_journal", None)
+    if callable(suspend):
+        with suspend():
+            yield
+        return
+    yield
+
+
+async def record_context_checkpoint(
+    session: Session,
+    *,
+    model: str,
+    summary: str,
+    state: dict[str, Any],
+    compacted_items: int,
+    recent_items: int,
+) -> None:
+    """Append one structured compaction checkpoint when the session supports it."""
+    if not isinstance(session, _PooledConnectionSession):
+        return
+
+    def _record() -> None:
+        with session._locked_connection() as connection:
+            connection.execute(
+                """
+                insert into context_checkpoints(
+                    session_id,model,summary,state_json,compacted_items,recent_items
+                ) values (?,?,?,?,?,?)
+                """,
+                (
+                    session.session_id,
+                    model,
+                    redact_secrets(summary),
+                    redact_secrets(json.dumps(state, ensure_ascii=False, default=str)),
+                    compacted_items,
+                    recent_items,
+                ),
+            )
+            connection.commit()
+
+    await asyncio.to_thread(_record)
+
+
+def _read_checkpoint_json(path: Path) -> Any | None:
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _agent_checkpoint_fields(agents: dict[str, Any], session_id: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    metadata = agents.get("metadata")
+    if isinstance(metadata, dict):
+        agent_metadata = metadata.get(session_id)
+        if isinstance(agent_metadata, dict) and agent_metadata.get("task"):
+            fields["task"] = agent_metadata["task"]
+    statuses = agents.get("statuses")
+    if isinstance(statuses, dict):
+        fields["pending_agents"] = {
+            key: value for key, value in statuses.items() if value in {"running", "waiting"}
+        }
+    errors = agents.get("errors")
+    if isinstance(errors, dict) and errors:
+        fields["failed_attempts"] = errors
+    return fields
+
+
+def _finding_files(findings: Any) -> list[str]:
+    relevant_files: set[str] = set()
+    if not isinstance(findings, list):
+        return []
+    for finding in findings:
+        locations = finding.get("code_locations") if isinstance(finding, dict) else None
+        if not isinstance(locations, list):
+            continue
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            relevant_files.update(
+                value
+                for key in ("path", "file", "uri")
+                if isinstance((value := location.get(key)), str) and value
+            )
+    return sorted(relevant_files)
+
+
+def deterministic_context_state(session: Session) -> dict[str, Any]:
+    """Read durable run ledgers used to anchor an LLM compaction summary."""
+    path = getattr(session, "db_path", None)
+    session_id = str(getattr(session, "session_id", ""))
+    if not path or str(path) == ":memory:":
+        return {"agent_id": session_id}
+    state_dir = Path(str(path)).parent
+    result: dict[str, Any] = {"agent_id": session_id}
+    for name in ("agents", "todos", "notes", "coverage", "threat_models"):
+        value = _read_checkpoint_json(state_dir / f"{name}.json")
+        if value is None:
+            continue
+        result[name] = (
+            value.get(session_id, {}) if name == "todos" and isinstance(value, dict) else value
+        )
+
+    agents = result.get("agents")
+    if isinstance(agents, dict):
+        result.update(_agent_checkpoint_fields(agents, session_id))
+    for result_name, filename in (("run", "run.json"), ("findings", "vulnerabilities.json")):
+        value = _read_checkpoint_json(state_dir.parent / filename)
+        if value is not None:
+            result[result_name] = value
+    relevant_files = _finding_files(result.get("findings"))
+    if relevant_files:
+        result["relevant_files"] = relevant_files
+    return result
 
 
 async def strip_all_images_from_session(session: Session) -> bool:
