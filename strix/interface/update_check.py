@@ -9,6 +9,7 @@ path for the standalone binary install.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -22,6 +23,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import cast
@@ -30,19 +32,45 @@ import requests
 from rich.console import Console
 from rich.prompt import Prompt
 
+from strix.notifications import NotificationAction, notify
+from strix.report.state import get_global_report_state
 from strix.telemetry._common import get_version
 
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "usestrix/strix"
+GITHUB_REPO = "Abcl-lyxz/strix-cli"
 PYPI_PACKAGE = "strix-agent"
+RELEASE_MANIFEST_NAME = "release-manifest.json"
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 REQUEST_TIMEOUT_SECONDS = 5
 
 _CACHE_PATH = Path.home() / ".strix" / "update-check.json"
 
 _background_thread: threading.Thread | None = None
+
+
+def _object_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    return cast("dict[str, object]", value)
+
+
+def _source_checkout_root() -> Path | None:
+    """Return the repository root when this module is running from a checkout."""
+    candidate = Path(__file__).resolve().parents[2]
+    return (
+        candidate
+        if (candidate / ".git").exists() and (candidate / "pyproject.toml").is_file()
+        else None
+    )
+
+
+def _active_scan() -> bool:
+    with contextlib.suppress(Exception):
+        report = get_global_report_state()
+        return bool(report is not None and report.run_record.get("status") == "running")
+    return False
 
 
 def _is_disabled() -> bool:
@@ -64,6 +92,8 @@ def get_install_method() -> str:
         return "pipx"
     if "/uv/tools/" in prefix:
         return "uv"
+    if _source_checkout_root() is not None:
+        return "source"
     return "pip"
 
 
@@ -74,6 +104,7 @@ def get_upgrade_command(method: str | None = None) -> str:
         "pipx": "pipx upgrade strix-agent",
         "uv": "uv tool upgrade strix-agent",
         "pip": "pip install --upgrade strix-agent",
+        "source": "git fetch origin --tags && git merge --ff-only v<version>",
     }
     return commands[method]
 
@@ -96,43 +127,110 @@ def _is_newer(latest: str, current: str) -> bool:
 
 def _fetch_latest_version() -> str | None:
     try:
-        if is_binary_install():
+        if is_binary_install() or _source_checkout_root() is not None:
             with requests.get(
                 f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 timeout=REQUEST_TIMEOUT_SECONDS,
             ) as response:
                 response.raise_for_status()
-                tag = response.json().get("tag_name", "")
-            return tag.lstrip("v") or None
+                tag = _object_dict(cast("object", response.json())).get("tag_name", "")
+            return tag.lstrip("v") or None if isinstance(tag, str) else None
         with requests.get(
             f"https://pypi.org/pypi/{PYPI_PACKAGE}/json",
             timeout=REQUEST_TIMEOUT_SECONDS,
         ) as response:
             response.raise_for_status()
-            version = response.json().get("info", {}).get("version")
+            payload = _object_dict(cast("object", response.json()))
+            version = _object_dict(payload.get("info", {})).get("version")
         return str(version) if version else None
     except Exception:  # noqa: BLE001
         logger.debug("update check failed", exc_info=True)
         return None
 
 
-def _fetch_asset_digest(version: str, filename: str) -> str | None:
-    """Return the expected sha256 (hex) for a release asset, if the API provides one."""
+def _fetch_release(version: str) -> dict[str, object]:
+    with requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/v{version}",
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    ) as response:
+        response.raise_for_status()
+        data = cast("object", response.json())
+    if not isinstance(data, dict):
+        raise TypeError("GitHub returned an invalid release record")
+    return _object_dict(cast("object", data))
+
+
+def _validate_release_manifest(version: str, manifest: dict[str, object]) -> None:
+    if manifest.get("version") != version:
+        raise RuntimeError("release manifest version does not match the tag")
+    commit = manifest.get("release_commit")
+    if not (
+        isinstance(commit, str)
+        and len(commit) == 40
+        and all(character in "0123456789abcdef" for character in commit.lower())
+    ):
+        raise TypeError("release manifest has no valid release commit")
+    if manifest.get("schema_version") != 1:
+        raise TypeError("release manifest uses an unsupported schema")
+    supported = manifest.get("supported_platforms")
+    if not isinstance(supported, list) or not all(
+        isinstance(item, str) for item in cast("list[object]", supported)
+    ):
+        raise TypeError("release manifest has no supported platform list")
+    provenance = manifest.get("provenance")
+    expected_repository = f"https://github.com/{GITHUB_REPO}"
+    if (
+        not isinstance(provenance, dict)
+        or _object_dict(cast("object", provenance)).get("repository") != expected_repository
+    ):
+        raise TypeError("release manifest provenance does not match this distribution")
+    manifest_assets = manifest.get("assets")
+    if not isinstance(manifest_assets, dict) or not manifest_assets:
+        raise TypeError("release manifest has no assets")
+    for record in _object_dict(cast("object", manifest_assets)).values():
+        checksum = (
+            _object_dict(cast("object", record)).get("sha256") if isinstance(record, dict) else None
+        )
+        valid_checksum = (
+            isinstance(checksum, str)
+            and len(checksum) == 64
+            and all(character in "0123456789abcdef" for character in checksum.lower())
+        )
+        if not valid_checksum:
+            raise TypeError("release manifest contains an invalid asset record")
+
+
+def _fetch_release_manifest(version: str) -> dict[str, object]:
+    """Download a manifest whose own digest is attested by GitHub Releases."""
     try:
-        with requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/v{version}",
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            response.raise_for_status()
-            assets = response.json().get("assets", [])
-        for asset in assets:
-            if asset.get("name") == filename:
-                digest = asset.get("digest") or ""
-                if digest.startswith("sha256:"):
-                    return digest.removeprefix("sha256:")
-    except Exception:  # noqa: BLE001
-        logger.debug("release asset digest lookup failed", exc_info=True)
-    return None
+        release = _fetch_release(version)
+        assets = release.get("assets", [])
+        if not isinstance(assets, list):
+            raise TypeError("GitHub release has no asset list")
+        for asset_value in cast("list[object]", assets):
+            if not isinstance(asset_value, dict):
+                continue
+            asset = _object_dict(cast("object", asset_value))
+            if asset.get("name") != RELEASE_MANIFEST_NAME:
+                continue
+            digest = str(asset.get("digest") or "")
+            url = str(asset.get("browser_download_url") or "")
+            if not digest.startswith("sha256:") or not url:
+                raise RuntimeError("release manifest has no GitHub-attested SHA-256 digest")
+            with requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                response.raise_for_status()
+                raw = response.content
+            if hashlib.sha256(raw).hexdigest() != digest.removeprefix("sha256:"):
+                raise RuntimeError("release manifest checksum mismatch")
+            manifest = cast("object", json.loads(raw))
+            if not isinstance(manifest, dict):
+                raise TypeError("release manifest must be an object")
+            typed_manifest = _object_dict(cast("object", manifest))
+            _validate_release_manifest(version, typed_manifest)
+            return typed_manifest
+        raise RuntimeError("release has no integrity manifest")
+    except (requests.RequestException, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot verify release manifest: {exc}") from exc
 
 
 def _sha256_file(path: Path) -> str:
@@ -172,7 +270,20 @@ def skip_version(version: str) -> None:
 def _refresh_cache() -> None:
     latest = _fetch_latest_version()
     if latest:
-        _write_cache(latest_version=latest, checked_at=time.time())
+        notes = ""
+        with contextlib.suppress(Exception):
+            notes = str(_fetch_release(latest).get("body") or "")[:4_000]
+        _write_cache(latest_version=latest, checked_at=time.time(), release_notes=notes)
+        current = get_version()
+        if current != "unknown" and _is_newer(latest, current):
+            notify(
+                "update.available",
+                title=f"Strix {latest} is available",
+                detail=notes,
+                severity="info",
+                dedupe_key=f"update:{latest}",
+                actions=(NotificationAction("start_update", "Install update", latest),),
+            )
 
 
 def start_background_check() -> None:
@@ -217,21 +328,154 @@ def notify_update(console: Console) -> None:
 
 
 def run_package_upgrade(console: Console, method: str) -> bool:
-    """Upgrade a package-manager install by running its upgrade command."""
-    command = get_upgrade_command(method).split()
-    console.print(f"[dim]Running[/] [#60a5fa]{' '.join(command)}[/]")
-    try:
-        result = subprocess.run(command, check=False)  # noqa: S603
-    except OSError as e:
-        console.print(f"[bold red]Update failed:[/] {e}")
+    """Install only a wheel verified by the matching fork release manifest."""
+    latest = _fetch_latest_version()
+    if not latest:
+        console.print("[bold red]Could not determine the latest version for this upgrade.[/]")
         return False
-    if result.returncode != 0:
-        console.print(
-            f"[bold red]Update failed[/] [dim](exit code {result.returncode}).[/] "
-            f"Run it manually: [#60a5fa]{get_upgrade_command(method)}[/]"
+    if method == "source":
+        return _update_source_checkout(console, latest)
+    try:
+        wheel = _download_verified_wheel(latest)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Update failed:[/] {exc}")
+        notify(
+            "update.failed",
+            title="Strix update verification failed",
+            detail=str(exc),
+            severity="error",
+            dedupe_key=f"update-failed:{latest}",
         )
         return False
+    commands = {
+        "pip": [sys.executable, "-m", "pip", "install", "--upgrade", str(wheel)],
+        "pipx": ["pipx", "install", "--force", str(wheel)],
+        "uv": ["uv", "tool", "install", "--force", str(wheel)],
+    }
+    command = commands[method]
+    console.print(f"[dim]Running[/] [#60a5fa]{' '.join(command)}[/]")
+    try:
+        try:
+            result = subprocess.run(command, check=False)  # noqa: S603
+        except OSError as e:
+            console.print(f"[bold red]Update failed:[/] {e}")
+            return False
+        if result.returncode != 0:
+            console.print(
+                f"[bold red]Update failed[/] [dim](exit code {result.returncode}).[/] "
+                f"Run it manually: [#60a5fa]{get_upgrade_command(method)}[/]"
+            )
+            return False
+    finally:
+        wheel.unlink(missing_ok=True)
     console.print("[#22c55e]✓ strix updated — restart the scan to use the new version[/]")
+    return True
+
+
+def _download_verified_wheel(version: str) -> Path:
+    manifest = _fetch_release_manifest(version)
+    raw_assets_value = manifest.get("assets", {})
+    if not isinstance(raw_assets_value, dict):
+        raise TypeError("release manifest has no assets")
+    raw_assets = _object_dict(cast("object", raw_assets_value))
+    suffixes = {
+        "linux-x86_64": "manylinux_2_17_x86_64.whl",
+        "linux-arm64": "manylinux_2_17_aarch64.whl",
+        "macos-x86_64": "macosx_11_0_x86_64.whl",
+        "macos-arm64": "macosx_11_0_arm64.whl",
+        "windows-x86_64": "win_amd64.whl",
+    }
+    target = _release_target()
+    suffix = suffixes.get(target or "")
+    filename = next(
+        (name for name in raw_assets if suffix and name.endswith(suffix)),
+        None,
+    )
+    if filename is None:
+        raise RuntimeError(f"release has no wheel for {target or 'this platform'}")
+    path = Path(tempfile.gettempdir()) / f"strix-{version}-{uuid.uuid4().hex}.whl"
+    _download_verified_asset(version, filename, path, manifest=manifest)
+    return path
+
+
+def _download_verified_asset(
+    version: str,
+    filename: str,
+    destination: Path,
+    *,
+    manifest: dict[str, object] | None = None,
+) -> None:
+    manifest = manifest or _fetch_release_manifest(version)
+    assets = _object_dict(manifest.get("assets", {}))
+    record = assets.get(filename)
+    expected = (
+        _object_dict(cast("object", record)).get("sha256") if isinstance(record, dict) else None
+    )
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise RuntimeError(f"release manifest has no checksum for {filename}")
+    url = f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/{filename}"
+    with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT_SECONDS * 12) as response:  # nosec B113
+        response.raise_for_status()
+        with destination.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=1 << 20):
+                output.write(chunk)
+    actual = _sha256_file(destination)
+    if actual != expected.lower():
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"checksum mismatch for {filename}: expected sha256 {expected}, got {actual}"
+        )
+
+
+def _update_source_checkout(console: Console, version: str) -> bool:
+    root = _source_checkout_root()
+    if root is None:
+        return False
+    manifest = _fetch_release_manifest(version)
+    commit = str(manifest["release_commit"])
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            [shutil.which("git") or "git", "-C", str(root), *args],
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+    try:
+        if git("status", "--porcelain").stdout.strip():
+            raise RuntimeError(  # noqa: TRY301
+                "source checkout is dirty; no files were changed"
+            )
+        branch = git("branch", "--show-current").stdout.strip()
+        if not branch:
+            raise RuntimeError("source checkout is detached")  # noqa: TRY301
+        upstream = git("rev-parse", "--abbrev-ref", "@{upstream}").stdout.strip()
+        if not upstream:
+            raise RuntimeError("source branch has no tracking branch")  # noqa: TRY301
+        origin = git("remote", "get-url", "origin").stdout.strip().lower()
+        if "github.com/abcl-lyxz/strix-cli" not in origin.replace(":", "/"):
+            raise RuntimeError(  # noqa: TRY301
+                "origin is not the verified Abcl-lyxz/strix-cli release repository"
+            )
+        git("fetch", "origin", f"refs/tags/v{version}:refs/tags/v{version}")
+        tag_commit = git("rev-list", "-n", "1", f"v{version}").stdout.strip()
+        if tag_commit != commit:
+            raise RuntimeError(  # noqa: TRY301
+                "release tag does not match the verified manifest commit"
+            )
+        git("merge", "--ff-only", commit)
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+        notify(
+            "update.failed",
+            title="Source update needs attention",
+            detail=str(exc),
+            severity="warning",
+            dedupe_key=f"source-update:{root}",
+        )
+        console.print(f"[bold red]Update failed:[/] {exc}")
+        return False
+    console.print(f"[#22c55e]✓ Updated source checkout to {version}[/]")
     return True
 
 
@@ -248,6 +492,9 @@ def prompt_update_if_available(console: Console) -> bool:
         f"[#eab308]A new version of strix is available:[/] "
         f"[dim]{get_version()}[/] [dim]→[/] [bold #22c55e]{latest}[/]"
     )
+    notes = _read_cache().get("release_notes")
+    if isinstance(notes, str) and notes.strip():
+        console.print(notes.strip(), style="dim", markup=False)
     console.print(
         "[dim]  y — update now    n — not now (ask again next run)    s — skip this version[/]"
     )
@@ -316,34 +563,15 @@ def _download_and_replace(version: str, target: str, console: Console) -> bool:
     is_windows = target.startswith("windows")
     archive_ext = ".zip" if is_windows else ".tar.gz"
     filename = f"strix-{version}-{target}{archive_ext}"
-    url = f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/{filename}"
     binary_name = f"strix-{version}-{target}" + (".exe" if is_windows else "")
     current_exe = Path(sys.executable).resolve()
+    manifest = _fetch_release_manifest(version)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         archive_path = tmp_dir / filename
-        console.print(f"[dim]Downloading[/] {url}")
-        with requests.get(  # nosec B113
-            url,
-            stream=True,
-            timeout=REQUEST_TIMEOUT_SECONDS * 12,
-        ) as response:
-            response.raise_for_status()
-            with archive_path.open("wb") as f:
-                for chunk in response.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
-
-        expected_digest = _fetch_asset_digest(version, filename)
-        if expected_digest:
-            actual_digest = _sha256_file(archive_path)
-            if actual_digest != expected_digest:
-                raise RuntimeError(
-                    f"checksum mismatch for {filename}: "
-                    f"expected sha256 {expected_digest}, got {actual_digest}"
-                )
-        else:
-            console.print("[dim yellow]No published checksum available; skipping verification[/]")
+        console.print(f"[dim]Downloading and verifying[/] {filename}")
+        _download_verified_asset(version, filename, archive_path, manifest=manifest)
 
         if is_windows:
             with zipfile.ZipFile(archive_path) as zf:
@@ -353,30 +581,45 @@ def _download_and_replace(version: str, target: str, console: Console) -> bool:
                 tf.extract(binary_name, tmp_dir, filter="data")
 
         new_binary = tmp_dir / binary_name
+        if not new_binary.is_file():
+            raise RuntimeError(f"release archive does not contain {binary_name}")
         new_binary.chmod(new_binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        smoke = subprocess.run(  # noqa: S603
+            [str(new_binary), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if smoke.returncode != 0 or version not in f"{smoke.stdout}\n{smoke.stderr}":
+            raise RuntimeError("staged binary failed its version smoke test")
 
         staged = current_exe.with_name(current_exe.name + ".new")
         try:
             shutil.copy2(new_binary, staged)
-            if is_windows:
-                # Windows can't replace a running executable in place; move it aside first.
-                old = current_exe.with_name(current_exe.name + ".old")
-                old.unlink(missing_ok=True)
-                current_exe.rename(old)
-                try:
-                    staged.replace(current_exe)
-                except Exception:
-                    old.rename(current_exe)
-                    raise
-            else:
-                staged.replace(current_exe)
+            _atomic_replace_with_rollback(current_exe, staged)
         except Exception:
             staged.unlink(missing_ok=True)
             raise
     return True
 
 
-def self_update(console: Console | None = None, version: str | None = None) -> bool:
+def _atomic_replace_with_rollback(current: Path, staged: Path) -> Path:
+    """Install ``staged`` and preserve exactly one recoverable prior binary."""
+    rollback = current.with_name(current.name + ".old")
+    rollback.unlink(missing_ok=True)
+    current.replace(rollback)
+    try:
+        staged.replace(current)
+    except Exception:
+        rollback.replace(current)
+        raise
+    return rollback
+
+
+def self_update(  # noqa: PLR0911
+    console: Console | None = None, version: str | None = None
+) -> bool:
     """Replace the running standalone binary with the latest release.
 
     Returns True on success. For package-manager installs this only
@@ -384,13 +627,19 @@ def self_update(console: Console | None = None, version: str | None = None) -> b
     """
     console = console or Console()
 
-    if not is_binary_install():
-        method = get_install_method()
-        console.print(
-            f"[#eab308]This strix was installed via {method};[/] "
-            f"upgrade it with: [#60a5fa]{get_upgrade_command(method)}[/]"
+    if _active_scan():
+        console.print("[yellow]An update cannot be installed during an active scan.[/]")
+        notify(
+            "update.failed",
+            title="Update postponed until the scan finishes",
+            severity="warning",
+            dedupe_key="update-active-scan",
         )
         return False
+
+    if not is_binary_install():
+        method = get_install_method()
+        return run_package_upgrade(console, method)
 
     latest = version or _fetch_latest_version()
     if not latest:
@@ -418,6 +667,13 @@ def self_update(console: Console | None = None, version: str | None = None) -> b
         console.print(
             "[dim]You can reinstall manually with:[/] "
             "[#60a5fa]curl -sSL https://strix.ai/install | bash[/]"
+        )
+        notify(
+            "update.failed",
+            title="Strix update failed",
+            detail=str(e),
+            severity="error",
+            dedupe_key=f"update-failed:{latest}",
         )
         return False
 
