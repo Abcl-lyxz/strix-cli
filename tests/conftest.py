@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
+from strix import notifications as notification_module
+from strix.config import loader as config_loader
 from strix.security import SecretStore
 from strix.security import secrets as secret_module
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class _MemorySecretBackend:
@@ -23,6 +31,28 @@ class _MemorySecretBackend:
 
     def delete(self, ref: str) -> bool:
         return self.values.pop(ref, None) is not None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_strix_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep tests away from the developer's routes and notification inbox."""
+    monkeypatch.setattr(config_loader, "_override", tmp_path / "cli-config.json")
+    monkeypatch.setattr(config_loader, "_cached", None)
+    monkeypatch.setattr(notification_module, "_DEFAULT_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(notification_module, "_default_service", None)
+    for name in (
+        "STRIX_ROUTES_FILE",
+        "STRIX_LLM",
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "LLM_API_BASE",
+        "OPENAI_API_BASE",
+        "OPENAI_BASE_URL",
+        "LITELLM_BASE_URL",
+        "OLLAMA_API_BASE",
+        "LLM_EXTRA_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)
