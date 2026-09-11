@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
 
+def _current_platform() -> str:
+    """Keep platform branching runtime-visible to cross-platform type checks."""
+    return sys.platform
+
+
 def _windows_docker_candidates(environ: MutableMapping[str, str]) -> list[Path]:
     """Return Docker Desktop CLI locations in per-user-first order."""
     candidates: list[Path] = []
@@ -47,7 +52,7 @@ def find_docker_cli(environ: MutableMapping[str, str] | None = None) -> str | No
     executable = shutil.which("docker", path=target_env.get("PATH"))
     if executable is not None:
         return executable
-    if sys.platform != "win32":
+    if _current_platform() != "win32":
         return None
     for candidate in _windows_docker_candidates(target_env):
         if candidate.is_file():

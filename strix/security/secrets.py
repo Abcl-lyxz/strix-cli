@@ -534,12 +534,9 @@ def interprocess_lock(path: Path) -> Generator[None, None, None]:
             handle.flush()
         handle.seek(0)
         if os.name == "nt":
-            import msvcrt  # noqa: PLC0415
-
+            msvcrt: Any = importlib.import_module("msvcrt")
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         else:
-            import importlib  # noqa: PLC0415
-
             fcntl: Any = importlib.import_module("fcntl")
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
@@ -547,12 +544,9 @@ def interprocess_lock(path: Path) -> Generator[None, None, None]:
         try:
             handle.seek(0)
             if os.name == "nt":
-                import msvcrt  # noqa: PLC0415
-
+                msvcrt = importlib.import_module("msvcrt")
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                import importlib  # noqa: PLC0415
-
                 fcntl = importlib.import_module("fcntl")
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
