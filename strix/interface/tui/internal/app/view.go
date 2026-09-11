@@ -642,6 +642,13 @@ func (m Model) statsView() string {
 		}
 		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(white).Render("Caido: ") + w.Render(caido))
 	}
+	if m.snapshot.NotificationUnread > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(amber).Render(
+			fmt.Sprintf("● %d notification(s)", m.snapshot.NotificationUnread)))
+	}
 	if b.Len() > 0 {
 		b.WriteString("\n")
 	}

@@ -14,7 +14,15 @@ from urllib.parse import urlparse
 
 from strix.config import load_settings, persist_overrides
 from strix.config.models import is_recommended_or_frontier_model
+from strix.config.routes import (
+    delete_route_key,
+    list_saved_routes,
+    load_routes,
+    save_route,
+    set_route_key,
+)
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
+from strix.core.paths import runtime_state_dir
 from strix.interface.tui.backend.live_view import TuiLiveView
 from strix.interface.tui.backend.projection import (
     MAX_TERMINAL_EVENTS,
@@ -27,6 +35,8 @@ from strix.interface.tui.backend.projection import (
     terminal_projection,
 )
 from strix.interface.utils import is_subscription_run
+from strix.notifications import Notification, get_notification_service
+from strix.routing import RouteConfig
 from strix.tools.workspace_search import search_local_workspace
 
 
@@ -140,6 +150,25 @@ class TuiController:
         self._on_verify = on_verify
         self._on_quit = on_quit
         self._on_change = on_change
+        requested_routes = getattr(args, "route", None) or []
+        self.selected_route = str(requested_routes[0]) if requested_routes else ""
+        self.notification_service = get_notification_service()
+        self._unsubscribe_notifications = self.notification_service.subscribe(self._on_notification)
+
+    def _on_notification(self, notification: Notification) -> None:
+        """Surface actionable global events while retaining every event in the inbox."""
+        if self.notification_service.should_surface(notification):
+            detail = f": {notification.detail}" if notification.detail else ""
+            self._append_message(
+                f"{notification.title}{detail}",
+                "error"
+                if notification.severity in {"error", "critical"}
+                else notification.severity,
+            )
+        if self.scan_loop is not None and self.scan_loop.is_running():
+            self.scan_loop.call_soon_threadsafe(self.notify_changed)
+        else:
+            self.notify_changed()
 
     def set_change_callback(self, callback: ChangeCallback) -> None:
         self._on_change = callback
@@ -226,6 +255,19 @@ class TuiController:
             llm_timeout = settings.llm.timeout
             max_tool_calls_per_turn = settings.llm.max_tool_calls_per_turn
             max_context_images = settings.runtime.max_context_images
+            if self.selected_route:
+                selected = next(
+                    (
+                        route
+                        for route in list_saved_routes()
+                        if route.name.casefold() == self.selected_route.casefold()
+                    ),
+                    None,
+                )
+                if selected is not None:
+                    model = selected.model
+                    api_key_configured = bool(selected.api_key_ref)
+                    api_base = _display_api_base(selected.base_url or "")
         usage: dict[str, Any] = {}
         if self.report_state is not None:
             usage = dict(self.report_state.get_total_llm_usage())
@@ -268,6 +310,8 @@ class TuiController:
             "max_tool_calls_per_turn": max_tool_calls_per_turn,
             "max_context_images": max_context_images,
             "config_env_override": any(alias in os.environ for alias in _LLM_ENV_ALIASES),
+            "selected_route": terminal_projection(self.selected_route, max_string=128),
+            "notification_unread": self.notification_service.unread_count(),
             "caido_url": terminal_projection(
                 getattr(self.report_state, "caido_url", None), max_string=1024
             ),
@@ -360,6 +404,9 @@ class TuiController:
             "setup.start": self._start,
             "setup.confirm_mount": self._confirm_mount,
             "config.update": self._update_config,
+            "routes.manage": self._manage_routes,
+            "notifications.manage": self._manage_notifications,
+            "storage.show": self._show_storage,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
             "workspace.find": self._find_workspace,
@@ -372,6 +419,86 @@ class TuiController:
         result = await handler(payload)
         self.notify_changed()
         return result
+
+    async def _manage_routes(self, payload: dict[str, Any]) -> dict[str, Any]:
+        operation = str(payload.get("operation") or "list")
+        routes = list_saved_routes()
+        if operation == "select":
+            name = self._required_string(payload, "name")
+            route = next((item for item in routes if item.name.casefold() == name.casefold()), None)
+            if route is None:
+                raise ValueError(f"Unknown route: {name}")
+            self.selected_route = route.name
+        elif operation != "list":
+            raise ValueError("routes operation must be list or select")
+        return {
+            "selected": self.selected_route,
+            "routes": [route.public_dict() for route in routes],
+        }
+
+    async def _manage_notifications(self, payload: dict[str, Any]) -> dict[str, Any]:
+        operation = str(payload.get("operation") or "list")
+        if operation == "read":
+            notification_id = self._required_string(payload, "id")
+            if not self.notification_service.mark_read(notification_id):
+                raise ValueError("Notification not found")
+        elif operation == "dismiss":
+            notification_id = self._required_string(payload, "id")
+            if not self.notification_service.dismiss(notification_id):
+                raise ValueError("Notification not found")
+        elif operation == "clear":
+            return {"cleared": self.notification_service.clear_read()}
+        elif operation == "action":
+            return self._invoke_notification_action(payload)
+        elif operation != "list":
+            raise ValueError("Unknown notification operation")
+
+        severity = payload.get("severity")
+        if severity is not None and severity not in {"info", "warning", "error", "critical"}:
+            raise ValueError("Unknown notification severity")
+        items = self.notification_service.list(
+            unread=True if payload.get("unread") is True else None,
+            severity=severity,
+            category=str(payload["category"]) if payload.get("category") else None,
+            run_id=str(payload["run"]) if payload.get("run") else None,
+            agent_id=str(payload["agent"]) if payload.get("agent") else None,
+            route_id=str(payload["route"]) if payload.get("route") else None,
+            limit=50,
+        )
+        return {
+            "unread": self.notification_service.unread_count(),
+            "notifications": [item.to_dict() for item in items],
+        }
+
+    def _invoke_notification_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        notification_id = self._required_string(payload, "id")
+        action_index = payload.get("index", 0)
+        if not isinstance(action_index, int) or isinstance(action_index, bool):
+            raise TypeError("action index must be an integer")
+        item = self.notification_service.get(notification_id)
+        if item is None:
+            raise ValueError("Notification not found")
+        if action_index < 0 or action_index >= len(item.actions):
+            raise ValueError("Notification action not found")
+        action = item.actions[action_index]
+        self.notification_service.mark_read(item.id)
+        # Return a typed UI instruction. The backend never evaluates a shell command.
+        return {"action": action.kind, "target": action.target, "label": action.label}
+
+    async def _show_storage(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        run_dir = self.report_state.get_run_dir() if self.report_state is not None else None
+        state_dir = runtime_state_dir(run_dir) if run_dir is not None else None
+        return {
+            "run": str(run_dir) if run_dir else "not created yet",
+            "database": str(state_dir / "agents.db") if state_dir else "not created yet",
+            "transcript": (
+                f"{state_dir / 'agents.db'}#transcript_entries" if state_dir else "not created yet"
+            ),
+            "graph": str(state_dir / "agents.json") if state_dir else "not created yet",
+            "log": str(run_dir / "strix.log") if run_dir else "not created yet",
+            "global_config": str(Path.home() / ".strix" / "cli-config.json"),
+            "global_inbox": str(self.notification_service.path),
+        }
 
     async def _add_target(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._require_setup_mutable()
@@ -464,7 +591,7 @@ class TuiController:
             "diff_base": self.diff_base,
         }
 
-    async def _update_config(  # noqa: PLR0912 - validates one bounded config schema
+    async def _update_config(  # noqa: PLR0912, PLR0915 - one bounded config schema
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
         """Validate and persist user configuration from the launch TUI."""
@@ -547,15 +674,70 @@ class TuiController:
                     raise ValueError(f"{field} must be {qualifier}")
                 updates[alias] = value
 
-        persist_overrides(updates)
+        route_updates = {
+            key: updates.pop(key)
+            for key in tuple(updates)
+            if key in {"STRIX_LLM", "LLM_API_KEY", "LLM_API_BASE"}
+        }
+        selected = (
+            next(
+                (
+                    route
+                    for route in list_saved_routes()
+                    if route.name.casefold() == self.selected_route.casefold()
+                ),
+                None,
+            )
+            if self.selected_route
+            else None
+        )
+        if selected is not None and route_updates:
+            edited = RouteConfig.from_dict(selected.to_dict())
+            if "STRIX_LLM" in route_updates:
+                model_value = route_updates["STRIX_LLM"]
+                if not model_value:
+                    raise ValueError("A named route model cannot be empty")
+                edited.model = str(model_value)
+            if "LLM_API_BASE" in route_updates:
+                edited.base_url = route_updates["LLM_API_BASE"]
+            save_route(edited, replace=True)
+            if "LLM_API_KEY" in route_updates:
+                key_value = route_updates["LLM_API_KEY"]
+                if key_value:
+                    set_route_key(edited.name, str(key_value))
+                else:
+                    delete_route_key(edited.name)
+        else:
+            updates.update(route_updates)
+        if updates:
+            persist_overrides(updates)
         settings = load_settings()
-        return {
+        selected = (
+            next(
+                (
+                    route
+                    for route in list_saved_routes()
+                    if route.name.casefold() == self.selected_route.casefold()
+                ),
+                None,
+            )
+            if self.selected_route
+            else None
+        )
+        result = {
             "saved": True,
-            "model": settings.llm.model or "",
-            "api_key_configured": bool(settings.llm.api_key),
-            "api_base": _display_api_base(settings.llm.api_base or ""),
+            "model": selected.model if selected else settings.llm.model or "",
+            "api_key_configured": bool(selected.api_key_ref)
+            if selected
+            else bool(settings.llm.api_key),
+            "api_base": _display_api_base(selected.base_url or "")
+            if selected
+            else _display_api_base(settings.llm.api_base or ""),
             "reasoning_effort": settings.llm.reasoning_effort,
         }
+        if self.selected_route:
+            result["selected_route"] = self.selected_route
+        return result
 
     async def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.scan_started or self._start_in_progress:
@@ -565,8 +747,14 @@ class TuiController:
         mount_working_dir = payload.get("mount_working_dir", False)
         if not isinstance(mount_working_dir, bool):
             raise TypeError("mount_working_dir must be a boolean")
-        model = (load_settings().llm.model or "").strip()
-        if not model:
+        try:
+            routes = load_routes(
+                load_settings(),
+                selected=[self.selected_route] if self.selected_route else None,
+            )
+        except ValueError as exc:
+            raise ValueError("No model configured. Use /model provider/model in the TUI.") from exc
+        if not routes:
             raise ValueError("No model configured. Use /model provider/model in the TUI.")
         if self._on_start is None:
             raise RuntimeError("Scan start is unavailable")
@@ -825,6 +1013,13 @@ class TuiController:
         with contextlib.suppress(Exception):
             httpd.shutdown()
             httpd.server_close()
+
+    def close(self) -> None:
+        """Release process-local subscriptions and viewer resources."""
+        self.close_viewer()
+        unsubscribe = self._unsubscribe_notifications
+        self._unsubscribe_notifications = lambda: None
+        unsubscribe()
 
     async def _quit(self, _payload: dict[str, Any]) -> dict[str, Any]:
         self.close_viewer()

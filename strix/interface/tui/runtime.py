@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from strix.config import load_settings, persist_current
+from strix.config.routes import load_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS
 from strix.core.agents import AgentCoordinator
 from strix.core.hooks import BudgetExceededError
@@ -107,6 +108,7 @@ class GoTuiRuntime:
             "diff_base": self.args.diff_base,
             "resume_instruction": self.args.user_explicit_instruction or "",
             "max_agents": getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
+            "routes": getattr(self.args, "route", None) or [],
             "workspace_mount": getattr(self.args, "workspace_mount", None) or "",
             "workspace_subdir": getattr(self.args, "workspace_subdir", None) or "",
         }
@@ -135,7 +137,9 @@ class GoTuiRuntime:
         the background so the screen paints first and the outcome lands in the
         setup log before the user has finished typing.
         """
-        if not (load_settings().llm.model or "").strip():
+        try:
+            self._configured_model()
+        except ValueError:
             return
         try:
             await self._preflight_model()
@@ -151,8 +155,9 @@ class GoTuiRuntime:
         if preflight is not None and not preflight.done():
             await asyncio.shield(preflight)
         current = load_settings().llm
+        model = self._configured_model()
         current_connection = (
-            (current.model or "").strip(),
+            model,
             getattr(current, "api_key", None) or "",
             getattr(current, "api_base", None) or "",
         )
@@ -167,9 +172,7 @@ class GoTuiRuntime:
 
     async def _preflight_model(self) -> None:
         llm = load_settings().llm
-        model = (llm.model or "").strip()
-        if not model:
-            raise RuntimeError("No model configured. Use /model in the TUI first.")
+        model = self._configured_model()
         self.controller.add_message("Verifying model connection...")
         set_scan_phase("preflight")
         await preflight_model_connection(model)
@@ -179,6 +182,15 @@ class GoTuiRuntime:
             getattr(llm, "api_key", None) or "",
             getattr(llm, "api_base", None) or "",
         )
+
+    def _configured_model(self) -> str:
+        routes = load_routes(
+            load_settings(),
+            selected=[self.controller.selected_route] if self.controller.selected_route else None,
+        )
+        if not routes:
+            raise ValueError("No model configured. Use /model in the TUI first.")
+        return min(routes, key=lambda route: (route.priority, route.name)).model
 
     def _start_preparation(self) -> asyncio.Task[None]:
         """Kick off the work that runs behind the freshly painted TUI."""
@@ -233,7 +245,7 @@ class GoTuiRuntime:
         The model round trip and run preparation run here rather than before
         launch so the interface appears immediately.
         """
-        model = (load_settings().llm.model or "").strip()
+        model = self._configured_model()
         set_scan_phase("preflight")
         try:
             await preflight_model_connection(model)
@@ -482,6 +494,7 @@ class GoTuiRuntime:
                 await self._cancel_tasks(prepare_task, sync_task)
                 await self.quit()
                 await self.server.close()
+                self.controller.close()
             finally:
                 sys.stdout = original_stdout
                 sys.stderr = original_stderr

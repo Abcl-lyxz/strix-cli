@@ -64,9 +64,7 @@ def test_compile_notice_never_emits_raw_ansi() -> None:
 
     go_tui._print_compile_notice(output)
 
-    assert output.getvalue() == (
-        "Compiling the TUI from source (cached after the first run)...\n"
-    )
+    assert output.getvalue() == ("Compiling the TUI from source (cached after the first run)...\n")
     assert "\x1b" not in output.getvalue()
 
 

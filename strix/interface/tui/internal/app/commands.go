@@ -27,6 +27,9 @@ var slashCommands = []slashCommand{
 	{"model", "<provider/model>", "set the model route"},
 	{"apikey", "[key|clear]", "open secure input, save, or remove the API key"},
 	{"baseurl", "<url|clear>", "set a custom OpenAI-compatible API URL"},
+	{"routes", "[select <name>]", "list model routes or select one to edit"},
+	{"notifications", "[unread|read <id>|dismiss <id>|clear]", "open the notification inbox"},
+	{"storage", "", "show exact run and global storage paths"},
 	{"reasoning", "<level>", "none|minimal|low|medium|high|xhigh|max"},
 	{"target", "<url|repo|path>", "add a scan target"},
 	{"untarget", "<target|all>", "remove one or all targets"},
@@ -238,6 +241,26 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 			return m, cmd, true
 		}
 		return m.submitConfigCommand(name, argument)
+	case "routes":
+		parts := strings.Fields(argument)
+		if len(parts) == 0 {
+			return m, send(m.client, "routes.manage", map[string]any{"operation": "list"}), true
+		}
+		if len(parts) == 2 && strings.EqualFold(parts[0], "select") {
+			return m, send(m.client, "routes.manage", map[string]any{"operation": "select", "name": parts[1]}), true
+		}
+		return m, m.slashError("Usage: /routes [select <name>]"), true
+	case "notifications":
+		payload, err := notificationCommandPayload(argument)
+		if err != "" {
+			return m, m.slashError(err), true
+		}
+		return m, send(m.client, "notifications.manage", payload), true
+	case "storage":
+		if strings.TrimSpace(argument) != "" {
+			return m, m.slashError("Usage: /storage"), true
+		}
+		return m, send(m.client, "storage.show", map[string]any{}), true
 	case "target":
 		if cmd := m.requireSetup(name); cmd != nil {
 			return m, cmd, true
@@ -487,9 +510,9 @@ func (m Model) commandHelpView() string {
 		return render.Bold(green).Render(label) + "\n" + render.Col(textColor).Render(commands)
 	}
 	body := strings.Join([]string{
-		section("Configure", "/config  /model  /apikey  /baseurl  /reasoning\n/telemetry  /streaming  /cache  /timeout  /toolcalls  /images"),
+		section("Configure", "/config  /model  /apikey  /baseurl  /routes  /reasoning\n/telemetry  /streaming  /cache  /timeout  /toolcalls  /images"),
 		section("Prepare", "/target  /untarget  /targets  /find  /instruction  /mode\n/budget  /turns  /agents  /scope  /diff-base  /start"),
-		section("Control", "/status  /viewer  /agent  /agents  /findings  /trace\n/follow  /stop  /clear  /quit"),
+		section("Control", "/status  /viewer  /notifications  /storage  /agent  /agents\n/findings  /trace  /follow  /stop  /clear  /quit"),
 		section("Keys", "F1 help · Tab complete/switch · Ctrl+J newline · Ctrl+O viewer\nEsc stop agent · Ctrl+Q quit · arrows navigate"),
 	}, "\n\n")
 	footer := render.Dim().Render("Type / to search commands · press any key to close")
@@ -537,6 +560,53 @@ func onOff(value bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func notificationCommandPayload(argument string) (map[string]any, string) {
+	parts := strings.Fields(argument)
+	payload := map[string]any{"operation": "list"}
+	if len(parts) == 0 || (len(parts) == 1 && strings.EqualFold(parts[0], "all")) {
+		return payload, ""
+	}
+	switch strings.ToLower(parts[0]) {
+	case "unread":
+		if len(parts) != 1 {
+			return nil, "Usage: /notifications unread"
+		}
+		payload["unread"] = true
+	case "read", "dismiss":
+		if len(parts) != 2 {
+			return nil, "Usage: /notifications " + parts[0] + " <id>"
+		}
+		payload["operation"] = strings.ToLower(parts[0])
+		payload["id"] = parts[1]
+	case "clear":
+		if len(parts) != 1 {
+			return nil, "Usage: /notifications clear"
+		}
+		payload["operation"] = "clear"
+	case "action":
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, "Usage: /notifications action <id> [index]"
+		}
+		payload["operation"] = "action"
+		payload["id"] = parts[1]
+		if len(parts) == 3 {
+			index, err := strconv.Atoi(parts[2])
+			if err != nil || index < 0 {
+				return nil, "Notification action index must be non-negative"
+			}
+			payload["index"] = index
+		}
+	case "severity", "category", "run", "agent", "route":
+		if len(parts) != 2 {
+			return nil, "Usage: /notifications " + parts[0] + " <value>"
+		}
+		payload[strings.ToLower(parts[0])] = parts[1]
+	default:
+		return nil, "Usage: /notifications [unread|read <id>|dismiss <id>|clear|severity <level>|category <name>]"
+	}
+	return payload, ""
 }
 
 func (m Model) workspaceSearchView() string {

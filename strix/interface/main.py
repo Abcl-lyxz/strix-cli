@@ -14,6 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strix.config import codex, load_settings, persist_current
+from strix.config.routes import load_routes
 from strix.core.paths import run_dir_for
 from strix.interface.cli_args import parse_arguments
 from strix.interface.environment import (
@@ -70,6 +71,9 @@ Additional commands:
   strix doctor [--network] Diagnose installation, Docker, VPN/proxy, and model setup
   strix view [RUN]         View a completed or running scan
   strix completions SHELL  Generate zsh, bash, or fish tab completion
+  strix routes ...         Configure health-aware model routes
+  strix secrets ...        Migrate and inspect credential storage
+  strix notifications ...  Read the application notification inbox
 """
 
 
@@ -136,7 +140,9 @@ def _subscription_error_hint(exc: BaseException) -> str | None:
     return None
 
 
-async def warm_up_llm(show_model_warning: bool = True) -> None:
+async def warm_up_llm(
+    show_model_warning: bool = True, *, selected_routes: list[str] | None = None
+) -> None:
     from agents.models.interface import ModelTracing
 
     from strix.config.models import (
@@ -155,7 +161,8 @@ async def warm_up_llm(show_model_warning: bool = True) -> None:
         settings = load_settings()
         configure_sdk_model_defaults(settings)
         llm = settings.llm
-        raw_model = (llm.model or "").strip()
+        routes = load_routes(settings, selected=selected_routes)
+        raw_model = min(routes, key=lambda route: (route.priority, route.name)).model
         if (
             raw_model
             and "/" not in raw_model
@@ -213,8 +220,10 @@ async def warm_up_llm(show_model_warning: bool = True) -> None:
                 ),
             )
 
-        await preflight_model_connection(raw_model, settings=settings)
-        logger.info("LLM warm-up succeeded for model %s", (llm.model or "").strip())
+        await preflight_model_connection(
+            raw_model, settings=settings, selected_routes=selected_routes
+        )
+        logger.info("LLM warm-up succeeded for model %s", raw_model)
 
         if settings.dedupe.model:
             from strix.report.dedupe import resolve_dedupe_model
@@ -404,7 +413,9 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
     """
     set_scan_phase("preflight")
     try:
-        asyncio.run(warm_up_llm(show_model_warning=True))
+        asyncio.run(
+            warm_up_llm(show_model_warning=True, selected_routes=getattr(args, "route", None))
+        )
     except ModelConnectionError as exc:
         report_error("model_connection_failed", exc)
         _print_model_connection_error(exc, exc.model_name)
@@ -421,7 +432,12 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
 
 def _ensure_interactive_setup_for_model(args: argparse.Namespace) -> None:
     """Route a missing model into the TUI instead of failing before it opens."""
-    if not (load_settings().llm.model or "").strip():
+    settings = load_settings()
+    configured = bool((settings.llm.model or "").strip())
+    if not configured:
+        with contextlib.suppress(TypeError, ValueError):
+            configured = bool(load_routes(settings))
+    if not configured:
         # Preserve any CLI target in the launch screen while configuration is
         # completed. A configured direct launch keeps its fast path.
         args.needs_setup = True
@@ -473,6 +489,21 @@ def main() -> None:
         from strix.interface.cloud import run_cloud
 
         sys.exit(run_cloud(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] in {"routes", "secrets", "notifications"}:
+        from strix.interface.local_admin import (
+            run_notifications,
+            run_routes,
+            run_secrets,
+        )
+
+        command = sys.argv[1]
+        handler = {
+            "routes": run_routes,
+            "secrets": run_secrets,
+            "notifications": run_notifications,
+        }[command]
+        sys.exit(handler(sys.argv[2:]))
 
     start_import_warmup()
 

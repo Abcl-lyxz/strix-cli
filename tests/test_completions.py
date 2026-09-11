@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import Any
+
+import pytest
 
 from strix.interface.completions import completion_candidates, run_completions
 
@@ -130,6 +133,8 @@ def test_filesystem_completion_for_source_output_and_data(tmp_path: Any, monkeyp
 def test_filesystem_completion_omits_terminal_control_names(
     tmp_path: Any, monkeypatch: Any, capsys: Any
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows filenames cannot contain terminal control characters")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "safe.json").write_text("{}", encoding="utf-8")
     (tmp_path / "unsafe\nname.json").write_text("{}", encoding="utf-8")

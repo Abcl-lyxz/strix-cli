@@ -297,10 +297,13 @@ func TestSetupOffersSearchableSlashCommands(t *testing.T) {
 	model.showSplash = false
 	model.handleEnvelope(stateEnvelope(t, 1, protocol.Snapshot{SetupMode: true, ScanState: "setup"}))
 
-	model.input.SetValue("/")
-	model.resizeViewport()
-	view := ansi.Strip(model.View())
-	for _, want := range []string{"Commands", "/target", "/model", "/apikey", "/help"} {
+	for _, want := range []string{"/target", "/model", "/apikey", "/routes", "/notifications", "/storage", "/help"} {
+		model.input.SetValue(want)
+		model.resizeViewport()
+		view := ansi.Strip(model.View())
+		if !strings.Contains(view, "Commands") {
+			t.Fatalf("slash command palette is missing its heading: %s", view)
+		}
 		if !strings.Contains(view, want) {
 			t.Fatalf("slash command palette is missing %q: %s", want, view)
 		}

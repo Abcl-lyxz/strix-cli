@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		update.State.Events = m.snapshot.Events
 		update.State.Vulnerabilities = m.snapshot.Vulnerabilities
 		update.State.Agents = m.snapshot.Agents
-		m.consumeMessages(update.State.Messages, update.State.SetupMode)
+		messageCmd := m.consumeMessages(update.State.Messages, update.State.SetupMode)
 		m.snapshot = update.State
 		m.stateRevision = update.Revision
 		if m.snapshot.Error != nil {
@@ -56,6 +57,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		// resize (not just refresh): status-row visibility changes the chat height.
 		m.resizeViewport()
 		m.resizeVulnerabilityViewport()
+		return messageCmd
 	case "collection_bootstrap":
 		return m.handleCollectionBootstrap(envelope.Payload)
 	case "collection_delta":
@@ -156,12 +158,83 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			m.searchTruncated = data.Truncated
 			m.searchMatches = data.Matches
 			m.openModal(modalWorkspaceSearch)
+		case "routes.manage":
+			var data struct {
+				Selected string `json:"selected"`
+				Routes   []struct {
+					Name    string `json:"name"`
+					Model   string `json:"model"`
+					Enabled bool   `json:"enabled"`
+				} `json:"routes"`
+			}
+			if err := json.Unmarshal(result.Result, &data); err != nil {
+				return m.slashError(err.Error())
+			}
+			m.snapshot.SelectedRoute = data.Selected
+			rows := make([]string, 0, len(data.Routes))
+			for _, route := range data.Routes {
+				marker := " "
+				if route.Name == data.Selected {
+					marker = "*"
+				}
+				state := "disabled"
+				if route.Enabled {
+					state = "enabled"
+				}
+				rows = append(rows, fmt.Sprintf("%s %s · %s · %s", marker, route.Name, route.Model, state))
+			}
+			if len(rows) == 0 {
+				rows = append(rows, "No saved routes; legacy model settings are active")
+			}
+			return m.slashInfo(strings.Join(rows, "\n"))
+		case "notifications.manage":
+			var data struct {
+				Unread        int     `json:"unread"`
+				Cleared       int     `json:"cleared"`
+				Action        string  `json:"action"`
+				Target        *string `json:"target"`
+				Notifications []struct {
+					ID       string `json:"id"`
+					Severity string `json:"severity"`
+					Title    string `json:"title"`
+					Count    int    `json:"count"`
+				} `json:"notifications"`
+			}
+			if err := json.Unmarshal(result.Result, &data); err != nil {
+				return m.slashError(err.Error())
+			}
+			if data.Action != "" {
+				return m.slashInfo("Notification action: " + data.Action)
+			}
+			if data.Cleared > 0 {
+				return m.slashInfo(fmt.Sprintf("Cleared %d read notification(s)", data.Cleared))
+			}
+			m.snapshot.NotificationUnread = data.Unread
+			rows := make([]string, 0, len(data.Notifications))
+			for _, item := range data.Notifications {
+				rows = append(rows, fmt.Sprintf("[%s] %s · %s · x%d", item.Severity, item.Title, item.ID[:min(8, len(item.ID))], item.Count))
+			}
+			if len(rows) == 0 {
+				rows = append(rows, "No notifications")
+			}
+			return m.slashInfo(strings.Join(rows, "\n"))
+		case "storage.show":
+			var data map[string]string
+			if err := json.Unmarshal(result.Result, &data); err != nil {
+				return m.slashError(err.Error())
+			}
+			keys := []string{"run", "database", "transcript", "graph", "log", "global_config", "global_inbox"}
+			rows := make([]string, 0, len(keys))
+			for _, key := range keys {
+				rows = append(rows, key+": "+data[key])
+			}
+			return m.slashInfo(strings.Join(rows, "\n"))
 		}
 	}
 	return nil
 }
 
-func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) {
+func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) tea.Cmd {
 	if m.seenMessages == nil {
 		m.seenMessages = map[string]bool{}
 	}
@@ -174,8 +247,11 @@ func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) {
 			continue
 		}
 		m.seenMessages[key] = true
-		if !setupMode || strings.TrimSpace(message.Text) == "" {
+		if strings.TrimSpace(message.Text) == "" {
 			continue
+		}
+		if !setupMode {
+			return m.showToastFor(message.Text, 7*time.Second)
 		}
 		style := render.Dim()
 		switch message.Level {
@@ -186,6 +262,7 @@ func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) {
 		}
 		m.setupMsg(message.Text, style)
 	}
+	return nil
 }
 
 func validCollection(name string) bool {

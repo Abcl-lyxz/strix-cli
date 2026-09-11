@@ -2,7 +2,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = 5
+const Version = 6
 
 var Capabilities = []string{
 	"state-revisions",
@@ -11,6 +11,9 @@ var Capabilities = []string{
 	"agents-collection",
 	"interactive-configuration",
 	"large-user-prompts",
+	"model-route-pools",
+	"notification-inbox",
+	"storage-locations",
 }
 
 type Envelope struct {
@@ -85,6 +88,8 @@ type Snapshot struct {
 	MaxToolCallsPerTurn int              `json:"max_tool_calls_per_turn"`
 	MaxContextImages    int              `json:"max_context_images"`
 	ConfigEnvOverride   bool             `json:"config_env_override"`
+	SelectedRoute       string           `json:"selected_route"`
+	NotificationUnread  int              `json:"notification_unread"`
 	CaidoURL            string           `json:"caido_url"`
 	Messages            []Message        `json:"messages"`
 	Agents              []Agent          `json:"-"`

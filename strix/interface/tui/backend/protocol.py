@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 PROTOCOL_CAPABILITIES = (
     "state-revisions",
     "collection-deltas",
@@ -13,6 +13,9 @@ PROTOCOL_CAPABILITIES = (
     "agents-collection",
     "interactive-configuration",
     "large-user-prompts",
+    "model-route-pools",
+    "notification-inbox",
+    "storage-locations",
 )
 
 # Commands and control messages are intentionally small. Event and finding
