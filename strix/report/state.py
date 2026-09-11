@@ -13,6 +13,7 @@ from uuid import uuid4
 from strix.config import codex
 from strix.config.loader import load_settings
 from strix.core.paths import run_dir_for, runtime_state_dir
+from strix.notifications import NotificationAction, notify
 from strix.report.coverage import write_coverage
 from strix.report.pricing import resolve_litellm_model
 from strix.report.sarif import write_sarif
@@ -411,6 +412,24 @@ class ReportState:
             self.vulnerability_found_callback(report)
 
         self.vulnerability_reports.append(report)
+        notify(
+            "finding.created",
+            title=f"{report['severity'].title()} finding: {report['title']}",
+            detail=str(report.get("target") or ""),
+            severity=(
+                "critical"
+                if report["severity"] == "critical"
+                else "error"
+                if report["severity"] == "high"
+                else "warning"
+                if report["severity"] == "medium"
+                else "info"
+            ),
+            run_id=self.run_id,
+            agent_id=agent_id,
+            dedupe_key=f"finding:{self.run_id}:{report_id}",
+            actions=(NotificationAction("open_finding", "Open finding", report_id),),
+        )
         logger.info(f"Added vulnerability report: {report_id} - {title}")
         posthog.finding(severity, cwe=cwe, is_cve=bool(cve))
         scarf.finding(severity, cwe=cwe, is_cve=bool(cve))
@@ -526,12 +545,14 @@ class ReportState:
         usage: "Usage | None",
         agent_name: str | None = None,
         model: str | None = None,
+        route: str | None = None,
     ) -> None:
         """Record SDK-native token usage for one completed model run/cycle."""
         if self._llm_usage.record(
             agent_id=agent_id,
             agent_name=agent_name,
             model=model,
+            route=route,
             usage=usage,
         ):
             self.save_run_data()
@@ -586,6 +607,14 @@ class ReportState:
 
         logger.info("Updated scan final fields")
         self.save_run_data(mark_complete=True)
+        notify(
+            "scan.completed",
+            title=f"Scan {self.run_name or self.run_id} completed",
+            detail=f"{len(self.vulnerability_reports)} finding(s) recorded.",
+            severity="info",
+            run_id=self.run_id,
+            dedupe_key=f"scan-completed:{self.run_id}",
+        )
         posthog.end(self, exit_reason="finished_by_tool")
         scarf.end(self, exit_reason="finished_by_tool")
 
