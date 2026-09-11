@@ -45,6 +45,18 @@ _LLM_ENV_KEYS = [
 ]
 
 
+def _v2(
+    env: dict[str, object] | None = None,
+    refs: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 2,
+        "env": env or {},
+        "secret_refs": refs or {},
+        "routing": {},
+    }
+
+
 @pytest.fixture(autouse=True)
 def _reset_loader_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset module globals and clear known env vars for deterministic runs."""
@@ -221,9 +233,7 @@ def test_persist_current_writes_env_block(tmp_path: Path, monkeypatch: pytest.Mo
     loader.persist_current()
 
     assert target.exists()
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "persisted-model"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2()
 
 
 def test_persist_current_keeps_file_values_when_env_is_unset(tmp_path: Path) -> None:
@@ -237,9 +247,9 @@ def test_persist_current_keeps_file_values_when_env_is_unset(tmp_path: Path) -> 
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "file-model", "LLM_API_KEY": "file-key"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"}, {"LLM_API_KEY": "settings.llm-api-key"}
+    )
 
 
 def test_persist_current_env_overrides_file_value(
@@ -255,9 +265,10 @@ def test_persist_current_env_overrides_file_value(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "file-model", "PERPLEXITY_API_KEY": "env-pplx"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"},
+        {"PERPLEXITY_API_KEY": "settings.perplexity-api-key"},
+    )
 
 
 def test_linked_llm_model_change_drops_stored_key_and_base(
@@ -287,9 +298,13 @@ def test_linked_llm_model_change_drops_stored_key_and_base(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "env-model", "PERPLEXITY_API_KEY": "pplx"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model", "LLM_API_BASE": "http://file-base"},
+        {
+            "LLM_API_KEY": "settings.llm-api-key",
+            "PERPLEXITY_API_KEY": "settings.perplexity-api-key",
+        },
+    )
 
 
 def test_linked_llm_key_change_drops_stored_model(
@@ -307,7 +322,9 @@ def test_linked_llm_key_change_drops_stored_model(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"LLM_API_KEY": "new-key"}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"}, {"LLM_API_KEY": "settings.llm-api-key"}
+    )
 
 
 def test_linked_llm_secondary_alias_in_env_is_not_a_change(
@@ -328,9 +345,9 @@ def test_linked_llm_secondary_alias_in_env_is_not_a_change(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "file-model", "LLM_API_KEY": "file-key"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"}, {"LLM_API_KEY": "settings.llm-api-key"}
+    )
 
 
 def test_linked_llm_unchanged_env_keeps_stored_key(
@@ -348,9 +365,9 @@ def test_linked_llm_unchanged_env_keeps_stored_key(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {"STRIX_LLM": "file-model", "LLM_API_KEY": "file-key"}
-    }
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"}, {"LLM_API_KEY": "settings.llm-api-key"}
+    )
 
 
 def test_persist_current_env_alias_replaces_other_alias_in_file(
@@ -363,7 +380,9 @@ def test_persist_current_env_alias_replaces_other_alias_in_file(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"LLM_API_KEY": "new-key"}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        refs={"OPENAI_API_KEY": "settings.llm-api-key"}
+    )
 
 
 def test_persist_current_empty_env_clears_file_value(
@@ -379,7 +398,10 @@ def test_persist_current_empty_env_clears_file_value(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"STRIX_LLM": "file-model"}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {"STRIX_LLM": "file-model"},
+        {"PERPLEXITY_API_KEY": "settings.perplexity-api-key"},
+    )
 
 
 def test_persist_current_empty_primary_alias_does_not_save_sibling(
@@ -395,7 +417,9 @@ def test_persist_current_empty_primary_alias_does_not_save_sibling(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"PERPLEXITY_API_KEY": "pplx"}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        refs={"PERPLEXITY_API_KEY": "settings.perplexity-api-key"}
+    )
 
 
 def test_persist_current_replaces_corrupt_file(
@@ -408,7 +432,7 @@ def test_persist_current_replaces_corrupt_file(
 
     loader.persist_current()
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"STRIX_LLM": "env-model"}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2()
 
 
 def test_persist_current_sets_0600_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -439,14 +463,16 @@ def test_persist_overrides_writes_explicit_values_and_invalidates_cache(tmp_path
         }
     )
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {
-        "env": {
-            "PERPLEXITY_API_KEY": "keep",
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2(
+        {
             "STRIX_LLM": "openrouter/openai/gpt-5.4",
-            "LLM_API_KEY": "new-secret",
             "STRIX_REASONING_EFFORT": "medium",
-        }
-    }
+        },
+        {
+            "LLM_API_KEY": "settings.llm-api-key",
+            "PERPLEXITY_API_KEY": "settings.perplexity-api-key",
+        },
+    )
     assert loader.load_settings() is not before
     assert loader.load_settings().llm.api_key == "new-secret"
     if os.name != "nt":
@@ -463,7 +489,7 @@ def test_persist_overrides_none_removes_all_field_aliases(tmp_path: Path) -> Non
 
     loader.persist_overrides({"LLM_API_BASE": None})
 
-    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {}}
+    assert json.loads(target.read_text(encoding="utf-8")) == _v2()
 
 
 def test_persist_overrides_rejects_unknown_settings(tmp_path: Path) -> None:

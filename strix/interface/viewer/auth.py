@@ -22,12 +22,14 @@ from typing import Any
 import requests
 
 from strix.config.loader import load_settings
+from strix.security import get_secret_store
 from strix.utils.secret_files import write_secret_text
 
 
 logger = logging.getLogger(__name__)
 
 AUTH_PATH = Path.home() / ".strix" / "viewer-auth.json"
+_SECRET_REF = "auth.viewer.relay-token"  # noqa: S105  # nosec B105 - keychain reference
 
 _OTP_TIMEOUT = 15
 _SEND_TIMEOUT = 30
@@ -54,6 +56,17 @@ def read_auth() -> dict[str, Any] | None:
         return None
     email = data.get("email")
     token = data.get("token")
+    secret_ref = data.get("secret_ref")
+    if isinstance(secret_ref, str):
+        try:
+            token = get_secret_store().get(secret_ref)
+        except (OSError, RuntimeError):
+            token = None
+        if token:
+            data["token"] = token
+    elif isinstance(token, str) and token:
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            write_auth(str(email or ""), token, str(data.get("verified_at") or ""))
     if not isinstance(email, str) or not email or not isinstance(token, str) or not token:
         return None
     return data
@@ -116,12 +129,15 @@ def is_verified() -> bool:
 
 def write_auth(email: str, token: str, verified_at: str) -> None:
     """Atomically persist the auth record with 0600 permissions."""
-    payload = json.dumps({"email": email, "token": token, "verified_at": verified_at})
+    get_secret_store().set(_SECRET_REF, token)
+    payload = json.dumps({"email": email, "secret_ref": _SECRET_REF, "verified_at": verified_at})
     write_secret_text(AUTH_PATH, payload)
 
 
 def forget() -> None:
     """Delete the stored auth record. No-op if it is absent."""
+    with contextlib.suppress(OSError, RuntimeError):
+        get_secret_store().delete(_SECRET_REF)
     with contextlib.suppress(OSError):
         AUTH_PATH.unlink()
 

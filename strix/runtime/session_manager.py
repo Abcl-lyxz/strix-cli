@@ -48,7 +48,11 @@ def _host_identity_env() -> dict[str, str]:
         return {}
     # Bind-mount ownership only needs mapping on Linux, where the container uid
     # must match the host's.
-    return {"STRIX_HOST_UID": str(os.getuid()), "STRIX_HOST_GID": str(os.getgid())}
+    get_uid = getattr(os, "getuid", None)
+    get_gid = getattr(os, "getgid", None)
+    if not callable(get_uid) or not callable(get_gid):
+        return {}
+    return {"STRIX_HOST_UID": str(get_uid()), "STRIX_HOST_GID": str(get_gid())}
 
 
 def build_bind_mounts(local_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:

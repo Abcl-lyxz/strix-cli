@@ -4,6 +4,32 @@ from __future__ import annotations
 
 import pytest
 
+from strix.security import SecretStore
+from strix.security import secrets as secret_module
+
+
+class _MemorySecretBackend:
+    name = "test keychain"
+    available = True
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def get(self, ref: str) -> str | None:
+        return self.values.get(ref)
+
+    def set(self, ref: str, value: str) -> None:
+        self.values[ref] = value
+
+    def delete(self, ref: str) -> bool:
+        return self.values.pop(ref, None) is not None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let tests read, write, or delete credentials in the user's keychain."""
+    monkeypatch.setattr(secret_module, "_default_store", SecretStore(_MemorySecretBackend()))
+
 
 @pytest.fixture(autouse=True)
 def _isolate_mcp_config(

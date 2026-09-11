@@ -87,6 +87,8 @@ def _auth_headers(config: McpConnectionConfig) -> dict[str, str]:
     auth = config.auth
     if auth is None:
         return {}
+    if not auth.token:
+        raise ValueError("MCP bearer credential could not be resolved")
     return {"Authorization": f"Bearer {auth.token}"}
 
 

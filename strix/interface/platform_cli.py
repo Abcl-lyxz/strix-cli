@@ -28,10 +28,12 @@ from strix.config import load_settings
 from strix.interface.platform_identity import read_or_create_identity
 from strix.interface.terminal_text import sanitize_terminal_text
 from strix.interface.url_safety import is_safe_web_url
+from strix.security import get_secret_store
 from strix.utils.secret_files import write_secret_text
 
 
 AUTH_PATH = Path.home() / ".strix" / "platform-auth.json"
+_SECRET_REF = "auth.platform.api-token"  # noqa: S105  # nosec B105 - keychain reference
 
 _HTTP_TIMEOUT_S = 30
 _DEFAULT_POLL_INTERVAL_S = 5
@@ -70,16 +72,36 @@ def read_record() -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     record = cast("dict[str, Any]", data)
+    secret_ref = record.get("secret_ref")
+    if isinstance(secret_ref, str):
+        try:
+            token = get_secret_store().get(secret_ref)
+        except (OSError, RuntimeError):
+            token = None
+        if token:
+            record = {**record, "api_token": token}
+    elif record.get("api_token"):
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            save_record(record)
     if not record.get("api_token"):
         return None
+    record.pop("secret_ref", None)
     return record
 
 
 def save_record(record: dict[str, Any]) -> None:
-    write_secret_text(AUTH_PATH, json.dumps(record, indent=2))
+    token = record.get("api_token")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("platform auth record must contain an API token")
+    get_secret_store().set(_SECRET_REF, token)
+    safe_record = {key: value for key, value in record.items() if key != "api_token"}
+    safe_record["secret_ref"] = _SECRET_REF
+    write_secret_text(AUTH_PATH, json.dumps(safe_record, indent=2))
 
 
 def logout() -> bool:
+    with contextlib.suppress(OSError, RuntimeError):
+        get_secret_store().delete(_SECRET_REF)
     try:
         AUTH_PATH.unlink()
     except FileNotFoundError:
@@ -174,7 +196,7 @@ def _login(console: Console, argv: list[str]) -> int:
 
     try:
         save_record(record)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         console.print(
             f"[red]Sign-in succeeded, but the token could not be stored:[/] {_terminal_markup(exc)}"
         )

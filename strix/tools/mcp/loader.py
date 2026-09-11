@@ -21,7 +21,9 @@ from typing import cast
 
 from pydantic import ValidationError
 
+from strix.security import SecretStoreUnavailableError, get_secret_store
 from strix.tools.mcp.config import McpConnectionConfig
+from strix.utils.secret_files import write_secret_text
 
 
 logger = logging.getLogger(__name__)
@@ -124,10 +126,61 @@ def load_user_mcp_configs(path: Path | None = None) -> list[McpConnectionConfig]
 
     entries = cast("list[object]", raw)
     configs: list[McpConnectionConfig] = []
+    sanitized_entries: list[object] = []
+    changed = False
     for index, entry in enumerate(entries):
+        resolved = entry
+        if isinstance(entry, dict):
+            resolved, sanitized, migrated = _resolve_auth(entry)
+            sanitized_entries.append(sanitized)
+            changed = changed or migrated
+        else:
+            sanitized_entries.append(entry)
         try:
-            configs.append(McpConnectionConfig.model_validate(entry))
+            configs.append(McpConnectionConfig.model_validate(resolved))
         except ValidationError as exc:
             logger.warning("Skipping invalid MCP server entry #%d in %s: %s", index, source, exc)
 
+    if changed:
+        try:
+            write_secret_text(source, json.dumps(sanitized_entries, indent=2))
+        except OSError:
+            logger.exception("Could not redact migrated MCP credentials in %s", source)
+
     return _apply_run_selection(_dedupe_by_name(configs))
+
+
+def _resolve_auth(entry: dict[str, object]) -> tuple[dict[str, object], dict[str, object], bool]:
+    """Resolve a keychain reference and migrate a legacy bearer token safely."""
+    resolved = dict(entry)
+    sanitized = dict(entry)
+    raw_auth = entry.get("auth")
+    if not isinstance(raw_auth, dict) or raw_auth.get("kind", "bearer") != "bearer":
+        return resolved, sanitized, False
+    auth = dict(raw_auth)
+    secret_ref = auth.get("secret_ref")
+    if isinstance(secret_ref, str):
+        try:
+            token = get_secret_store().get(secret_ref)
+        except (OSError, SecretStoreUnavailableError):
+            token = None
+        if token:
+            auth["token"] = token
+            resolved["auth"] = auth
+        return resolved, sanitized, False
+    token = auth.get("token")
+    name = str(entry.get("name") or "server")
+    if not isinstance(token, str) or not token:
+        return resolved, sanitized, False
+    slug = "".join(char if char.isalnum() or char in "._-" else "-" for char in name.lower())
+    ref = f"mcp.{slug}.bearer"
+    try:
+        get_secret_store().set(ref, token)
+    except (OSError, SecretStoreUnavailableError, ValueError):
+        return resolved, sanitized, False
+    clean_auth = {key: value for key, value in auth.items() if key != "token"}
+    clean_auth["secret_ref"] = ref
+    sanitized["auth"] = clean_auth
+    auth["secret_ref"] = ref
+    resolved["auth"] = auth
+    return resolved, sanitized, True

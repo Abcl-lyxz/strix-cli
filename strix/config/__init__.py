@@ -14,15 +14,20 @@ Public surface:
 
 from strix.config.loader import (
     apply_config_override,
+    config_path,
     load_settings,
+    migrate_legacy_config_secrets,
     persist_current,
     persist_overrides,
+    read_config_document,
+    write_config_document,
 )
 from strix.config.settings import (
     ContextSettings,
     DedupeSettings,
     IntegrationSettings,
     LlmSettings,
+    RoutingSettings,
     RuntimeSettings,
     Settings,
     TelemetrySettings,
@@ -34,11 +39,16 @@ __all__ = [
     "DedupeSettings",
     "IntegrationSettings",
     "LlmSettings",
+    "RoutingSettings",
     "RuntimeSettings",
     "Settings",
     "TelemetrySettings",
     "apply_config_override",
+    "config_path",
     "load_settings",
+    "migrate_legacy_config_secrets",
     "persist_current",
     "persist_overrides",
+    "read_config_document",
+    "write_config_document",
 ]

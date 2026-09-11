@@ -29,6 +29,7 @@ def write_secret_text(path: Path, text: str) -> None:
 
     try:
         tmp.replace(path)
+        path.chmod(SECRET_FILE_MODE)
     except BaseException as exc:
         _cleanup_tmp(tmp, exc)
         raise

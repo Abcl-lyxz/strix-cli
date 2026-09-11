@@ -6,10 +6,13 @@ import contextlib
 import logging
 import os
 import sys
+import traceback
 import warnings
 from contextvars import ContextVar
 from pathlib import Path  # noqa: TC003  used at runtime by ``setup_scan_logging``
 from typing import TYPE_CHECKING
+
+from strix.security import redact_secrets
 
 
 if TYPE_CHECKING:
@@ -39,6 +42,10 @@ class _StrixContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.scan_id = _SCAN_ID.get() or "-"
         record.agent_id = _AGENT_ID.get() or "-"
+        record.msg = redact_secrets(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_secrets("".join(traceback.format_exception(*record.exc_info)))
         return True
 
 

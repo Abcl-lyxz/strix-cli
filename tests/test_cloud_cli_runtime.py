@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sys
 import time
 from typing import TYPE_CHECKING, Any
@@ -284,6 +285,8 @@ def test_human_rendering_neutralizes_osc_and_csi_control_sequences() -> None:
 def test_source_prompt_shows_paths_and_literal_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows filenames cannot contain terminal control characters")
     (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
     dangerous_name = "visible\x1b]52;c;copied\x07\x1b[2J.py"
     (tmp_path / dangerous_name).write_text("print('safe')\n", encoding="utf-8")

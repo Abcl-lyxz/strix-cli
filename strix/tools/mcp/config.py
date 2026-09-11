@@ -21,7 +21,14 @@ class BearerAuth(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["bearer"] = "bearer"
-    token: str = Field(min_length=1, repr=False)
+    token: str | None = Field(default=None, min_length=1, repr=False)
+    secret_ref: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _has_credential(self) -> BearerAuth:
+        if not self.token and not self.secret_ref:
+            raise ValueError("bearer auth requires token or secret_ref")
+        return self
 
 
 McpAuth = Annotated[BearerAuth, Field(discriminator="kind")]

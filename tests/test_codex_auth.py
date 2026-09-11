@@ -157,7 +157,8 @@ def test_store_roundtrip_and_logout() -> None:
 
 
 def test_read_record_rejects_incomplete_records() -> None:
-    codex.save_record({"type": "oauth", "access": "a"})  # missing refresh/account
+    with pytest.raises(ValueError, match="access and refresh"):
+        codex.save_record({"type": "oauth", "access": "a"})  # missing refresh/account
     assert codex.read_record() is None
     assert codex.is_authenticated() is False
 

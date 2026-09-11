@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -87,6 +88,8 @@ def test_is_verified_accepts_epoch_expiry() -> None:
 
 
 def test_write_auth_is_0600() -> None:
+    if os.name == "nt":
+        pytest.skip("Windows ACLs are not represented by POSIX mode bits")
     auth.write_auth(email="a@b.com", token="t", verified_at="")  # nosec B106
     mode = stat.S_IMODE(auth.AUTH_PATH.stat().st_mode)
     assert mode == 0o600

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
+from strix.security import get_secret_store, interprocess_lock
 from strix.utils.secret_files import write_secret_text
 
 
@@ -58,6 +59,7 @@ _refresh_lock = threading.Lock()
 
 # Kept separate from cli-config.json so OAuth tokens never land in the env-var config.
 AUTH_PATH = Path.home() / ".strix" / "subscription-auth.json"
+_SECRET_REF = "auth.chatgpt.oauth"  # noqa: S105  # nosec B105 - keychain reference
 
 
 def _read_store() -> dict[str, Any]:
@@ -76,6 +78,22 @@ def read_record() -> dict[str, Any] | None:
     record = _read_store().get(PROVIDER)
     if not isinstance(record, dict) or record.get("type") != "oauth":
         return None
+    secret_ref = record.get("secret_ref")
+    if isinstance(secret_ref, str):
+        try:
+            secret = get_secret_store().get(secret_ref)
+        except (OSError, RuntimeError):
+            secret = None
+        if secret:
+            try:
+                payload = json.loads(secret)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(payload, dict):
+                record = {**record, **payload}
+    elif record.get("access") and record.get("refresh"):
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            save_record(record)
     if not (record.get("access") and record.get("refresh") and record.get("account_id")):
         return None
     return record
@@ -86,16 +104,28 @@ def is_authenticated() -> bool:
 
 
 def save_record(record: dict[str, Any]) -> None:
+    secret_payload = {
+        key: record[key]
+        for key in ("access", "refresh", "id_token")
+        if isinstance(record.get(key), str) and record[key]
+    }
+    if not secret_payload.get("access") or not secret_payload.get("refresh"):
+        raise ValueError("OAuth record must contain access and refresh tokens")
+    get_secret_store().set(_SECRET_REF, json.dumps(secret_payload, separators=(",", ":")))
+    safe_record = {
+        key: value for key, value in record.items() if key not in {"access", "refresh", "id_token"}
+    }
+    safe_record["secret_ref"] = _SECRET_REF
     data = _read_store()
-    data[PROVIDER] = record
+    data[PROVIDER] = safe_record
     _write_store(data)
 
 
 def logout() -> None:
     data = _read_store()
-    if PROVIDER not in data:
-        return
-    del data[PROVIDER]
+    data.pop(PROVIDER, None)
+    with contextlib.suppress(OSError, RuntimeError):
+        get_secret_store().delete(_SECRET_REF)
     if data:
         _write_store(data)
         return
@@ -109,22 +139,10 @@ def _refresh_guard() -> Iterator[None]:
     so concurrent runs can't both spend the single-use refresh token."""
     with _refresh_lock:
         try:
-            import fcntl
-
-            lock_path = AUTH_PATH.with_suffix(".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = lock_path.open("w")
-        except (ImportError, OSError):
+            with interprocess_lock(AUTH_PATH.with_suffix(".lock")):
+                yield
+        except OSError:
             yield
-            return
-        try:
-            with contextlib.suppress(OSError):
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            yield
-        finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
 
 
 class CodexAuthError(Exception):
