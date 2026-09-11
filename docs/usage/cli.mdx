@@ -21,6 +21,9 @@ Type `/` to search commands and press Tab to complete one.
 | `/model <provider/model>` | Set the LiteLLM model route |
 | `/apikey [key\|clear]` | Open a secure key popup, save an inline key, or remove it |
 | `/baseurl <url\|clear>` | Configure an OpenAI-compatible or local endpoint |
+| `/routes [select <name>]` | List model routes or select the route edited by `/model`, `/apikey`, and `/baseurl` |
+| `/notifications [filters or action]` | Open and manage the persistent notification inbox |
+| `/storage` | Show the exact run, database, transcript, graph, log, config, and inbox locations |
 | `/reasoning <level>` | Set reasoning effort |
 | `/target`, `/untarget`, `/targets` | Manage launch targets |
 | `/find <text>` | Search the local workspace without consuming an AI turn |
@@ -36,6 +39,32 @@ Type `/` to search commands and press Tab to complete one.
 Configuration and launch-setting commands are available before a scan starts;
 navigation and agent controls remain available during a live run. Environment
 variables still take precedence over values saved by the TUI.
+
+## Route, secret, and notification commands
+
+```bash
+strix routes list
+strix routes add primary --model openai/gpt-5.4 --priority 1 --max-concurrency 3
+strix routes key primary
+strix routes test primary
+strix routes enable primary
+strix routes disable primary
+strix routes remove primary
+strix routes strategy
+
+strix secrets status
+strix secrets migrate
+strix secrets purge-legacy
+
+strix notifications list --unread --severity warning
+strix notifications read <id>
+strix notifications dismiss <id>
+strix notifications clear
+```
+
+Use `--route NAME` on a scan to select one saved route; repeat it to select a
+smaller pool. See [Routes, recovery, and storage](/advanced/resilience-and-storage)
+for routing, secure credentials, recovery, and file locations.
 
 ## Options
 

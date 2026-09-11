@@ -29,7 +29,10 @@
 ## What This Edition Improves
 
 - **Full interactive TUI** with a command palette, setup controls, live agent navigation, and compact modals
-- **Safer configuration** with a masked `/apikey` popup and private persisted settings
+- **Resilient multi-route models** with health-aware load sharing, cooldowns, failover, and parked-agent recovery
+- **System-keychain credentials** with a masked `/apikey` popup and no reusable plaintext secrets in JSON
+- **General notifications** with TUI toasts, a persistent inbox, filters, deduplication, and headless JSON
+- **Durable context** with append-only transcripts and checkpoints that survive compaction
 - **Smarter code navigation** through deterministic `/find` and agent-side bounded workspace search
 - **Lower context waste** by routing exact lookups through code search before loading whole files
 - **Stronger Windows support** with Docker Desktop discovery, WSL-aware diagnostics, and clearer startup checks
@@ -98,9 +101,16 @@ strix
 > [!NOTE]
 > First run automatically pulls the sandbox Docker image. Results are saved to `strix_runs/<run-name>`
 
-Type `/` in the TUI for a searchable command palette. Model credentials are saved in the private
-`~/.strix/cli-config.json` file; the API key is masked and never returned to the UI. Environment
-variables remain supported for headless and CI runs.
+Type `/` in the TUI for a searchable command palette. Model credentials are
+stored in Windows Credential Manager, macOS Keychain, or Linux Secret Service;
+`~/.strix/cli-config.json` keeps only non-secret settings and credential
+references. The API key is masked and never returned to the UI. Environment
+variables remain process-only and supported for headless and CI runs.
+
+Use `/routes` to inspect or select model routes, `/notifications` for the
+application-wide inbox, and `/storage` to see the exact chat, database, log,
+and global-state paths. Chat and scan evidence stay with the project under
+`strix_runs/<run-name>/`; they are not moved into `~/.strix`.
 
 Use `/find <text>` for a fast, bounded repository lookup that does not consume an AI turn.
 

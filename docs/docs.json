@@ -67,6 +67,7 @@
             "group": "Advanced",
             "pages": [
               "advanced/configuration",
+              "advanced/resilience-and-storage",
               "advanced/skills",
               "contributing"
             ]

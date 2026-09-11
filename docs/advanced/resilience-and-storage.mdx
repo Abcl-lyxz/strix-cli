@@ -1,0 +1,180 @@
+---
+title: "Routes, Recovery, and Storage"
+description: "Multi-route failover, durable chat history, secure credentials, notifications, and verified updates"
+---
+
+## Model route pools
+
+A route names one model connection. Each saved route has a model, optional base
+URL, priority, concurrency limit, optional requests-per-minute and
+tokens-per-minute limits, enabled state, and credential references. Strix picks
+the least-loaded healthy route in the best available priority tier and checks
+context capacity and known tool support before dispatch.
+
+```bash
+strix routes add primary \
+  --model openai/gpt-5.4 \
+  --priority 1 \
+  --max-concurrency 3 \
+  --rpm 120 \
+  --tpm 500000
+strix routes key primary
+
+strix routes add fallback \
+  --model anthropic/claude-sonnet-4-6 \
+  --priority 2 \
+  --max-concurrency 2
+strix routes key fallback
+
+strix routes list
+strix routes test primary
+```
+
+Lower priority numbers are preferred. Routes at the same priority share load.
+`/routes select <name>` makes existing `/model`, `/apikey`, and `/baseurl`
+commands edit that route. Use `--route NAME` on a scan to restrict that run to
+one route, or repeat it to select a subset.
+
+For CI, `STRIX_ROUTES_FILE` accepts either a route list or an object containing
+a `routes` list:
+
+```json
+{
+  "routes": [
+    {
+      "name": "primary",
+      "model": "openai/gpt-5.4",
+      "base_url": "https://api.openai.com/v1",
+      "priority": 1,
+      "max_concurrency": 3,
+      "rpm": 120,
+      "tpm": 500000,
+      "enabled": true,
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  ]
+}
+```
+
+Literal `api_key`, `token`, `key`, and sensitive-header values are rejected.
+`STRIX_LLM`, `LLM_API_KEY`, and `LLM_API_BASE` remain compatible and form one
+process-only route that overrides the saved pool.
+
+## Failure and agent recovery
+
+Rate limits, timeouts, network failures, and provider `5xx` responses honor
+`Retry-After`, cool down only the affected route, and fail over. Authentication,
+billing, and exhausted-quota failures block that route until its configuration
+changes. Unsupported tool schemas disable a route for the run. Content-policy
+refusals are reported and are never sent to another provider as a bypass.
+
+The route pool owns request retries, avoiding multiplied SDK/provider retry
+loops. A partially streamed model turn can be replayed at most twice. Tool
+outputs are checkpointed before replay, so an already-executed tool is not run
+again.
+
+When all routes are unavailable, agents park without becoming failed. An
+interactive run waits for recovery indefinitely. A headless run waits up to
+`STRIX_ROUTE_OUTAGE_TIMEOUT` seconds (600 by default), checkpoints, and exits
+nonzero. Genuine agent crashes restart the same ID and session at most twice;
+the budget resets after a successful model or tool turn. Terminal agents are
+never recreated during resume.
+
+## Where chats and run state are saved
+
+Chat history and scan evidence stay in the project that launched Strix:
+
+```text
+strix_runs/<run-name>/
+├── .state/
+│   ├── agents.db       # sessions, working messages, append-only transcripts, checkpoints
+│   └── agents.json     # agent graph snapshot
+├── strix.log
+├── run.json
+├── vulnerabilities.json
+├── vulnerabilities/
+└── penetration_test_report.md
+```
+
+Working SDK messages may be compacted, but `transcript_entries` in `agents.db`
+is append-only and context summaries are recorded in `context_checkpoints`.
+Existing runs are backfilled once from messages still present in their old
+database. Content removed by a compaction before this upgrade cannot be
+reconstructed.
+
+Run `/storage` in the TUI to print the exact paths for the current run,
+database, transcript table, graph snapshot, log, global config, and inbox.
+
+Global, sanitized application state lives outside the project:
+
+```text
+~/.strix/cli-config.json  # versioned non-secret settings and credential references
+~/.strix/state.db         # sanitized global notification inbox and preferences
+```
+
+## Secure credentials
+
+Reusable model keys, sensitive route headers, search and integration keys, MCP
+bearer tokens, ChatGPT OAuth tokens, managed-cloud tokens, and viewer relay
+tokens use the operating-system credential service under `strix-cli`:
+
+- Windows Credential Manager
+- macOS Keychain
+- Linux Secret Service (`secret-tool`)
+
+Migration writes and reads back the keychain entry before redacting legacy
+JSON. If verification or the JSON rewrite fails, the usable legacy value is
+retained. Check or run migration with:
+
+```bash
+strix secrets status
+strix secrets migrate
+strix secrets purge-legacy
+```
+
+If no supported keychain is available, Strix records a warning and refuses new
+persistent secrets. Supply credentials through environment variables for that
+process instead. Environment credentials are never saved automatically.
+
+Credentials intentionally supplied inside pentest instructions remain part of
+the local, gitignored run evidence. Database encryption is not provided in this
+release, so protect the project directory accordingly.
+
+## General notifications
+
+Any runtime subsystem or plugin can publish a namespaced event such as
+`runtime.route.cooldown`, `agent.crashed`, `context.compacted`,
+`finding.created`, `scan.completed`, `update.available`, or its own future
+namespace. The durable record contains sanitized text, severity, category,
+timestamps, optional run/agent/route references, unread state, a deduplication
+count, and allowlisted UI actions.
+
+Warnings and errors appear immediately. Update availability and scan completion
+are informational. Noisy recovery events remain in the inbox unless preferences
+raise them. Repeated failures are deduplicated and category floods are grouped.
+
+```bash
+strix notifications list --unread
+strix notifications list --category runtime --route primary
+strix notifications read <id>
+strix notifications dismiss <id>
+strix notifications clear
+```
+
+In the TUI use `/notifications`, with filters including `unread`, `severity`,
+`category`, `run`, `agent`, and `route`. Headless runs emit human notifications
+on stderr. Set `STRIX_NOTIFICATION_FORMAT=json` for stable structured JSON on
+stderr without mixing events into normal stdout.
+
+## Verified updates
+
+Stable update checks use `Abcl-lyxz/strix-cli`. Checks are silent while offline.
+An available release creates a notification and displays release notes before
+installation confirmation. Updates never install during an active scan.
+
+Every release carries a GitHub-attested integrity manifest with its exact
+commit, supported platforms, asset sizes, provenance, and SHA-256 checksums.
+Binary updates download, verify, stage, smoke-test, atomically replace, and keep
+one `.old` rollback binary. Source checkouts must be clean, track a branch, and
+fast-forward to the exact verified release commit. Package-manager installs use
+the verified wheel from the matching fork release.

@@ -8,9 +8,11 @@ config file. Run `strix`, type `/config` to inspect the active non-secret values
 and use `/model`, `/apikey`, `/baseurl`, or `/reasoning` to change them. Type `/`
 for the complete searchable command palette.
 
-The TUI masks API keys and writes them to `~/.strix/cli-config.json` with private
-file permissions. It never sends a stored key back to the terminal client.
-Environment variables take precedence over saved values.
+The TUI masks API keys and stores reusable credentials in Windows Credential
+Manager, macOS Keychain, or Linux Secret Service under the `strix-cli`
+namespace. `~/.strix/cli-config.json` contains only non-secret settings and
+opaque credential references. It never sends a stored key back to the terminal
+client. Environment variables take precedence and remain process-only.
 
 ## LLM Configuration
 
@@ -38,8 +40,15 @@ Environment variables take precedence over saved values.
   Request timeout in seconds for LLM calls.
 </ParamField>
 
-<ParamField path="STRIX_LLM_MAX_RETRIES" default="5" type="integer">
-  Maximum number of retries for LLM API calls on transient failures.
+<ParamField path="STRIX_ROUTE_OUTAGE_TIMEOUT" default="600" type="integer">
+  Maximum seconds a headless run waits for a route to recover before it
+  checkpoints and exits nonzero. Interactive runs remain parked until a route
+  recovers or the user changes configuration.
+</ParamField>
+
+<ParamField path="STRIX_ROUTES_FILE" type="string">
+  Headless route-pool JSON file. Secret values are rejected; use `api_key_env`
+  and `headers_env` references to process environment variables.
 </ParamField>
 
 <ParamField path="STRIX_REASONING_EFFORT" default="high" type="string">
@@ -167,13 +176,24 @@ strix --target ./app --config /path/to/config.json
 
 ```json
 {
+  "version": 2,
   "env": {
     "STRIX_LLM": "openrouter/z-ai/glm-5.3",
-    "LLM_API_KEY": "sk-...",
     "STRIX_REASONING_EFFORT": "high"
+  },
+  "secret_refs": {
+    "LLM_API_KEY": "settings.llm-api-key"
+  },
+  "routing": {
+    "strategy": "smart",
+    "routes": []
   }
 }
 ```
+
+Do not add literal keys or tokens to this file. Use `strix routes key <name>`
+or an environment variable. See [Routes, recovery, and storage](/advanced/resilience-and-storage)
+for the route schema and migration behavior.
 
 ## Example Setup
 
