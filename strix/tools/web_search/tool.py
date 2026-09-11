@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -12,6 +14,7 @@ import requests
 from agents import RunContextWrapper, function_tool
 
 from strix.config import load_settings
+from strix.resilience import full_jitter_delay, retry_after_seconds
 
 
 if TYPE_CHECKING:
@@ -19,6 +22,19 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_WEB_MAX_ATTEMPTS = 3
+_WEB_RETRY_BASE_DELAY_S = 0.5
+_WEB_RETRY_MAX_DELAY_S = 8.0
+_WEB_RETRY_MAX_ELAPSED_S = 120.0
+_WEB_REQUEST_TIMEOUT = (10, 90)
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+@dataclass(frozen=True)
+class _GuardedFailure:
+    result: dict[str, Any]
+    retryable: bool
 
 
 _SYSTEM_PROMPT = """You are assisting a cybersecurity agent specialized in vulnerability scanning
@@ -56,7 +72,9 @@ def _perplexity_content(api_key: str, query: str) -> str:
             {"role": "user", "content": query},
         ],
     }
-    with requests.post(url, headers=headers, json=payload, timeout=300) as response:
+    with requests.post(
+        url, headers=headers, json=payload, timeout=_WEB_REQUEST_TIMEOUT
+    ) as response:
         response.raise_for_status()
         return str(response.json()["choices"][0]["message"]["content"])
 
@@ -110,7 +128,9 @@ def _exa_blocks(
 
 def _exa_post(api_key: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-    with requests.post(endpoint, headers=headers, json=payload, timeout=300) as response:
+    with requests.post(
+        endpoint, headers=headers, json=payload, timeout=_WEB_REQUEST_TIMEOUT
+    ) as response:
         response.raise_for_status()
         body: dict[str, Any] = response.json()
     return body
@@ -196,32 +216,93 @@ def _not_configured_error(missing: str) -> dict[str, Any]:
     }
 
 
-def _guarded_call[T](  # noqa: PLR0911 - each error class needs its own sanitized return
+def _provider_candidates(integrations: Any) -> list[tuple[str, str]] | dict[str, Any]:
+    """Return providers in failover order while honoring an explicit pin."""
+    resolved = _resolve_provider(integrations)
+    if isinstance(resolved, dict):
+        return resolved
+    candidates = [resolved]
+    if (
+        integrations.web_search_provider == "auto"
+        and resolved[0] == "exa"
+        and integrations.perplexity_api_key
+    ):
+        candidates.append(("perplexity", integrations.perplexity_api_key))
+    return candidates
+
+
+def _guarded_call[T](
     tool: str,
     rejected_hint: str,
     fetch: Callable[[], T],
-) -> T | dict[str, Any]:
-    """Run a provider call and translate any failure into a sanitized error dict."""
-    try:
-        return fetch()
-    except requests.exceptions.Timeout:
-        logger.warning("%s timed out", tool)
-        return {"success": False, "error": f"{tool} timed out. Try again or narrow the request"}
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        logger.exception("%s HTTP error status=%s", tool, status)
-        if status is not None and 400 <= status < 500:
-            return {"success": False, "error": rejected_hint}
-        return {"success": False, "error": f"{tool} service is unavailable. Try again later"}
-    except requests.exceptions.RequestException:
-        logger.exception("%s network error", tool)
-        return {"success": False, "error": f"{tool} network error. Try again later"}
-    except (KeyError, IndexError, ValueError):
-        logger.exception("%s response shape unexpected", tool)
-        return {"success": False, "error": f"{tool} returned an unexpected response. Try again"}
-    except Exception:
-        logger.exception("%s failed", tool)
-        return {"success": False, "error": f"{tool} failed unexpectedly"}
+) -> T | _GuardedFailure:
+    """Run a provider call with bounded retries and sanitized failures."""
+    started_at = time.monotonic()
+    for attempt in range(1, _WEB_MAX_ATTEMPTS + 1):
+        caught: BaseException
+        try:
+            return fetch()
+        except requests.exceptions.Timeout as exc:
+            caught = exc
+            failure = _GuardedFailure(
+                {"success": False, "error": f"{tool} timed out. Try again or narrow the request"},
+                retryable=True,
+            )
+        except requests.exceptions.HTTPError as exc:
+            caught = exc
+            status = exc.response.status_code if exc.response is not None else None
+            retryable = status in _RETRYABLE_HTTP_STATUSES
+            logger.warning("%s HTTP error status=%s", tool, status)
+            if status is not None and 400 <= status < 500 and not retryable:
+                failure = _GuardedFailure(
+                    {"success": False, "error": rejected_hint}, retryable=False
+                )
+            else:
+                failure = _GuardedFailure(
+                    {"success": False, "error": f"{tool} service is unavailable. Try again later"},
+                    retryable=retryable,
+                )
+        except requests.exceptions.RequestException as exc:
+            caught = exc
+            logger.warning("%s network error: %s", tool, type(exc).__name__)
+            failure = _GuardedFailure(
+                {"success": False, "error": f"{tool} network error. Try again later"},
+                retryable=True,
+            )
+        except (KeyError, IndexError, ValueError):
+            logger.exception("%s response shape unexpected", tool)
+            return _GuardedFailure(
+                {"success": False, "error": f"{tool} returned an unexpected response. Try again"},
+                retryable=False,
+            )
+        except Exception:
+            logger.exception("%s failed", tool)
+            return _GuardedFailure(
+                {"success": False, "error": f"{tool} failed unexpectedly"},
+                retryable=False,
+            )
+
+        if not failure.retryable or attempt >= _WEB_MAX_ATTEMPTS:
+            return failure
+        delay = full_jitter_delay(
+            attempt,
+            base_delay=_WEB_RETRY_BASE_DELAY_S,
+            max_delay=_WEB_RETRY_MAX_DELAY_S,
+            retry_after=retry_after_seconds(caught),
+        )
+        if time.monotonic() - started_at + delay > _WEB_RETRY_MAX_ELAPSED_S:
+            logger.warning("%s retry budget exhausted", tool)
+            return failure
+        logger.warning(
+            "%s transient failure; retrying attempt %d/%d in %.1fs",
+            tool,
+            attempt + 1,
+            _WEB_MAX_ATTEMPTS,
+            delay,
+        )
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _do_search(query: str) -> dict[str, Any]:
@@ -229,38 +310,51 @@ def _do_search(query: str) -> dict[str, Any]:
         return {"success": False, "error": "Query cannot be empty"}
 
     integrations = load_settings().integrations
-    resolved = _resolve_provider(integrations)
-    if isinstance(resolved, dict):
-        return resolved
-    provider, api_key = resolved
-    logger.info("web_search provider=%s query (len=%d): %s", provider, len(query), query[:120])
+    candidates = _provider_candidates(integrations)
+    if isinstance(candidates, dict):
+        return candidates
+    first_provider = candidates[0][0]
+    for index, (provider, api_key) in enumerate(candidates):
+        logger.info("web_search provider=%s query (len=%d): %s", provider, len(query), query[:120])
 
-    def fetch() -> str:
-        if provider == "exa":
-            return _exa_content(
-                api_key,
-                query,
-                integrations.exa_search_type,
-                integrations.exa_num_results,
-            )
-        return _perplexity_content(api_key, query)
+        def fetch(selected_provider: str = provider, selected_key: str = api_key) -> str:
+            if selected_provider == "exa":
+                return _exa_content(
+                    selected_key,
+                    query,
+                    integrations.exa_search_type,
+                    integrations.exa_num_results,
+                )
+            return _perplexity_content(selected_key, query)
 
-    outcome = _guarded_call(
-        "Web search",
-        (
-            "Web search rejected the query. Refine it "
-            "(more specific, shorter, no unusual characters) and retry"
-        ),
-        fetch,
-    )
-    if isinstance(outcome, dict):
-        return outcome
-    return {
-        "success": True,
-        "query": query,
-        "provider": provider,
-        "content": outcome,
-    }
+        outcome = _guarded_call(
+            "Web search",
+            (
+                "Web search rejected the query. Refine it "
+                "(more specific, shorter, no unusual characters) and retry"
+            ),
+            fetch,
+        )
+        if isinstance(outcome, _GuardedFailure):
+            if outcome.retryable and index + 1 < len(candidates):
+                logger.warning("web_search provider=%s exhausted; trying fallback", provider)
+                continue
+            return outcome.result
+        result: dict[str, Any] = {
+            "success": True,
+            "query": query,
+            "provider": provider,
+            "content": outcome,
+        }
+        if provider != first_provider:
+            result["fallback_from"] = first_provider
+        return result
+    return {"success": False, "error": "Web search providers were unavailable"}
+
+
+def search_web(query: str) -> dict[str, Any]:
+    """Public synchronous entry point shared by specialized research tools."""
+    return _do_search(query)
 
 
 def _do_get_contents(urls: list[str]) -> dict[str, Any]:
@@ -294,8 +388,8 @@ def _do_get_contents(urls: list[str]) -> dict[str, Any]:
         "Page fetch was rejected. Check the URLs are complete, public, and correctly formed",
         lambda: _exa_page_text(api_key, cleaned),
     )
-    if isinstance(outcome, dict):
-        return outcome
+    if isinstance(outcome, _GuardedFailure):
+        return outcome.result
     content, fetched = outcome
     missing = [url for url in cleaned if _normalize_url(url) not in fetched]
     result: dict[str, Any] = {
@@ -379,7 +473,7 @@ async def web_search(ctx: RunContextWrapper, query: str) -> str:
             target tech, and the specific question. Treat it like a
             ticket title for a senior security engineer.
     """
-    result = await asyncio.to_thread(_do_search, query)
+    result = await asyncio.to_thread(search_web, query)
     return json.dumps(result, ensure_ascii=False, default=str)
 
 

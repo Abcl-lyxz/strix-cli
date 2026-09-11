@@ -88,3 +88,8 @@ def test_policy_helper_matches_statusless_only() -> None:
         )
         is False
     )
+
+
+def test_request_retry_budget_is_bounded_and_jittered() -> None:
+    assert DEFAULT_MODEL_RETRY.max_retries == 3
+    assert DEFAULT_MODEL_RETRY.backoff.jitter is True

@@ -88,6 +88,10 @@ def test_client_errors_are_not_transient() -> None:
     assert execution._is_transient_model_error(ValueError("nope")) is False
 
 
+def test_turn_replay_budget_is_small_to_avoid_nested_retry_storms() -> None:
+    assert execution._MAX_TRANSIENT_MODEL_RETRIES == 2
+
+
 class _FakeStream:
     def __init__(self, exc: BaseException | None = None) -> None:
         self._exc = exc

@@ -391,12 +391,110 @@ def test_do_get_contents_sanitizes_a_network_error(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(tool, "load_settings", _Settings)
     monkeypatch.setattr(requests, "post", boom)
+    monkeypatch.setattr(tool.time, "sleep", lambda _delay: None)
 
     result = tool._do_get_contents(["https://ex.example"])
 
     assert result["success"] is False
     assert "network error" in result["error"]
     assert "ek" not in result["error"]
+
+
+def test_guarded_call_retries_transient_failure_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def fetch() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise requests.exceptions.ConnectionError("reset")
+        return "answer"
+
+    monkeypatch.setattr(tool.time, "sleep", delays.append)
+    monkeypatch.setattr(tool, "full_jitter_delay", lambda *_a, **_kw: 0.25)
+
+    assert tool._guarded_call("Web search", "rejected", fetch) == "answer"
+    assert attempts == 3
+    assert delays == [0.25, 0.25]
+
+
+def test_guarded_call_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    seen_retry_after: list[float | None] = []
+    response = requests.Response()
+    response.status_code = 429
+    response.headers["Retry-After"] = "9"
+
+    def fetch() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise requests.exceptions.HTTPError(response=response)
+        return "answer"
+
+    def delay(*_args: Any, retry_after: float | None = None, **_kwargs: Any) -> float:
+        seen_retry_after.append(retry_after)
+        return 0.0
+
+    monkeypatch.setattr(tool, "full_jitter_delay", delay)
+    monkeypatch.setattr(tool.time, "sleep", lambda _delay: None)
+
+    assert tool._guarded_call("Web search", "rejected", fetch) == "answer"
+    assert seen_retry_after == [9.0]
+
+
+def test_guarded_call_does_not_sleep_past_elapsed_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fetch() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise requests.exceptions.ConnectionError("reset")
+
+    monkeypatch.setattr(tool, "full_jitter_delay", lambda *_a, **_kw: 121.0)
+    monkeypatch.setattr(tool.time, "sleep", sleeps.append)
+
+    result = tool._guarded_call("Web search", "rejected", fetch)
+
+    assert isinstance(result, tool._GuardedFailure)
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_auto_provider_fails_over_after_transient_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Settings:
+        integrations = IntegrationSettings(EXA_API_KEY="ek", PERPLEXITY_API_KEY="pk")
+
+    exa_attempts = 0
+
+    def fail_exa(*_args: Any) -> str:
+        nonlocal exa_attempts
+        exa_attempts += 1
+        raise requests.exceptions.ConnectionError("reset")
+
+    monkeypatch.setattr(tool, "load_settings", _Settings)
+    monkeypatch.setattr(tool, "_exa_content", fail_exa)
+    monkeypatch.setattr(tool, "_perplexity_content", lambda *_a: "fallback answer")
+    monkeypatch.setattr(tool.time, "sleep", lambda _delay: None)
+
+    result = tool._do_search("OpenSSH 7.4 RCE?")
+
+    assert exa_attempts == tool._WEB_MAX_ATTEMPTS
+    assert result == {
+        "success": True,
+        "query": "OpenSSH 7.4 RCE?",
+        "provider": "perplexity",
+        "content": "fallback answer",
+        "fallback_from": "exa",
+    }
 
 
 def test_do_search_reports_the_provider_it_used(monkeypatch: pytest.MonkeyPatch) -> None:

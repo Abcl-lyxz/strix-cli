@@ -546,12 +546,15 @@ class StrixProvider(MultiProvider):
 
 
 DEFAULT_MODEL_RETRY = ModelRetrySettings(
-    max_retries=5,
+    # The SDK owns request-level retries. The execution loop has a much
+    # smaller turn-replay budget for failures that surface after streaming has
+    # begun, preventing multiplicative retry storms during provider outages.
+    max_retries=3,
     backoff=ModelRetryBackoffSettings(
         initial_delay=2.0,
         max_delay=90.0,
         multiplier=2.0,
-        jitter=False,
+        jitter=True,
     ),
     policy=retry_policies.any(
         retry_policies.provider_suggested(),

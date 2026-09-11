@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from functools import cache
@@ -34,6 +35,7 @@ from strix.core.sessions import (
     strip_all_images_from_session,
 )
 from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.resilience import full_jitter_delay, retry_after_seconds
 
 
 if TYPE_CHECKING:
@@ -119,9 +121,10 @@ async def _compact_session(
     )
 
 
-_MAX_TRANSIENT_MODEL_RETRIES = 5
+_MAX_TRANSIENT_MODEL_RETRIES = 2
 _TRANSIENT_MODEL_RETRY_BASE_DELAY_S = 2.0
-_TRANSIENT_MODEL_RETRY_MAX_DELAY_S = 90.0
+_TRANSIENT_MODEL_RETRY_MAX_DELAY_S = 30.0
+_TRANSIENT_MODEL_RETRY_MAX_ELAPSED_S = 120.0
 
 
 def _model_error_status_code(exc: BaseException) -> int | None:
@@ -144,9 +147,13 @@ def _is_transient_model_error(exc: BaseException) -> bool:
     return isinstance(exc, APIError)
 
 
-def _transient_model_retry_delay(attempt: int) -> float:
-    delay = _TRANSIENT_MODEL_RETRY_BASE_DELAY_S * float(2 ** (attempt - 1))
-    return min(delay, _TRANSIENT_MODEL_RETRY_MAX_DELAY_S)
+def _transient_model_retry_delay(attempt: int, exc: BaseException | None = None) -> float:
+    return full_jitter_delay(
+        attempt,
+        base_delay=_TRANSIENT_MODEL_RETRY_BASE_DELAY_S,
+        max_delay=_TRANSIENT_MODEL_RETRY_MAX_DELAY_S,
+        retry_after=retry_after_seconds(exc) if exc is not None else None,
+    )
 
 
 async def _salvage_stream_to_session(
@@ -658,6 +665,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     image_strips = 0
     compactions = 0
     model_retries = 0
+    model_retry_started_at: float | None = None
     while True:
         stream: Any = None
         pre_run_items: list[Any] = []
@@ -773,21 +781,33 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     input_data = []
                     continue
             if model_retries < _MAX_TRANSIENT_MODEL_RETRIES and _is_transient_model_error(exc):
+                now = time.monotonic()
+                if model_retry_started_at is None:
+                    model_retry_started_at = now
                 model_retries += 1
-                delay = _transient_model_retry_delay(model_retries)
-                logger.warning(
-                    "transient model/provider error for %s; replaying turn "
-                    "(attempt %d/%d, backoff %.1fs): %r",
-                    agent_id,
-                    model_retries,
-                    _MAX_TRANSIENT_MODEL_RETRIES,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-                if session is not None:
-                    input_data = []
-                continue
+                delay = _transient_model_retry_delay(model_retries, exc)
+                elapsed = now - model_retry_started_at
+                if elapsed + delay > _TRANSIENT_MODEL_RETRY_MAX_ELAPSED_S:
+                    logger.warning(
+                        "transient model/provider retry budget exhausted for %s after %.1fs",
+                        agent_id,
+                        elapsed,
+                    )
+                    model_retries = _MAX_TRANSIENT_MODEL_RETRIES
+                else:
+                    logger.warning(
+                        "transient model/provider error for %s; replaying turn "
+                        "(attempt %d/%d, backoff %.1fs): %r",
+                        agent_id,
+                        model_retries,
+                        _MAX_TRANSIENT_MODEL_RETRIES,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    if session is not None:
+                        input_data = []
+                    continue
             if session is not None:
                 await _salvage_stream_to_session(session, pre_run_items, stream, agent_id)
             if isinstance(exc, ProviderRefusalError):
