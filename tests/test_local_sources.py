@@ -177,6 +177,8 @@ def test_check_mountable_dir_accepts_a_project_under_the_home_root(
 
 
 def test_infer_target_type_applies_the_mount_policy() -> None:
+    if not Path("/etc").is_dir():
+        pytest.skip("no /etc on this platform")
     with pytest.raises(ValueError, match="Refusing to mount"):
         infer_target_type("/etc")
 

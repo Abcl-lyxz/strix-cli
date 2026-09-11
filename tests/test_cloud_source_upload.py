@@ -64,7 +64,10 @@ def test_source_defaults_are_private_and_git_aware(tmp_path: Path) -> None:
     (source / "fixture.zip").write_bytes(b"not really a zip")
     (source / "node_modules").mkdir()
     (source / "node_modules" / "dep.js").write_text("dep\n", encoding="utf-8")
-    (source / "linked.py").symlink_to(source / "app.py")
+    try:
+        (source / "linked.py").symlink_to(source / "app.py")
+    except OSError:
+        pytest.skip("symlink creation requires developer mode or elevated rights on Windows")
 
     bundle = source_upload.prepare_source(
         str(source),

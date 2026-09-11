@@ -597,14 +597,7 @@ def _write_archive(destination: Path, files: tuple[SelectedFile, ...]) -> None:
                 raise http.CloudError(f"could not safely read {item.archive_name}: {exc}") from exc
             with os.fdopen(descriptor, "rb") as source_file:
                 current = os.fstat(source_file.fileno())
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or current.st_size != item.size
-                    or current.st_dev != item.device
-                    or current.st_ino != item.inode
-                    or current.st_mtime_ns != item.mtime_ns
-                    or current.st_ctime_ns != item.ctime_ns
-                ):
+                if not _matches_selected_file(current, item):
                     raise http.CloudError(
                         f"{item.archive_name} changed while the source archive was being built; "
                         "retry."
@@ -624,19 +617,29 @@ def _write_archive(destination: Path, files: tuple[SelectedFile, ...]) -> None:
                         target.write(chunk)
                         remaining -= len(chunk)
                     final = os.fstat(source_file.fileno())
-                    if (
-                        source_file.read(1)
-                        or not stat.S_ISREG(final.st_mode)
-                        or final.st_size != item.size
-                        or final.st_dev != item.device
-                        or final.st_ino != item.inode
-                        or final.st_mtime_ns != item.mtime_ns
-                        or final.st_ctime_ns != item.ctime_ns
-                    ):
+                    if source_file.read(1) or not _matches_selected_file(final, item):
                         raise http.CloudError(
                             f"{item.archive_name} changed while the source archive was being "
                             "built; retry."
                         )
+
+
+def _matches_selected_file(current: os.stat_result, selected: SelectedFile) -> bool:
+    """Compare a descriptor with its selection-time path snapshot.
+
+    Windows obtains ``Path.stat().st_ctime_ns`` and ``os.fstat().st_ctime_ns``
+    through APIs that can report different timestamp semantics. Device, inode,
+    size, and mtime still pin the opened file; POSIX additionally compares
+    ctime to detect same-inode metadata changes.
+    """
+    return (
+        stat.S_ISREG(current.st_mode)
+        and current.st_size == selected.size
+        and current.st_dev == selected.device
+        and current.st_ino == selected.inode
+        and current.st_mtime_ns == selected.mtime_ns
+        and (os.name == "nt" or current.st_ctime_ns == selected.ctime_ns)
+    )
 
 
 def _sha256(path: Path) -> str:
