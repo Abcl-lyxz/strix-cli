@@ -182,11 +182,19 @@ def test_get_upgrade_command_all_methods() -> None:
     assert update_check.get_upgrade_command("pip") == "pip install --upgrade strix-agent"
 
 
-def test_self_update_non_binary_prints_command(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_self_update_non_binary_uses_package_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+
+    def run_package_upgrade(_console: Console, method: str) -> bool:
+        called.append(method)
+        return False
+
     monkeypatch.setattr(update_check, "is_binary_install", lambda: False)
+    monkeypatch.setattr(update_check, "get_install_method", lambda: "pip")
+    monkeypatch.setattr(update_check, "run_package_upgrade", run_package_upgrade)
     buffer = io.StringIO()
     assert update_check.self_update(Console(file=buffer)) is False
-    assert "upgrade" in buffer.getvalue()
+    assert called == ["pip"]
 
 
 def test_self_update_already_latest(monkeypatch: pytest.MonkeyPatch) -> None:
