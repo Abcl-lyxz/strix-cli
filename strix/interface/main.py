@@ -490,8 +490,6 @@ def main() -> None:
         }[command]
         sys.exit(handler(sys.argv[2:]))
 
-    start_import_warmup()
-
     args = parse_arguments()
 
     start_background_check()
@@ -500,6 +498,8 @@ def main() -> None:
             restart_after_update()
         sys.exit(0)
 
+    # Help, version, and updates must exit without background scan imports.
+    start_import_warmup()
     check_docker_installed()
     pull_docker_image()
 
