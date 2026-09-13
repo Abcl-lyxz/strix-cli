@@ -23,7 +23,6 @@ import tarfile
 import tempfile
 import threading
 import time
-import uuid
 import zipfile
 from pathlib import Path
 from typing import cast
@@ -35,12 +34,12 @@ from rich.prompt import Prompt
 from strix.notifications import NotificationAction, notify
 from strix.report.state import get_global_report_state
 from strix.telemetry._common import get_version
+from strix.utils.atomic import atomic_write_text
 
 
 logger = logging.getLogger(__name__)
 
 GITHUB_REPO = "Abcl-lyxz/strix-cli"
-PYPI_PACKAGE = "strix-agent"
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 REQUEST_TIMEOUT_SECONDS = 5
@@ -98,15 +97,9 @@ def get_install_method() -> str:
 
 
 def get_upgrade_command(method: str | None = None) -> str:
-    method = method or get_install_method()
-    commands = {
-        "binary": "strix --update",
-        "pipx": "pipx upgrade strix-agent",
-        "uv": "uv tool upgrade strix-agent",
-        "pip": "pip install --upgrade strix-agent",
-        "source": "git fetch origin --tags && git merge --ff-only v<version>",
-    }
-    return commands[method]
+    """Keep every install method on this distribution's verified releases."""
+    del method
+    return "strix --update"
 
 
 def _parse_version(value: str) -> tuple[int, ...] | None:
@@ -127,22 +120,15 @@ def _is_newer(latest: str, current: str) -> bool:
 
 def _fetch_latest_version() -> str | None:
     try:
-        if is_binary_install() or _source_checkout_root() is not None:
-            with requests.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            ) as response:
-                response.raise_for_status()
-                tag = _object_dict(cast("object", response.json())).get("tag_name", "")
-            return tag.lstrip("v") or None if isinstance(tag, str) else None
         with requests.get(
-            f"https://pypi.org/pypi/{PYPI_PACKAGE}/json",
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
             timeout=REQUEST_TIMEOUT_SECONDS,
         ) as response:
             response.raise_for_status()
-            payload = _object_dict(cast("object", response.json()))
-            version = _object_dict(payload.get("info", {})).get("version")
-        return str(version) if version else None
+            tag = _object_dict(cast("object", response.json())).get("tag_name", "")
+        if not isinstance(tag, str) or _parse_version(tag) is None:
+            return None
+        return tag.lstrip("v")
     except Exception:  # noqa: BLE001
         logger.debug("update check failed", exc_info=True)
         return None
@@ -327,12 +313,18 @@ def notify_update(console: Console) -> None:
     console.print()
 
 
-def run_package_upgrade(console: Console, method: str) -> bool:
+def run_package_upgrade(  # noqa: PLR0911
+    console: Console, method: str, *, version: str | None = None
+) -> bool:
     """Install only a wheel verified by the matching fork release manifest."""
-    latest = _fetch_latest_version()
+    latest = version or _fetch_latest_version()
     if not latest:
         console.print("[bold red]Could not determine the latest version for this upgrade.[/]")
         return False
+    current = get_version()
+    if current != "unknown" and not _is_newer(latest, current):
+        console.print(f"[#22c55e]strix {current} is already the latest version.[/]")
+        return True
     if method == "source":
         return _update_source_checkout(console, latest)
     try:
@@ -353,6 +345,14 @@ def run_package_upgrade(console: Console, method: str) -> bool:
         "uv": ["uv", "tool", "install", "--force", str(wheel)],
     }
     command = commands[method]
+    if _needs_package_handoff():
+        try:
+            _handoff_package_upgrade(console, command, wheel, latest)
+        except OSError as exc:
+            _cleanup_staged_wheel(wheel)
+            console.print(f"[bold red]Could not start the update installer:[/] {exc}")
+            return False
+        return True
     console.print(f"[dim]Running[/] [#60a5fa]{' '.join(command)}[/]")
     try:
         try:
@@ -367,9 +367,89 @@ def run_package_upgrade(console: Console, method: str) -> bool:
             )
             return False
     finally:
-        wheel.unlink(missing_ok=True)
+        _cleanup_staged_wheel(wheel)
+    _write_cache(latest_version=latest, checked_at=time.time())
     console.print("[#22c55e]✓ strix updated — restart the scan to use the new version[/]")
     return True
+
+
+def _needs_package_handoff() -> bool:
+    return sys.platform == "win32"
+
+
+def _cleanup_staged_wheel(wheel: Path) -> None:
+    wheel.unlink(missing_ok=True)
+    if wheel.parent.name.startswith("strix-update-"):
+        with contextlib.suppress(OSError):
+            (wheel.parent / "install.py").unlink(missing_ok=True)
+            (wheel.parent / "install.json").unlink(missing_ok=True)
+            wheel.parent.rmdir()
+
+
+def _handoff_package_upgrade(
+    console: Console, command: list[str], wheel: Path, version: str
+) -> None:
+    """Exit before Windows installers replace loaded Python libraries."""
+    status = _CACHE_PATH.with_name("update-install.json")
+    log = status.with_suffix(".log")
+    worker = wheel.parent / "install.py"
+    payload = wheel.parent / "install.json"
+    worker.write_bytes(Path(__file__).with_name("update_worker.py").read_bytes())
+    payload.write_text(
+        json.dumps(
+            {
+                "parent_pid": os.getpid(),
+                "command": command,
+                "wheel": str(wheel),
+                "sha256": _sha256_file(wheel),
+                "version": version,
+                "status": str(status),
+            }
+        ),
+        encoding="utf-8",
+    )
+    status.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        status,
+        json.dumps({"status": "pending", "version": version, "started_at": time.time()}),
+    )
+    try:
+        with log.open("w", encoding="utf-8") as output:
+            subprocess.Popen(  # noqa: S603
+                [getattr(sys, "_base_executable", sys.executable), "-I", str(worker), str(payload)],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+    except OSError:
+        status.unlink(missing_ok=True)
+        raise
+    console.print(
+        f"[yellow]Strix {version} is verified and ready to install. "
+        "Installation will start when this process exits.[/]"
+    )
+    console.print("[dim]Wait a few seconds, then run strix --version.[/]")
+    console.print(f"[dim]Installer status: {status}\nInstaller log: {log}[/]", markup=True)
+
+
+def _package_install_pending(console: Console) -> bool:
+    status = _CACHE_PATH.with_name("update-install.json")
+    try:
+        state = json.loads(status.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return False
+        if state.get("status") == "pending" and time.time() - state["started_at"] < 1200:
+            console.print("[yellow]A verified update is already being installed.[/]")
+            console.print(str(status), markup=False)
+            return True
+        if state.get("status") == "failed":
+            console.print("[yellow]The previous installer failed; retrying the update.[/]")
+            console.print(str(status.with_suffix(".log")), markup=False)
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return False
 
 
 def _download_verified_wheel(version: str) -> Path:
@@ -393,8 +473,18 @@ def _download_verified_wheel(version: str) -> Path:
     )
     if filename is None:
         raise RuntimeError(f"release has no wheel for {target or 'this platform'}")
-    path = Path(tempfile.gettempdir()) / f"strix-{version}-{uuid.uuid4().hex}.whl"
-    _download_verified_asset(version, filename, path, manifest=manifest)
+    if Path(filename).name != filename or "/" in filename or "\\" in filename:
+        raise RuntimeError("release contains an invalid wheel filename")
+    # Installers parse the distribution, version, and platform from the filename.
+    # Keep it intact and isolate concurrent downloads in separate directories.
+    directory = Path(tempfile.mkdtemp(prefix="strix-update-"))
+    path = directory / filename
+    try:
+        _download_verified_asset(version, filename, path, manifest=manifest)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        directory.rmdir()
+        raise
     return path
 
 
@@ -505,10 +595,7 @@ def prompt_update_if_available(console: Console) -> bool:
         return False
     if choice != "y":
         return False
-    method = get_install_method()
-    if method == "binary":
-        return self_update(console, version=latest)
-    return run_package_upgrade(console, method)
+    return self_update(console, version=latest)
 
 
 def restart_env() -> dict[str, str]:
@@ -622,8 +709,8 @@ def self_update(  # noqa: PLR0911
 ) -> bool:
     """Replace the running standalone binary with the latest release.
 
-    Returns True on success. For package-manager installs this only
-    prints the right upgrade command and returns False.
+    Returns True on success, accepted Windows handoff, or when already current.
+    Package installs use the same verified release source as binary installs.
     """
     console = console or Console()
 
@@ -638,8 +725,10 @@ def self_update(  # noqa: PLR0911
         return False
 
     if not is_binary_install():
+        if _package_install_pending(console):
+            return True
         method = get_install_method()
-        return run_package_upgrade(console, method)
+        return run_package_upgrade(console, method, version=version)
 
     latest = version or _fetch_latest_version()
     if not latest:
@@ -665,8 +754,8 @@ def self_update(  # noqa: PLR0911
         logger.debug("self-update failed", exc_info=True)
         console.print(f"[bold red]Update failed:[/] {e}")
         console.print(
-            "[dim]You can reinstall manually with:[/] "
-            "[#60a5fa]curl -sSL https://strix.ai/install | bash[/]"
+            "[dim]Download this distribution's release from:[/] "
+            f"[#60a5fa]https://github.com/{GITHUB_REPO}/releases/latest[/]"
         )
         notify(
             "update.failed",

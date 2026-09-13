@@ -8,9 +8,10 @@ from types import SimpleNamespace
 from typing import Self
 
 import pytest
+from packaging.utils import parse_wheel_filename
 from rich.console import Console
 
-from strix.interface import update_check
+from strix.interface import update_check, update_worker
 
 
 class _Response:
@@ -59,6 +60,7 @@ def _isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update_check, "_background_thread", None)
     monkeypatch.delenv("STRIX_NO_UPDATE_CHECK", raising=False)
     monkeypatch.setattr(update_check, "_active_scan", lambda: False)
+    monkeypatch.setattr(update_check, "_needs_package_handoff", lambda: False)
     for key in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS_URL", "BUILDKITE", "CIRCLECI"):
         monkeypatch.delenv(key, raising=False)
 
@@ -176,16 +178,15 @@ def test_write_cache_preserves_existing_fields() -> None:
 
 
 def test_get_upgrade_command_all_methods() -> None:
-    assert update_check.get_upgrade_command("binary") == "strix --update"
-    assert update_check.get_upgrade_command("pipx") == "pipx upgrade strix-agent"
-    assert update_check.get_upgrade_command("uv") == "uv tool upgrade strix-agent"
-    assert update_check.get_upgrade_command("pip") == "pip install --upgrade strix-agent"
+    for method in ("binary", "pipx", "uv", "pip", "source"):
+        assert update_check.get_upgrade_command(method) == "strix --update"
 
 
 def test_self_update_non_binary_uses_package_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
     called: list[str] = []
 
-    def run_package_upgrade(_console: Console, method: str) -> bool:
+    def run_package_upgrade(_console: Console, method: str, *, version: str | None = None) -> bool:
+        assert version is None
         called.append(method)
         return False
 
@@ -374,6 +375,7 @@ def test_failed_package_upgrade_removes_staged_wheel(
 ) -> None:
     wheel = tmp_path / "verified.whl"
     wheel.write_bytes(b"wheel")
+    monkeypatch.setattr(update_check, "get_version", lambda: "1.6.2")
     monkeypatch.setattr(update_check, "_fetch_latest_version", lambda: "1.7.0")
     monkeypatch.setattr(update_check, "_download_verified_wheel", lambda _version: wheel)
     monkeypatch.setattr(
@@ -465,3 +467,178 @@ def test_offline_background_check_remains_silent(
     assert update_check._fetch_latest_version() is None
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("method", ["binary", "pip", "pipx", "uv", "source"])
+def test_every_install_method_discovers_the_same_fork_release(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    urls = []
+
+    def get(url: str, **_kwargs: object) -> _Response:
+        urls.append(url)
+        return _Response(payload={"tag_name": "v1.8.1"})
+
+    monkeypatch.setattr(update_check, "is_binary_install", lambda: method == "binary")
+    monkeypatch.setattr(update_check, "get_install_method", lambda: method)
+    monkeypatch.setattr(update_check, "_source_checkout_root", lambda: None)
+    monkeypatch.setattr(update_check.requests, "get", get)
+    assert update_check._fetch_latest_version() == "1.8.1"
+    assert urls == ["https://api.github.com/repos/Abcl-lyxz/strix-cli/releases/latest"]
+
+
+@pytest.mark.parametrize("latest", ["1.6.2", "1.7.0"])
+def test_package_updater_never_downloads_an_older_or_current_version(
+    monkeypatch: pytest.MonkeyPatch, latest: str
+) -> None:
+    monkeypatch.setattr(update_check, "_fetch_latest_version", lambda: latest)
+    monkeypatch.setattr(update_check, "get_version", lambda: "1.7.0")
+
+    def unexpected_download(_version: str) -> Path:
+        pytest.fail("The installed version must not be replaced")
+
+    monkeypatch.setattr(update_check, "_download_verified_wheel", unexpected_download)
+    assert update_check.run_package_upgrade(Console(file=io.StringIO()), "uv") is True
+
+
+def test_package_updater_preserves_explicit_release_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received = []
+
+    def upgrade(_console: Console, method: str, *, version: str | None = None) -> bool:
+        received.append((method, version))
+        return True
+
+    monkeypatch.setattr(update_check, "is_binary_install", lambda: False)
+    monkeypatch.setattr(update_check, "get_install_method", lambda: "uv")
+    monkeypatch.setattr(update_check, "run_package_upgrade", upgrade)
+    assert update_check.self_update(Console(file=io.StringIO()), version="1.8.1")
+    assert received == [("uv", "1.8.1")]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_wheel_download_preserves_installer_filename_and_cleans_failed_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    filename = "strix_agent-1.8.1-py3-none-win_amd64.whl"
+    manifest = _manifest("1.8.1")
+    manifest["assets"] = {filename: {"sha256": hashlib.sha256(b"wheel").hexdigest()}}
+    stage = tmp_path / "strix-update-fixture"
+
+    def temporary(*, prefix: str) -> str:
+        assert prefix == "strix-update-"
+        stage.mkdir()
+        return str(stage)
+
+    def download(_version: str, asset: str, path: Path, **_kwargs: object) -> None:
+        assert asset == filename and path.name == filename
+        assert str(parse_wheel_filename(path.name)[1]) == "1.8.1"
+        path.write_bytes(b"partial" if fail else b"wheel")
+        if fail:
+            raise OSError("connection interrupted")
+
+    monkeypatch.setattr(update_check, "_fetch_release_manifest", lambda _version: manifest)
+    monkeypatch.setattr(update_check, "_release_target", lambda: "windows-x86_64")
+    monkeypatch.setattr(update_check.tempfile, "mkdtemp", temporary)
+    monkeypatch.setattr(update_check, "_download_verified_asset", download)
+    if fail:
+        with pytest.raises(OSError, match="interrupted"):
+            update_check._download_verified_wheel("1.8.1")
+        assert not stage.exists()
+    else:
+        path = update_check._download_verified_wheel("1.8.1")
+        assert path == stage / filename and path.read_bytes() == b"wheel"
+
+
+@pytest.mark.parametrize("method", ["pip", "pipx", "uv"])
+def test_package_install_uses_verified_wheel_and_cleans_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    directory = tmp_path / "strix-update-fixture"
+    directory.mkdir()
+    wheel = directory / "strix_agent-1.8.1-py3-none-win_amd64.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+
+    def install(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        assert wheel.exists()
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(update_check, "get_version", lambda: "1.7.0")
+    monkeypatch.setattr(update_check, "_download_verified_wheel", lambda _version: wheel)
+    monkeypatch.setattr(update_check.subprocess, "run", install)
+    assert update_check.run_package_upgrade(Console(file=io.StringIO()), method, version="1.8.1")
+    assert len(calls) == 1 and calls[0][-1] == str(wheel)
+    assert not directory.exists()
+    assert update_check._read_cache()["latest_version"] == "1.8.1"
+
+
+def test_windows_handoff_retains_verified_wheel_until_process_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "strix-update-fixture"
+    directory.mkdir()
+    wheel = directory / "strix_agent-1.8.1-py3-none-win_amd64.whl"
+    wheel.write_bytes(b"wheel")
+    spawned = []
+    monkeypatch.setattr(update_check, "get_version", lambda: "1.7.0")
+    monkeypatch.setattr(update_check, "_needs_package_handoff", lambda: True)
+    monkeypatch.setattr(update_check, "_download_verified_wheel", lambda _version: wheel)
+    monkeypatch.setattr(
+        update_check.subprocess, "Popen", lambda command, **_kwargs: spawned.append(command)
+    )
+    assert update_check.run_package_upgrade(Console(file=io.StringIO()), "uv", version="1.8.1")
+    assert wheel.exists() and len(spawned) == 1
+    payload = json.loads((directory / "install.json").read_text())
+    assert payload["command"] == ["uv", "tool", "install", "--force", str(wheel)]
+    assert payload["sha256"] == hashlib.sha256(b"wheel").hexdigest()
+    assert "import strix" not in (directory / "install.py").read_text()
+    assert update_check._package_install_pending(Console(file=io.StringIO()))
+
+
+@pytest.mark.parametrize("failure", [None, "checksum", "installer", "parent"])
+def test_windows_worker_waits_verifies_and_records_honest_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    directory = tmp_path / "stage"
+    directory.mkdir()
+    wheel = directory / "fixture.whl"
+    wheel.write_bytes(b"tampered" if failure == "checksum" else b"wheel")
+    payload = directory / "install.json"
+    status = tmp_path / "status.json"
+    calls = []
+    payload.write_text(
+        json.dumps(
+            {
+                "parent_pid": 123,
+                "command": ["installer", str(wheel)],
+                "wheel": str(wheel),
+                "sha256": hashlib.sha256(b"wheel").hexdigest(),
+                "version": "1.8.1",
+                "status": str(status),
+            }
+        )
+    )
+
+    def wait(pid: int) -> None:
+        assert pid == 123
+        calls.append("wait")
+        if failure == "parent":
+            raise TimeoutError("parent still running")
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        assert calls == ["wait"] and command == ["installer", str(wheel)]
+        calls.append("install")
+        return SimpleNamespace(returncode=2 if failure == "installer" else 0)
+
+    monkeypatch.setattr(update_worker, "wait_for_parent", wait)
+    monkeypatch.setattr(update_worker.subprocess, "run", run)
+    assert update_worker.install(payload) == (1 if failure else 0)
+    state = json.loads(status.read_text())
+    assert state["status"] == ("failed" if failure else "complete")
+    assert state["version"] == "1.8.1"
+    assert not directory.exists()
+    if failure in {"checksum", "parent"}:
+        assert calls == ["wait"]
