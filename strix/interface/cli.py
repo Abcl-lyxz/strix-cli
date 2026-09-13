@@ -15,6 +15,7 @@ from rich.text import Text
 
 from strix.config import load_settings
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
+from strix.core.ownership import owned_cli
 from strix.core.runner import run_strix_scan
 from strix.notifications import get_notification_service
 from strix.report.state import ReportState, set_global_report_state
@@ -40,6 +41,7 @@ def _resolve_sandbox_image() -> str:
     return image
 
 
+@owned_cli
 async def run_cli(args: Any) -> None:  # noqa: PLR0915
     console = Console()
     if bool(getattr(args, "non_interactive", False)):
@@ -206,6 +208,7 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
                 await run_strix_scan(
                     scan_config=scan_config,
                     scan_id=args.run_name,
+                    run_lease=args.run_lease,
                     image=_resolve_sandbox_image(),
                     local_sources=getattr(args, "local_sources", None) or [],
                     extra_files=read_workspace_files(getattr(args, "workspace_files", None)),

@@ -76,6 +76,7 @@ class Notification:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["actions"] = [asdict(action) for action in self.actions]
+        result["resolved"] = self.event_type.endswith(".recovered")
         return result
 
 
@@ -88,6 +89,7 @@ class NotificationService:
         self._subscribers: list[Any] = []
         self._headless = False
         self._structured_headless = False
+        self._last_surfaced: dict[str, tuple[str, str]] = {}
         self._initialize()
 
     def configure_headless(self, *, enabled: bool, structured: bool = False) -> None:
@@ -129,6 +131,11 @@ class NotificationService:
                     on notifications(dedupe_key) where dedupe_key is not null and dismissed = 0;
                 create index if not exists notifications_updated
                     on notifications(updated_at desc);
+                create table if not exists notification_events (
+                    id integer primary key autoincrement,
+                    event_type text not null, title text not null, detail text not null,
+                    severity text not null, created_at text not null, run_id text, route_id text
+                );
                 create table if not exists notification_preferences (
                     category text primary key,
                     minimum_severity text not null,
@@ -148,6 +155,22 @@ class NotificationService:
                     self._subscribers.remove(callback)
 
         return unsubscribe
+
+    def record_output(self, detail: str, *, run_id: str | None = None) -> None:
+        """Retain incidental output without creating one inbox item per line."""
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "insert into notification_events "
+                "(event_type,title,detail,severity,created_at,run_id) values (?,?,?,?,?,?)",
+                (
+                    "ui.output",
+                    "Application output",
+                    redact_secrets(detail),
+                    "info",
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                ),
+            )
 
     def publish(  # noqa: PLR0912 - validates and commits one durable event
         self,
@@ -180,10 +203,16 @@ class NotificationService:
         notification: Notification | None = None
 
         with self._lock, self._connect() as connection:
+            connection.execute(
+                "insert into notification_events(event_type,title,detail,severity,created_at,"
+                "run_id,route_id) values (?,?,?,?,?,?,?)",
+                (event_type, safe_title, safe_detail, severity, now, run_id, route_id),
+            )
             existing = None
             if normalized_dedupe:
                 existing = connection.execute(
-                    "select id from notifications where dedupe_key = ? and dismissed = 0",
+                    "select id,severity,event_type from notifications "
+                    "where dedupe_key = ? and dismissed = 0",
                     (normalized_dedupe,),
                 ).fetchone()
             if existing is not None:
@@ -192,7 +221,8 @@ class NotificationService:
                     """
                     update notifications
                     set event_type=?, category=?, severity=?, title=?, detail=?, updated_at=?,
-                        unread=1, count=count+1, run_id=?, agent_id=?, route_id=?, actions_json=?
+                        unread=case when severity<>? or event_type<>? then 1 else unread end,
+                        count=count+1, run_id=?, agent_id=?, route_id=?, actions_json=?
                     where id=?
                     """,
                     (
@@ -202,6 +232,8 @@ class NotificationService:
                         safe_title,
                         safe_detail,
                         now,
+                        severity,
+                        event_type,
                         run_id,
                         agent_id,
                         route_id,
@@ -211,7 +243,9 @@ class NotificationService:
                 )
             else:
                 notification_id = uuid.uuid4().hex
-                if self._category_is_flooding(connection, resolved_category, now):
+                if severity not in {"error", "critical"} and self._category_is_flooding(
+                    connection, resolved_category, now
+                ):
                     notification = self._publish_throttled(connection, resolved_category, now)
                 else:
                     connection.execute(
@@ -399,6 +433,11 @@ class NotificationService:
             )
 
     def should_surface(self, notification: Notification) -> bool:
+        # A repeated event updates its incident without stealing focus again.
+        signature = (notification.event_type, notification.severity)
+        if self._last_surfaced.get(notification.id) == signature:
+            return False
+        self._last_surfaced[notification.id] = signature
         with self._connect() as connection:
             row = connection.execute(
                 "select minimum_severity, immediate from notification_preferences where category=?",
@@ -407,7 +446,11 @@ class NotificationService:
         if row is not None:
             configured = _SEVERITY_ORDER[str(row["minimum_severity"])]
             return bool(row["immediate"]) and _SEVERITY_ORDER[notification.severity] >= configured
-        if notification.event_type in {"update.available", "scan.completed"}:
+        if notification.event_type in {
+            "update.available",
+            "scan.completed",
+            "runtime.route.recovered",
+        }:
             return True
         return _SEVERITY_ORDER[notification.severity] >= _SEVERITY_ORDER["warning"]
 

@@ -58,11 +58,10 @@ def test_infer_target_type_detects_api_spec(tmp_path: Path) -> None:
     assert Path(details["target_spec"]).is_absolute()
 
 
-def test_infer_target_type_still_rejects_non_spec_file(tmp_path: Path) -> None:
+def test_infer_target_type_accepts_general_file(tmp_path: Path) -> None:
     path = tmp_path / "data.json"
     path.write_text(json.dumps({"foo": "bar"}), encoding="utf-8")
-    with pytest.raises(ValueError, match="not a directory"):
-        infer_target_type(str(path))
+    assert infer_target_type(str(path))[0] == "local_file"
 
 
 def test_infer_target_type_detects_postman_uri() -> None:
@@ -95,13 +94,13 @@ def test_build_targets_info_records_title_and_base_urls(tmp_path: Path) -> None:
     assert target["details"]["base_urls"] == ["https://api.shop.test/v1"]
 
 
-def test_build_targets_info_rejects_unparseable_spec(tmp_path: Path) -> None:
+def test_build_targets_info_keeps_unparseable_file_for_inspection(tmp_path: Path) -> None:
     path = tmp_path / "openapi.json"
     path.write_text('{"openapi": "3.0.0", "info": {"title": "X"}, "paths"', encoding="utf-8")
     args = argparse.Namespace(target=[str(path)], target_list=None)
-    # a broken file is not recognized as a spec, so it fails as an unusable target
-    with pytest.raises(ValueError, match="Invalid target"):
-        build_targets_info(args)
+    # The original bytes remain available for agent inspection as a general file.
+    build_targets_info(args)
+    assert args.targets_info[0]["type"] == "local_file"
 
 
 def test_stage_api_specs_copies_spec_into_workspace_dir(tmp_path: Path) -> None:

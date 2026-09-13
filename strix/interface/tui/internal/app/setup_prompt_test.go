@@ -122,35 +122,21 @@ func startPayloadFlag(t *testing.T, envelopes []protocol.Envelope, field string)
 
 // A bare prompt launches straight away, asking to mount the working directory
 // rather than adding it as a target. The prompt is held in case it is declined.
-func TestSetupPromptWithoutTargetLaunchesAndRequestsMount(t *testing.T) {
+func TestSetupPromptWithoutTargetUsesAtomicSubmit(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
-	model.snapshot = protocol.Snapshot{SetupMode: true, WorkingDir: "/Users/me/code/api"}
-
-	updated, cmd := model.submit("find auth bugs in the login flow")
-	model = updated.(Model)
+	model.snapshot = protocol.Snapshot{SetupMode: true}
+	_, cmd := model.submit("find auth bugs in the login flow")
 	envelopes := drainCommands(t, cmd, connection)
-	types := commandTypes(envelopes)
-
-	if !contains(types, "setup.set_instruction") || !contains(types, "setup.start") {
-		t.Fatalf("bare prompt did not launch: %v", types)
+	if len(envelopes) != 1 || envelopes[0].Type != "scan.submit" {
+		t.Fatalf("expected one atomic submit: %#v", envelopes)
 	}
-	if contains(types, "setup.add_target") {
-		t.Fatalf("the working directory must not be added as a target: %v", types)
+	var payload map[string]any
+	if err := json.Unmarshal(envelopes[0].Payload, &payload); err != nil {
+		t.Fatal(err)
 	}
-	if mount, found := startPayloadFlag(t, envelopes, "mount_working_dir"); !found || !mount {
-		t.Fatalf("mount was not requested: mount_working_dir=%v found=%v", mount, found)
-	}
-	// setup.start leaves setup mode, so it must be the last command sent.
-	if start, instr := firstIndex(types, "setup.start"), lastIndex(types, "setup.set_instruction"); start < instr {
-		t.Fatalf("setup.start (%d) must come after setup.set_instruction (%d): %v", start, instr, types)
-	}
-	if model.pendingPrompt != "find auth bugs in the login flow" {
-		t.Fatalf("prompt was not held in case the mount is declined: %q", model.pendingPrompt)
-	}
-	// The confirmation is not raised locally; the backend asks for it.
-	if model.modal != modalNone {
-		t.Fatalf("submit should not open a dialog itself: modal=%v", model.modal)
+	if payload["message"] != "find auth bugs in the login flow" || payload["target"] != nil {
+		t.Fatalf("prompt changed: %#v", payload)
 	}
 }
 
@@ -236,31 +222,21 @@ func TestMountConfirmationAnswers(t *testing.T) {
 }
 
 // A prompt that names a target adds it and launches.
-func TestSetupPromptWithTargetLaunches(t *testing.T) {
+func TestStandaloneTargetUsesAtomicSubmit(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.snapshot = protocol.Snapshot{SetupMode: true}
-
-	_, cmd := model.submit("https://juice-shop.example.com hit the coupon endpoint")
+	_, cmd := model.submit("https://example.invalid")
 	envelopes := drainCommands(t, cmd, connection)
-	types := commandTypes(envelopes)
-
-	for _, want := range []string{"setup.add_target", "setup.set_instruction", "setup.start"} {
-		if !contains(types, want) {
-			t.Fatalf("missing %s in %v", want, types)
-		}
+	if len(envelopes) != 1 || envelopes[0].Type != "scan.submit" {
+		t.Fatalf("expected one atomic submit: %#v", envelopes)
 	}
-	if _, found := startPayloadFlag(t, envelopes, "mount_working_dir"); found {
-		t.Fatalf("a targeted prompt must not ask to mount the working directory: %v", types)
+	var payload map[string]any
+	if err := json.Unmarshal(envelopes[0].Payload, &payload); err != nil {
+		t.Fatal(err)
 	}
-	// The target and instruction must reach the backend before setup.start
-	// closes the setup guard.
-	start := firstIndex(types, "setup.start")
-	if target := lastIndex(types, "setup.add_target"); start < target {
-		t.Fatalf("setup.start (%d) must come after setup.add_target (%d): %v", start, target, types)
-	}
-	if instr := lastIndex(types, "setup.set_instruction"); start < instr {
-		t.Fatalf("setup.start (%d) must come after setup.set_instruction (%d): %v", start, instr, types)
+	if payload["target"] != "https://example.invalid" {
+		t.Fatalf("standalone target changed: %#v", payload)
 	}
 }
 

@@ -189,6 +189,13 @@ func (m *Model) keepVulnerabilitySelectionInWindow() {
 // statsView ports build_tui_stats_text + the version line appended in
 // _update_stats_display: model, token/cost line, optional Caido URL, version.
 func (m Model) modalView() string {
+	if m.modal == modalWorkspace {
+		return m.workspaceView()
+	}
+	if m.modal == modalExpanded {
+		return lipgloss.NewStyle().Width(max(10, m.width-6)).Border(lipgloss.RoundedBorder()).Render("Compose · Ctrl+S Send · Esc collapse\n" + m.inputView())
+	}
+
 	switch m.modal {
 	case modalHelp:
 		return m.commandHelpView()

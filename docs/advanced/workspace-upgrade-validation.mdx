@@ -1,0 +1,55 @@
+---
+title: "Workspace upgrade validation"
+description: "Stability regressions, interface checks, and distribution validation"
+---
+
+Validated on Windows with Python 3.13, the repository's Go toolchain, and Microsoft Edge. The upgraded terminal and browser use protocol version 7 and the same application controller. Start them from the checkout with `uv run strix` or `uv run strix view`.
+
+| Check | Result |
+| --- | --- |
+| Complete Python suite | 1,532 passed; 12 skipped |
+| Final focused Python checks, including additional regressions | 166 shared/input regressions and 100 SDK model tests passed |
+| Go application, protocol, and renderer tests with `-race` | Passed |
+| Go vet | Passed |
+| React component tests | 9 passed |
+| Edge end-to-end workspace test | Passed |
+| TypeScript | Passed |
+| Ruff lint and formatting | Passed |
+| mypy | Passed across 140 source files |
+| Bandit | No findings |
+| npm dependency audit | No reported vulnerabilities |
+| Production dashboard and Windows wheel build | Passed |
+| Packaged workspace startup and authenticated HTTP smoke test | Passed |
+
+Pyright remains nonzero: 928 diagnostics, compared with 983 in the unchanged Git baseline using the same virtual environment. The upgrade's new diagnostic entries were addressed. This is existing repository typing debt; the overall strict Pyright check is not marked as passing.
+
+The extended synthetic scan drives the real agent SDK and SQLite session through 64 successful model turns and 32 injected malformed-response failures, with checkpoint/reopen halfway through. Its model transport is mocked. Every outbound tool argument is validated, all 32 completed tool actions execute exactly once, their results survive recovery, and the history remains bounded. This test exposed and now guards against appending the SDK's replay to a duplicate copy of its input history.
+
+Persistence tests cover concurrent and cancelled snapshots, permanent disk errors, cleanup, duplicate run ownership, abandoned-run status, injected sharing failures, and a real Win32 file handle that prevents replacement until released. Notification tests cover incident coalescing, retained diagnostic events, action selection, read/dismiss behavior, and isolation between runs.
+
+Composer tests cover multiline and command-like paste, Unicode, the 256 KiB byte limit, failed delivery, duplicate acknowledgements, reload restoration, and typing while delivery is pending. Attachment tests cover binary and Unicode paths, staging failures, and mapping to sandbox paths. Provider regressions cover exact model IDs, discovery fallback, session overrides, saved-key isolation, and readiness for an unsaved connection.
+
+The wheel smoke test runs the extracted package outside the source tree. It verifies the bundled sidecar, an empty workspace, authenticated commands, incremental events, snapshot resynchronization on reconnect, binary uploads, origin rejection, and artifact boundaries. It also checks that managed-cloud modules, email authorization, analytics senders, and frontend source/dependencies are absent from the wheel. The dashboard bundle is included. LiteLLM telemetry is disabled and automatic application-attribution headers are removed; explicit user headers are retained.
+
+Browser adapter tests use sandbox doubles to verify session isolation and safe-read recovery without replaying consequential actions. No real targets or paid model calls were used. Live provider compatibility and a full Docker browser integration run remain environment-dependent checks; the mocked tests do not establish those outcomes.
+
+Reproduce the main checks with:
+
+```bash
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy strix/
+uv run bandit -r strix/ -c pyproject.toml
+cd strix/interface/tui
+go test -race ./...
+go vet ./...
+cd ../viewer/frontend
+npm ci
+npm test
+npm run type-check
+npm run test:e2e
+npm run build
+```
+
+The end-to-end configuration uses the installed Edge channel. Build the distribution from the repository root with `uv build --wheel`.

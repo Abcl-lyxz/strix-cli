@@ -42,6 +42,7 @@ from strix.core.inputs import (
     build_scope_context,
     make_model_settings,
 )
+from strix.core.ownership import owned_run
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.core.sessions import open_agent_session
 from strix.report.state import get_global_report_state
@@ -97,6 +98,8 @@ def _route_reloader(
     )
 
     def reload() -> tuple[object, list[RouteConfig]]:
+        from strix.config import routes as route_config
+
         route_file = os.environ.get("STRIX_ROUTES_FILE", "").strip()
         source = Path(route_file) if route_file else config_path()
         try:
@@ -109,7 +112,9 @@ def _route_reloader(
             )
         except OSError:
             revision = (str(source), None)
-        return revision, load_routes(load_settings(), selected=selected_names)
+        return (revision, route_config.session_revision()), load_routes(
+            load_settings(), selected=selected_names
+        )
 
     return reload
 
@@ -222,6 +227,7 @@ def _compose_root_instructions_override(
     )
 
 
+@owned_run
 async def run_strix_scan(
     *,
     scan_config: dict[str, Any],

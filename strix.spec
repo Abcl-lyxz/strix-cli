@@ -164,7 +164,6 @@ hiddenimports = [
     'strix.runtime.session_manager',
     'strix.telemetry',
     'strix.telemetry.logging',
-    'strix.telemetry.posthog',
     'strix.tools',
     'strix.tools.agents_graph.tools',
     'strix.tools.finish.tool',

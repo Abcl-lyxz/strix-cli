@@ -24,14 +24,12 @@ from strix.interface.utils import (
     derive_local_base_name,
     generate_run_name,
     infer_target_type,
-    is_whitebox_scan,
     read_target_list_file,
     resolve_diff_scope_context,
     rewrite_localhost_targets,
     stage_api_specs,
     write_fetched_collection,
 )
-from strix.telemetry import posthog, scarf
 from strix.utils.api_spec import (
     SpecParseError,
     fetch_postman_collection,
@@ -63,6 +61,7 @@ async def preflight_model_connection(
     *,
     settings: Settings | None = None,
     selected_routes: list[str] | None = None,
+    check_tools: bool = False,
 ) -> None:
     """Verify the configured model route using the run's real transport mode."""
     from agents.model_settings import ModelSettings
@@ -112,21 +111,63 @@ async def preflight_model_connection(
         "prompt": None,
     }
 
+    if check_tools:
+        from agents.tool import FunctionTool
+
+        async def probe(_context: Any, _arguments: str) -> str:
+            return "OK"
+
+        request["tools"] = [
+            FunctionTool(
+                name="strix_connection_test",
+                description="Confirm tool calling is supported",
+                params_json_schema={
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": False,
+                },
+                on_invoke_tool=probe,
+            )
+        ]
+        request["input"] = "Call strix_connection_test with ok set to true."
+        request["model_settings"] = request_settings.resolve(
+            ModelSettings(max_tokens=128, tool_choice="strix_connection_test")
+        )
+    observed_tool = False
+
+    def observe(response: Any) -> None:
+        nonlocal observed_tool
+        from strix.llm.tool_arguments import parse_tool_arguments
+
+        for output in getattr(response, "output", []) or []:
+            if (
+                getattr(output, "type", "") == "function_call"
+                and getattr(output, "name", "") == "strix_connection_test"
+            ):
+                observed_tool = parse_tool_arguments(output.arguments).get("ok") is True
+
     async def perform_check() -> None:
         if resolved_settings.llm.disable_streaming:
-            await model.get_response(**request)
+            observe(await model.get_response(**request))
             return
         # Match the transport used by a normal scan. Some OpenAI-compatible
         # gateways support streaming reliably but leave non-streaming requests
         # open indefinitely, so a non-streaming-only preflight rejects a route
         # that the agent itself can use.
-        async for _event in model.stream_response(**request):
-            pass
+        async for event in model.stream_response(**request):
+            if getattr(event, "type", "") == "response.completed":
+                observe(getattr(event, "response", None))
 
     timeout = min(float(resolved_settings.llm.timeout), 45.0)
     try:
         try:
             await asyncio.wait_for(perform_check(), timeout=timeout)
+            if check_tools and not observed_tool:
+                raise ValueError(
+                    "The model did not return the requested tool call. "
+                    "Choose a model with tool support."
+                )
         except TimeoutError as exc:
             raise TimeoutError(f"model connection check timed out after {timeout:g}s") from exc
     finally:
@@ -217,6 +258,15 @@ def prepare_run(args: argparse.Namespace) -> None:
             cloned_path = clone_repository(repo_url, args.run_name, dest_name)
             target_info["details"]["cloned_repo_path"] = cloned_path
 
+    from strix.interface.attachments import describe_attachment
+
+    for target in args.targets_info:
+        if target["type"] == "local_file":
+            if target["details"].get("workspace_path"):
+                continue
+            item = describe_attachment(target["details"]["target_path"], role="target")
+            target["details"]["workspace_path"] = item["workspace_path"]
+            args.workspace_files = list(getattr(args, "workspace_files", []) or []) + item["files"]
     args.local_sources = collect_local_sources(args.targets_info)
     args.local_sources.extend(stage_api_specs(args.targets_info, args.run_name))
     diff_scope = resolve_diff_scope_context(
@@ -257,20 +307,6 @@ def attach_workspace_mount(args: argparse.Namespace) -> None:
         }
     )
     args.local_sources = local_sources
-
-
-def telemetry_start(args: argparse.Namespace) -> None:
-    model = load_settings().llm.model
-    kwargs = {
-        "model": model,
-        "auth_mode": codex.auth_mode(model),
-        "scan_mode": args.scan_mode,
-        "is_whitebox": is_whitebox_scan(args.targets_info),
-        "interactive": not args.non_interactive,
-        "has_instructions": bool(args.instruction),
-    }
-    posthog.start(**kwargs)
-    scarf.start(**kwargs)
 
 
 def _persist_run_record(args: argparse.Namespace) -> None:

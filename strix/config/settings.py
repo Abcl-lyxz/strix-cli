@@ -123,12 +123,6 @@ class RoutingSettings(BaseSettings):
     outage_timeout: int = Field(default=600, ge=1, alias="STRIX_ROUTE_OUTAGE_TIMEOUT")
 
 
-class TelemetrySettings(BaseSettings):
-    model_config = _BASE_CONFIG
-
-    enabled: bool = Field(default=True, alias="STRIX_TELEMETRY")
-
-
 WebSearchProvider = Literal["auto", "perplexity", "exa"]
 ExaSearchType = Literal["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"]
 
@@ -167,23 +161,18 @@ class IntegrationSettings(BaseSettings):
     )
 
 
-class ViewerSettings(BaseSettings):
+class KeyboardSettings(BaseSettings):
     model_config = _BASE_CONFIG
-
-    # Base URL of the Strix relay the local viewer proxies to for email
-    # verification and encrypted report delivery. The browser never talks to
-    # the relay directly; the local server is the only caller.
-    app_url: str = Field(default="https://app.strix.ai", alias="STRIX_APP_URL")
+    external_editor: str | None = Field(default=None, alias="STRIX_EXTERNAL_EDITOR")
 
 
 class Settings(BaseSettings):
     model_config = _BASE_CONFIG
 
+    keyboard: KeyboardSettings = Field(default_factory=KeyboardSettings)
     llm: LlmSettings = Field(default_factory=LlmSettings)
     dedupe: DedupeSettings = Field(default_factory=DedupeSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
-    telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     integrations: IntegrationSettings = Field(default_factory=IntegrationSettings)
-    viewer: ViewerSettings = Field(default_factory=ViewerSettings)

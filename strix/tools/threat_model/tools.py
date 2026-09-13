@@ -21,7 +21,6 @@ import json
 import logging
 import re
 import subprocess
-import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +30,7 @@ from urllib.parse import urlsplit
 from agents import RunContextWrapper, function_tool
 
 from strix.core.agents import AgentCoordinator
+from strix.utils.atomic import atomic_write_text
 
 
 logger = logging.getLogger(__name__)
@@ -249,19 +249,8 @@ def _persist_locked() -> None:
     if path is None:
         return
     try:
-        payload = json.dumps(_MODELS, ensure_ascii=False, default=str)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            tmp.write(payload)
-            tmp_path = Path(tmp.name)
-        tmp_path.replace(path)
+        with _store_lock:
+            atomic_write_text(path, lambda: json.dumps(_MODELS, ensure_ascii=False, default=str))
     except OSError:
         logger.exception("threat model mirror to %s failed", path)
 

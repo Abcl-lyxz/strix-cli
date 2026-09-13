@@ -17,7 +17,6 @@ import litellm
 from agents.model_settings import ModelSettings
 from agents.models.interface import Model, ModelProvider
 
-from strix.config import codex
 from strix.llm.context_budget import context_window
 from strix.notifications import NotificationAction, notify
 from strix.resilience import full_jitter_delay, retry_after_seconds
@@ -48,35 +47,6 @@ RouteFailureKind = Literal[
     "fatal",
 ]
 
-_AUTH_CODES = frozenset({401, 402, 403})
-_TRANSIENT_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
-_CONTEXT_MARKERS = (
-    "context length",
-    "context window",
-    "context_length_exceeded",
-    "prompt is too long",
-    "input is too long",
-    "too many tokens",
-)
-_POLICY_MARKERS = ("content policy", "content filter", "guardrail", "safety policy")
-_INCOMPATIBLE_MARKERS = (
-    "invalid tool",
-    "tool schema",
-    "unsupported tool",
-    "does not support tools",
-    "function calling is not supported",
-)
-_AUTH_MARKERS = (
-    "invalid api key",
-    "incorrect api key",
-    "unauthorized",
-    "billing",
-    "insufficient quota",
-    "quota exceeded",
-    "payment required",
-    "credit balance",
-)
-
 
 @dataclass(slots=True)
 class RouteConfig:
@@ -90,6 +60,9 @@ class RouteConfig:
     rpm: int | None = None
     tpm: int | None = None
     enabled: bool = True
+    provider_id: str | None = None
+    transport: str | None = None
+    model_id: str | None = None
     api_key_ref: str | None = None
     headers_ref: str | None = None
     api_key_env: str | None = field(default=None, repr=False, compare=False)
@@ -128,6 +101,9 @@ class RouteConfig:
             "rpm",
             "tpm",
             "enabled",
+            "provider_id",
+            "transport",
+            "model_id",
             "api_key_ref",
             "headers_ref",
         }
@@ -199,35 +175,14 @@ class RouteContextOverflowError(RuntimeError):
 
 
 def classify_route_failure(exc: BaseException) -> RouteFailureKind:
-    result: RouteFailureKind
-    if codex.is_content_guardrail_error(exc):
-        result = "policy"
-    else:
-        status = getattr(exc, "status_code", None)
-        text = str(exc).lower()
-        name = type(exc).__name__.lower()
-        named_transient = any(
-            marker in name
-            for marker in ("timeout", "connection", "ratelimit", "serviceunavailable")
-        )
-        if status in _AUTH_CODES or any(marker in text for marker in _AUTH_MARKERS):
-            result = "authentication"
-        elif any(marker in text for marker in _CONTEXT_MARKERS):
-            result = "context"
-        elif any(marker in text for marker in _POLICY_MARKERS):
-            result = "policy"
-        elif status in {400, 404, 422} and any(marker in text for marker in _INCOMPATIBLE_MARKERS):
-            result = "incompatible"
-        elif (
-            status in _TRANSIENT_CODES
-            or (isinstance(status, int) and 500 <= status <= 599)
-            or isinstance(exc, TimeoutError | ConnectionError | ConnectionResetError | OSError)
-            or named_transient
-        ):
-            result = "transient"
-        else:
-            result = "fatal"
-    return result
+    from strix.llm.errors import classify_model_failure  # noqa: PLC0415 - avoid config cycle
+
+    kind = classify_model_failure(exc)
+    if kind == "billing":
+        return "authentication"
+    if kind == "malformed":
+        return "fatal"  # execution owns history recovery, not the route pool
+    return kind
 
 
 class RoutePool:
@@ -252,6 +207,7 @@ class RoutePool:
         self.states = {route.name: RouteState(route) for route in routes}
         self.wait_timeout = wait_timeout
         self.health_path = health_path
+        self.run_id = health_path.parent.parent.name if health_path else "setup"
         self._condition = asyncio.Condition()
         self._models: dict[str, Model] = {}
         self._retired_models: list[Model] = []
@@ -364,7 +320,8 @@ class RoutePool:
                                 title=f"Route {state.config.name} does not support tools",
                                 severity="error",
                                 route_id=state.config.name,
-                                dedupe_key=f"route-tools:{state.config.name}",
+                                dedupe_key=f"route-tools:{self.run_id}:{state.config.name}",
+                                run_id=self.run_id,
                                 actions=(
                                     NotificationAction(
                                         "open_routes", "Open routes", state.config.name
@@ -527,7 +484,8 @@ class RoutePool:
                         title=f"Route {state.config.name} recovered",
                         severity="info",
                         route_id=state.config.name,
-                        dedupe_key=f"route-recovered:{state.config.name}",
+                        dedupe_key=f"route-incident:{self.run_id}:{state.config.name}",
+                        run_id=self.run_id,
                     )
             elif error is not None:
                 state.failed_turns += 1
@@ -555,7 +513,8 @@ class RoutePool:
                 detail=safe_error,
                 severity="warning",
                 route_id=state.config.name,
-                dedupe_key=f"route-cooldown:{state.config.name}",
+                dedupe_key=f"route-incident:{self.run_id}:{state.config.name}",
+                run_id=self.run_id,
                 actions=(NotificationAction("retry_route_test", "Test route", state.config.name),),
             )
         elif kind == "authentication":
@@ -566,7 +525,8 @@ class RoutePool:
                 detail=safe_error,
                 severity="error",
                 route_id=state.config.name,
-                dedupe_key=f"route-auth:{state.config.name}",
+                dedupe_key=f"route-incident:{self.run_id}:{state.config.name}",
+                run_id=self.run_id,
                 actions=(NotificationAction("open_routes", "Open routes", state.config.name),),
             )
         elif kind == "incompatible":
@@ -577,7 +537,8 @@ class RoutePool:
                 detail=safe_error,
                 severity="error",
                 route_id=state.config.name,
-                dedupe_key=f"route-incompatible:{state.config.name}",
+                dedupe_key=f"route-incident:{self.run_id}:{state.config.name}",
+                run_id=self.run_id,
                 actions=(NotificationAction("open_routes", "Open routes", state.config.name),),
             )
 
@@ -785,6 +746,9 @@ def _resolve_route_secrets(route: RouteConfig) -> tuple[str | None, dict[str, st
     return api_key or None, headers
 
 
+resolve_route_secrets = _resolve_route_secrets
+
+
 def _default_model_factory(
     route: RouteConfig, api_key: str | None, headers: dict[str, str] | None
 ) -> Model:
@@ -793,9 +757,61 @@ def _default_model_factory(
     from strix.config.models import StrixProvider  # noqa: PLC0415
 
     inner = StrixProvider(api_key=api_key, base_url=route.base_url).get_model(route.model)
-    if not headers:
-        return inner
-    return _HeaderModel(inner, headers)
+    if headers:
+        inner = _HeaderModel(inner, headers)
+    return _LiveSettingsModel(inner, route.model)
+
+
+class _LiveSettingsModel(Model):
+    """Capture current UI settings once at each provider-call boundary."""
+
+    def __init__(self, inner: Model, model_name: str) -> None:
+        self.inner = inner
+        self.model_name = model_name
+
+    async def close(self) -> None:
+        await self.inner.close()
+
+    def _settings(self, original: ModelSettings) -> ModelSettings:
+        from strix.config.loader import load_settings  # noqa: PLC0415
+        from strix.core.inputs import make_model_settings  # noqa: PLC0415
+
+        current = load_settings().llm
+        fresh = make_model_settings(
+            current.reasoning_effort,
+            model_name=self.model_name,
+            force_required_tool_choice=current.force_required_tool_choice,
+            request_timeout=current.timeout,
+            prompt_cache=current.prompt_cache,
+            extra_headers=current.extra_headers,
+        )
+        original_body: object = getattr(original, "extra_body", None)
+        fresh_body: object = getattr(fresh, "extra_body", None)
+        extra_body: dict[str, Any] = (
+            dict(cast("dict[str, Any]", original_body)) if isinstance(original_body, dict) else {}
+        )
+        extra_body.pop("reasoning_effort", None)
+        if isinstance(fresh_body, dict):
+            extra_body.update(cast("dict[str, Any]", fresh_body))
+        return replace(
+            original,
+            reasoning=fresh.reasoning,
+            tool_choice=fresh.tool_choice or original.tool_choice,
+            extra_args=fresh.extra_args,
+            extra_body=extra_body or None,
+            extra_headers=fresh.extra_headers,
+        )
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        kwargs["model_settings"] = self._settings(kwargs["model_settings"])
+        return await self.inner.get_response(*args, **kwargs)
+
+    async def stream_response(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        kwargs["model_settings"] = self._settings(kwargs["model_settings"])
+        async for event in self.inner.stream_response(*args, **kwargs):
+            yield event
 
 
 class _HeaderModel(Model):

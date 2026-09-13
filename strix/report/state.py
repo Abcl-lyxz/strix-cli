@@ -23,7 +23,6 @@ from strix.report.writer import (
     write_run_record,
     write_vulnerabilities,
 )
-from strix.telemetry import posthog, scarf
 
 
 if TYPE_CHECKING:
@@ -226,8 +225,6 @@ class ReportState:
         self._sarif_repo_ctx: dict[str, Any] | None = None
         self._sarif_repo_ctx_ready: bool = False
 
-        self.posthog_scan_ended_sent: bool = False
-        self.scarf_scan_ended_sent: bool = False
         self.scan_ended_exit_reason: str | None = None
 
     def get_run_dir(self) -> Path:
@@ -431,8 +428,6 @@ class ReportState:
             actions=(NotificationAction("open_finding", "Open finding", report_id),),
         )
         logger.info(f"Added vulnerability report: {report_id} - {title}")
-        posthog.finding(severity, cwe=cwe, is_cve=bool(cve))
-        scarf.finding(severity, cwe=cwe, is_cve=bool(cve))
 
         self.save_run_data()
         return report_id
@@ -607,6 +602,9 @@ class ReportState:
 
         logger.info("Updated scan final fields")
         self.save_run_data(mark_complete=True)
+        if self.run_record.get("storage_error"):
+            raise OSError(self.run_record["storage_error"])
+        self.scan_ended_exit_reason = self.scan_ended_exit_reason or "finished_by_tool"
         notify(
             "scan.completed",
             title=f"Scan {self.run_name or self.run_id} completed",
@@ -615,8 +613,6 @@ class ReportState:
             run_id=self.run_id,
             dedupe_key=f"scan-completed:{self.run_id}",
         )
-        posthog.end(self, exit_reason="finished_by_tool")
-        scarf.end(self, exit_reason="finished_by_tool")
 
     def record_mcp_connections(self, names: list[str]) -> None:
         """Note the MCP servers this run connected, and persist it.
@@ -728,6 +724,12 @@ class ReportState:
             return None
 
     def _save_artifacts(self) -> None:
+        from strix.utils.atomic import path_lock
+
+        with path_lock(self.get_run_dir() / "run.json"):
+            self._save_artifacts_locked()
+
+    def _save_artifacts_locked(self) -> None:
         """Write scan artifacts under ``run_dir``."""
         run_dir = self.get_run_dir()
         try:
@@ -763,10 +765,33 @@ class ReportState:
             except Exception:
                 logger.exception("SARIF emit failed (non-fatal; CSV/MD unaffected)")
 
+            from strix.utils.atomic import storage_failures
+
+            errors = storage_failures(run_dir)
+            errors.pop(str((run_dir / "run.json").resolve()), None)
+            if errors:
+                self.run_record["storage_error"] = "; ".join(errors.values())
+                if self.run_record.get("status") == "completed":
+                    self.run_record["status"] = "failed"
+            else:
+                self.run_record.pop("storage_error", None)
             write_run_record(run_dir, self.run_record)
 
             logger.info("Essential scan data saved to: %s", run_dir)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError) as exc:
+            from strix.notifications import notify
+
+            self.run_record["storage_error"] = str(exc)
+            if self.run_record.get("status") == "completed":
+                self.run_record["status"] = "failed"
+            notify(
+                "storage.failed",
+                title="Scan data could not be saved",
+                detail=str(exc),
+                severity="error",
+                run_id=self.run_name,
+                dedupe_key=f"storage:{run_dir}",
+            )
             logger.exception("Failed to save scan data")
 
     def _sarif_repository_context(self) -> dict[str, Any] | None:

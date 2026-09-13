@@ -32,8 +32,8 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from strix.report.writer import atomic_write_text
 from strix.skills import get_available_skills
+from strix.utils.atomic import atomic_write_text
 
 
 if TYPE_CHECKING:

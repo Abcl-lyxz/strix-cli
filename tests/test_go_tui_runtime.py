@@ -237,16 +237,14 @@ async def test_runtime_does_not_initialize_or_scan_before_ready(
         calls.append("scan")
         scan_started.set()
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         calls.append("preflight")
 
     monkeypatch.setattr(runtime, "binary_command", lambda: ["test-sidecar"])
     monkeypatch.setattr(go_tui, "launch_tui_process", launch)
     monkeypatch.setattr(go_tui, "wait_process", wait_process)
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
-    monkeypatch.setattr(go_tui, "persist_current", lambda: None)
     monkeypatch.setattr(go_tui, "prepare_run", lambda _args: None)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: None)
     monkeypatch.setattr(runtime, "init_run_state", init_state)
     monkeypatch.setattr(runtime, "start_scan", start_scan)
 
@@ -316,7 +314,7 @@ async def test_setup_preflights_model_before_starting(
     runtime.controller.diff_base = "origin/main"
     calls: list[str] = []
 
-    async def preflight(model: str) -> None:
+    async def preflight(model: str, **_options: Any) -> None:
         assert model == "openrouter/test-model"
         calls.append("preflight")
 
@@ -350,10 +348,8 @@ async def test_setup_preflights_model_before_starting(
         assert candidate.scope_mode == "diff"
         assert candidate.diff_base == "origin/main"
 
-    monkeypatch.setattr(go_tui, "persist_current", lambda: calls.append("persist"))
     monkeypatch.setattr(go_tui, "build_targets_info", build)
     monkeypatch.setattr(go_tui, "prepare_run", prepare)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: calls.append("telemetry"))
     monkeypatch.setattr(runtime, "init_run_state", lambda: calls.append("state"))
     monkeypatch.setattr(runtime, "start_scan", lambda: calls.append("scan"))
 
@@ -362,7 +358,7 @@ async def test_setup_preflights_model_before_starting(
     await runtime.start_from_setup()
 
     # The same steps, in the same order, as a direct launch's prepare_and_start.
-    assert calls == ["preflight", "persist", "targets", "prepare", "telemetry", "state", "scan"]
+    assert calls == ["preflight", "targets", "prepare", "state", "scan"]
     assert runtime.args.scan_mode == "quick"
     assert runtime.args.instruction == ""
     assert runtime.args.max_budget_usd == 8.5
@@ -392,7 +388,7 @@ async def test_setup_model_check_reports_success_in_the_setup_log(
     runtime = GoTuiRuntime(args())
     calls: list[str] = []
 
-    async def preflight(model: str) -> None:
+    async def preflight(model: str, **_options: Any) -> None:
         calls.append(model)
 
     _setup_model(monkeypatch)
@@ -414,7 +410,7 @@ async def test_setup_model_check_reports_failure_without_leaving_setup(
 ) -> None:
     runtime = GoTuiRuntime(args())
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         raise TimeoutError("connection timed out")
 
     _setup_model(monkeypatch)
@@ -458,7 +454,7 @@ async def test_ensure_model_verified_reuses_the_startup_check(
     release = asyncio.Event()
     calls: list[str] = []
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         calls.append("preflight")
         await release.wait()
 
@@ -487,7 +483,7 @@ async def test_ensure_model_verified_retries_after_a_failed_startup_check(
     outcomes = iter([TimeoutError("connection timed out"), None])
     calls: list[str] = []
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         calls.append("preflight")
         outcome = next(outcomes)
         if outcome is not None:
@@ -515,14 +511,12 @@ async def test_confirmed_target_less_launch_mounts_workspace_without_targets(
     prepared: list[argparse.Namespace] = []
 
     _setup_model(monkeypatch)
-    monkeypatch.setattr(go_tui, "persist_current", lambda: None)
     monkeypatch.setattr(
         go_tui,
         "build_targets_info",
         lambda _args, **_kw: pytest.fail("a target-less launch must not build targets"),
     )
     monkeypatch.setattr(go_tui, "prepare_run", prepared.append)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: None)
     monkeypatch.setattr(runtime, "init_run_state", lambda: None)
     monkeypatch.setattr(runtime, "start_scan", lambda: None)
 
@@ -550,14 +544,12 @@ async def test_setup_preserves_prepared_cli_targets(
     calls: list[str] = []
 
     _setup_model(monkeypatch)
-    monkeypatch.setattr(go_tui, "persist_current", lambda: calls.append("persist"))
     monkeypatch.setattr(
         go_tui,
         "build_targets_info",
         lambda _args, **_kw: pytest.fail("prepared targets should not be rebuilt"),
     )
     monkeypatch.setattr(go_tui, "prepare_run", lambda _args: calls.append("prepare"))
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: calls.append("telemetry"))
     monkeypatch.setattr(runtime, "init_run_state", lambda: calls.append("state"))
     monkeypatch.setattr(runtime, "start_scan", lambda: calls.append("scan"))
 
@@ -565,7 +557,7 @@ async def test_setup_preserves_prepared_cli_targets(
 
     assert runtime.controller.targets == ["https://example.com"]
     assert runtime.args.targets_info[0]["type"] == "web"
-    assert calls == ["persist", "prepare", "telemetry", "state", "scan"]
+    assert calls == ["prepare", "state", "scan"]
 
 
 @pytest.mark.asyncio
@@ -585,7 +577,7 @@ async def test_setup_target_change_preserves_local_targets(
     runtime = GoTuiRuntime(runtime_args)
     runtime.controller.targets.append("https://example.com")
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         return None
 
     def build(target_args: argparse.Namespace, **_: object) -> None:
@@ -611,7 +603,6 @@ async def test_setup_target_change_preserves_local_targets(
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "build_targets_info", build)
     monkeypatch.setattr(go_tui, "prepare_run", lambda _args: None)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: None)
     monkeypatch.setattr(runtime, "init_run_state", lambda: None)
     monkeypatch.setattr(runtime, "start_scan", lambda: None)
 
@@ -647,7 +638,7 @@ async def test_setup_same_basename_uses_combined_workspace_names_on_retry(
     prepare_attempts = 0
     started: list[str] = []
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         return None
 
     def build(target_args: argparse.Namespace, **_: object) -> None:
@@ -691,7 +682,6 @@ async def test_setup_same_basename_uses_combined_workspace_names_on_retry(
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "build_targets_info", build)
     monkeypatch.setattr(go_tui, "prepare_run", prepare)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: None)
     monkeypatch.setattr(runtime, "init_run_state", lambda: started.append("state"))
     monkeypatch.setattr(runtime, "start_scan", lambda: started.append("scan"))
 
@@ -735,7 +725,7 @@ async def test_setup_target_rebuild_restores_all_target_fields_on_failure(
     runtime = GoTuiRuntime(runtime_args)
     runtime.controller.targets.append("https://example.com")
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         return None
 
     def fail_rebuild(target_args: argparse.Namespace, **_: object) -> None:
@@ -775,7 +765,7 @@ async def test_setup_rebuild_canonicalizes_relative_local_target(
     runtime.controller.targets = ["source"]
     prepared = False
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         return None
 
     def prepare(candidate: argparse.Namespace) -> None:
@@ -791,7 +781,6 @@ async def test_setup_rebuild_canonicalizes_relative_local_target(
     )
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "prepare_run", prepare)
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: None)
     monkeypatch.setattr(runtime, "init_run_state", lambda: None)
     monkeypatch.setattr(runtime, "start_scan", lambda: None)
 
@@ -824,7 +813,7 @@ async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
     runtime.controller.instruction = ""
     telemetry_started = False
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         return None
 
     def fail_prepare(candidate: argparse.Namespace) -> None:
@@ -844,7 +833,6 @@ async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
     )
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "prepare_run", fail_prepare)
-    monkeypatch.setattr(go_tui, "telemetry_start", telemetry)
 
     with pytest.raises(ValueError, match="invalid diff scope"):
         await runtime.start_from_setup()
@@ -893,7 +881,7 @@ async def test_setup_preflight_failure_does_not_start_scan(
     runtime.controller.targets = ["https://example.com"]
     started = False
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         raise ValueError("401 Unauthorized")
 
     def mark_started(*_args: Any) -> None:
@@ -902,7 +890,6 @@ async def test_setup_preflight_failure_does_not_start_scan(
 
     _setup_model(monkeypatch)
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
-    monkeypatch.setattr(go_tui, "persist_current", mark_started)
     monkeypatch.setattr(go_tui, "build_targets_info", mark_started)
     monkeypatch.setattr(runtime, "init_run_state", mark_started)
     monkeypatch.setattr(runtime, "start_scan", mark_started)
@@ -939,7 +926,7 @@ async def test_setup_rechecks_same_model_after_credential_change(
         lambda: SimpleNamespace(llm=SimpleNamespace(**connection)),
     )
 
-    async def preflight(model: str) -> None:
+    async def preflight(model: str, **_options: Any) -> None:
         checked.append(model)
 
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
@@ -947,11 +934,8 @@ async def test_setup_rechecks_same_model_after_credential_change(
     await runtime.ensure_model_verified()
 
     assert checked == ["openai/gpt-5.4"]
-    assert runtime.verified_connection == (
-        "openai/gpt-5.4",
-        "new-key",
-        "https://gateway.example/v1",
-    )
+    assert runtime.verified_connection == runtime._connection_signature()
+    assert "new-key" not in str(runtime.verified_connection)
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1025,7 @@ async def test_prepare_and_start_reports_ordinary_connection_failures(
     monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
     started: list[str] = []
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         raise TimeoutError("connection timed out")
 
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
@@ -1063,19 +1047,17 @@ async def test_prepare_and_start_runs_the_scan_after_preparation(
     monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
     order: list[str] = []
 
-    async def preflight(_model: str) -> None:
+    async def preflight(_model: str, **_options: Any) -> None:
         order.append("preflight")
 
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
-    monkeypatch.setattr(go_tui, "persist_current", lambda: order.append("persist"))
     monkeypatch.setattr(go_tui, "prepare_run", lambda _args: order.append("prepare"))
-    monkeypatch.setattr(go_tui, "telemetry_start", lambda _args: order.append("telemetry"))
     monkeypatch.setattr(runtime, "init_run_state", lambda: order.append("state"))
     monkeypatch.setattr(runtime, "start_scan", lambda: order.append("scan"))
 
     await runtime.prepare_and_start()
 
-    assert order == ["preflight", "persist", "prepare", "telemetry", "state", "scan"]
+    assert order == ["preflight", "prepare", "state", "scan"]
     assert runtime.controller.scan_state == "running"
 
 

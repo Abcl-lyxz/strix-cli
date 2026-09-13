@@ -417,18 +417,17 @@ func TestLeadingSlashIsPromptTextNotACommand(t *testing.T) {
 	model.focus = focusInput
 	model.input.SetValue("/etc/passwd is world readable, check it")
 
-	updated, cmd := model.updateMain(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.updateMain(tea.KeyMsg{Type: tea.KeyCtrlS})
 	result := updated.(Model)
 	if cmd == nil {
 		t.Fatal("enter did not submit")
 	}
 	types := commandTypes(drainCommands(t, cmd, connection))
-	if !contains(types, "setup.start") {
+	if !contains(types, "scan.submit") {
 		t.Fatalf("a slash-leading prompt did not launch a scan: %v", types)
 	}
-	// The path is read as a target and the sentence as the instruction.
-	if !contains(types, "setup.add_target") || !contains(types, "setup.set_instruction") {
-		t.Fatalf("slash-leading prompt was not split into target and instruction: %v", types)
+	if contains(types, "setup.add_target") {
+		t.Fatal("a path mentioned in prose silently changed scope")
 	}
 	for _, line := range result.setupLog {
 		if strings.Contains(ansi.Strip(line), "Unknown command") {
@@ -1208,6 +1207,7 @@ func TestBudgetPauseShowsOneWarningToastUntilResumed(t *testing.T) {
 	if cmd := model.notifyBudgetPause(); cmd != nil {
 		t.Fatal("budget toast should fire once per pause")
 	}
+	model.toast = "" // The earlier warning expired before this new pause.
 	model.snapshot.Agents[0].Status = "running"
 	if cmd := model.notifyBudgetPause(); cmd != nil {
 		t.Fatal("no toast expected while running")

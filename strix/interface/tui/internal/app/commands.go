@@ -22,6 +22,18 @@ type slashCommand struct {
 // The launch palette shows a short prefix of this list; F1 shows the complete
 // reference. Commands that mutate setup are rejected after the scan starts.
 var slashCommands = []slashCommand{
+	{"connect", "", "connect a provider and discover models"},
+	{"models", "", "choose a model connection"},
+	{"routing", "", "advanced route priorities and request limits"},
+	{"mcp", "", "configure MCP connections for the next scan"},
+	{"notify-settings", "", "set notification severity and alert preferences"},
+	{"settings", "", "edit all settings in forms"},
+	{"attach", "[path]", "attach a local file or folder"},
+	{"sessions", "", "browse and resume local runs"},
+	{"retry", "", "retry the interrupted turn using saved results"},
+	{"new", "", "start a new session"},
+	{"editor", "", "compose in your external editor"},
+
 	{"help", "", "show every command and shortcut"},
 	{"config", "[clear]", "show configuration or clear model credentials"},
 	{"model", "<provider/model>", "set the model route"},
@@ -42,7 +54,6 @@ var slashCommands = []slashCommand{
 	{"agents", "[n]", "set the setup limit or focus live agents"},
 	{"scope", "<auto|diff|full>", "set repository scope"},
 	{"diff-base", "<ref|clear>", "set the base ref for diff scope"},
-	{"telemetry", "<on|off>", "enable or disable anonymous telemetry"},
 	{"streaming", "<on|off>", "toggle streamed model responses"},
 	{"cache", "<on|off>", "toggle model prompt caching"},
 	{"timeout", "<seconds>", "set the model request timeout"},
@@ -216,6 +227,57 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 		return m, nil, false
 	}
 
+	if strings.TrimSpace(argument) == "" {
+		switch name {
+		case "connect", "models", "model":
+			cmd := m.openWorkspace("providers", "Providers", "providers.list")
+			return m, cmd, true
+		case "routing":
+			cmd := m.openWorkspace("routing", "Advanced routing", "providers.list")
+			return m, cmd, true
+		case "config", "settings", "reasoning", "streaming", "timeout", "cache", "toolcalls", "images":
+			cmd := m.openWorkspace("settings", "Settings", "settings.list")
+			return m, cmd, true
+		case "baseurl":
+			m.openForm("Provider endpoint", "config.update", map[string]any{}, inputField("api_base", "Base URL", "text", m.snapshot.APIBase))
+			return m, nil, true
+		case "retry":
+			return m, send(m.client, "scan.retry", map[string]any{}), true
+		case "sessions":
+			cmd := m.openWorkspace("sessions", "Local sessions", "sessions.list")
+			return m, cmd, true
+		case "notifications":
+			cmd := m.openWorkspace("notifications", "Notifications", "notifications.manage")
+			return m, cmd, true
+		case "new":
+			return m, send(m.client, "scan.new", map[string]any{}), true
+		case "editor":
+			return m, m.externalEditor(), true
+		case "mcp":
+			m.openForm("MCP connection · next scan", "mcp.update", map[string]any{}, inputField("name", "Name", "text", ""), inputField("transport", "Transport: http or stdio", "text", "http"), inputField("url", "HTTP endpoint", "text", ""), inputField("command", "Executable (stdio)", "text", ""), inputField("args", "Arguments (JSON array)", "text", "[]"), inputField("token", "Bearer token (optional)", "secret", ""), inputField("persist", "Save as default: true or false", "boolean", false))
+			return m, nil, true
+		case "notify-settings":
+			m.openForm("Notification preferences", "notifications.preferences", map[string]any{}, inputField("category", "Category: runtime, security, model, scan, storage", "text", "runtime"), inputField("minimum_severity", "Minimum: info, warning, error, critical", "text", "warning"), inputField("immediate", "Show alerts: true or false", "boolean", true))
+			return m, nil, true
+		case "attach":
+			m.openForm("Attach a file or folder", "attachments.add", map[string]any{}, inputField("path", "Local path", "text", ""), inputField("role", "Role: context or target", "text", "context"))
+			return m, nil, true
+		case "target":
+			m.openForm("Add a target", "setup.add_target", map[string]any{}, inputField("target", "URL, repository, or local path", "text", ""))
+			return m, nil, true
+		case "mode", "budget", "turns", "agents", "scope", "diff-base":
+			field := map[string]string{"mode": "scan_mode", "budget": "max_budget_usd", "turns": "max_turns", "agents": "max_agents", "scope": "scope_mode", "diff-base": "diff_base"}[name]
+			kind := "text"
+			if name == "budget" || name == "turns" || name == "agents" {
+				kind = "number"
+			}
+			m.openForm("Scan "+name, "setup.configure", map[string]any{}, inputField(field, name, kind, ""))
+			return m, nil, true
+		}
+	}
+	if name == "attach" {
+		return m, send(m.client, "attachments.add", map[string]any{"path": argument, "role": "context"}), true
+	}
 	switch name {
 	case "_partial":
 		m.input.SetValue("/" + argument)
@@ -236,10 +298,7 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 		}
 		m.openModal(modalConfig)
 		return m, nil, true
-	case "model", "apikey", "baseurl", "reasoning", "telemetry", "streaming", "cache", "timeout", "toolcalls", "images":
-		if cmd := m.requireSetup(name); cmd != nil {
-			return m, cmd, true
-		}
+	case "model", "apikey", "baseurl", "reasoning", "streaming", "cache", "timeout", "toolcalls", "images":
 		return m.submitConfigCommand(name, argument)
 	case "routes":
 		parts := strings.Fields(argument)
@@ -441,12 +500,12 @@ func (m Model) submitConfigCommand(name, argument string) (tea.Model, tea.Cmd, b
 			return m, cmd, true
 		}
 		payload["reasoning_effort"] = strings.ToLower(value)
-	case "telemetry", "streaming", "cache":
+	case "streaming", "cache":
 		enabled, ok := parseToggle(argument)
 		if !ok {
 			return m, m.slashError("Usage: /" + name + " <on|off>"), true
 		}
-		field := map[string]string{"telemetry": "telemetry_enabled", "streaming": "streaming_enabled", "cache": "prompt_cache"}[name]
+		field := map[string]string{"streaming": "streaming_enabled", "cache": "prompt_cache"}[name]
 		payload[field] = enabled
 	case "timeout", "toolcalls", "images":
 		value, err := strconv.Atoi(strings.TrimSpace(argument))
@@ -510,7 +569,7 @@ func (m Model) commandHelpView() string {
 		return render.Bold(green).Render(label) + "\n" + render.Col(textColor).Render(commands)
 	}
 	body := strings.Join([]string{
-		section("Configure", "/config  /model  /apikey  /baseurl  /routes  /reasoning\n/telemetry  /streaming  /cache  /timeout  /toolcalls  /images"),
+		section("Configure", "/config  /model  /apikey  /baseurl  /routes  /reasoning\n/streaming  /cache  /timeout  /toolcalls  /images"),
 		section("Prepare", "/target  /untarget  /targets  /find  /instruction  /mode\n/budget  /turns  /agents  /scope  /diff-base  /start"),
 		section("Control", "/status  /viewer  /notifications  /storage  /agent  /agents\n/findings  /trace  /follow  /stop  /clear  /quit"),
 		section("Keys", "F1 help · Tab complete/switch · Ctrl+J newline · Ctrl+O viewer\nEsc stop agent · Ctrl+Q quit · arrows navigate"),
@@ -536,14 +595,13 @@ func (m Model) configurationView() string {
 		fmt.Sprintf("%-13s %s", "Reasoning", m.snapshot.ReasoningEffort),
 		fmt.Sprintf("%-13s %s", "Streaming", onOff(m.snapshot.StreamingEnabled)),
 		fmt.Sprintf("%-13s %s", "Prompt cache", onOff(m.snapshot.PromptCache)),
-		fmt.Sprintf("%-13s %s", "Telemetry", onOff(m.snapshot.TelemetryEnabled)),
 		fmt.Sprintf("%-13s %ds · %d tool calls · %d images", "Limits", m.snapshot.LLMTimeout, m.snapshot.MaxToolCallsPerTurn, m.snapshot.MaxContextImages),
 	}
 	for index, line := range status {
 		status[index] = truncate(line, inner)
 	}
 	commands := render.Bold(green).Render("Change from the composer") + "\n" +
-		render.Col(textColor).Render("/model openrouter/openai/gpt-5.4\n/apikey  (opens secure input)\n/baseurl http://localhost:11434/v1\n/reasoning high\n/streaming on · /cache on · /telemetry off\n/timeout 300 · /toolcalls 32 · /images 3")
+		render.Col(textColor).Render("/model openrouter/openai/gpt-5.4\n/apikey  (opens secure input)\n/baseurl http://localhost:11434/v1\n/reasoning high\n/streaming on · /cache on\n/timeout 300 · /toolcalls 32 · /images 3")
 	warning := ""
 	if m.snapshot.ConfigEnvOverride {
 		warning = "\n\n" + render.Col(amber).Render("Environment variables currently override one or more saved LLM values.")

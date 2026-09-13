@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
+from strix.core.ownership import run_is_active
 from strix.core.paths import run_record_path
 from strix.interface.tui.live_view import TuiLiveView
 
@@ -56,6 +58,18 @@ def read_run_summary(run_dir: Path) -> dict[str, Any]:
     if not isinstance(record, dict):
         record = {}
     status = record.get("status")
+    if status in {"running", "waiting", "starting", "budget_paused"}:
+        owner = run_dir / ".state" / "owner.lock"
+        try:
+            abandoned = (
+                owner.exists() or time.time() - run_record_path(run_dir).stat().st_mtime > 90
+            )
+        except OSError:
+            abandoned = False
+        if abandoned and not run_is_active(run_dir):
+            record["status"] = status = "interrupted"
+            record["resumable"] = True
+            record["interruption_reason"] = "The owning process is no longer running"
     finished = status in _TERMINAL_STATUSES and bool(record.get("end_time"))
     return {**record, "finished": finished}
 

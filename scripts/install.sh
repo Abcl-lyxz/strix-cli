@@ -346,7 +346,6 @@ echo -e "${MUTED}For more information visit ${NC}https://strix.ai"
 echo -e "${MUTED}Supported models ${NC}https://docs.strix.ai/llm-providers/overview"
 echo -e "${MUTED}Join our community ${NC}https://discord.gg/strix-ai"
 echo ""
-echo -e "${MUTED}Run a pentest in Strix Cloud ${NC}https://app.strix.ai"
 echo -e "${MUTED}Enterprise ${NC}https://strix.ai/demo"
 echo ""
 

@@ -40,6 +40,7 @@ from strix.config import codex
 from strix.config.loader import load_settings
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
 from strix.config.tool_call_limits import TurnToolCallLimiter
+from strix.llm.tool_arguments import safe_model_input
 
 
 if TYPE_CHECKING:
@@ -69,7 +70,18 @@ def request_timeout_extra_args(timeout_s: float | None) -> dict[str, float] | No
 
 
 def _retry_statusless_provider_errors(context: RetryPolicyContext) -> bool:
-    """Retry statusless provider errors (e.g. mid-stream quota/billing), but not aborts."""
+    """Retry unclassified statusless transport failures, excluding permanent failures."""
+    from strix.llm.errors import classify_model_failure
+
+    if classify_model_failure(context.error) in {
+        "malformed",
+        "authentication",
+        "billing",
+        "context",
+        "incompatible",
+        "policy",
+    }:
+        return False
     normalized = context.normalized
     if normalized.is_abort:
         return False
@@ -303,7 +315,7 @@ class _TurnGuardModel(Model):
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
-        sanitized = dedupe_input(input)
+        sanitized = safe_model_input(dedupe_input(input))
         rewriter = TurnCallIdRewriter(sanitized)
         response = await self._inner.get_response(
             system_instructions,
@@ -336,7 +348,7 @@ class _TurnGuardModel(Model):
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        sanitized = dedupe_input(input)
+        sanitized = safe_model_input(dedupe_input(input))
         rewriter = TurnCallIdRewriter(sanitized)
         limiter = self._limiter()
         stream = self._inner.stream_response(
@@ -545,6 +557,32 @@ class StrixProvider(MultiProvider):
         )
 
 
+_request_retry_policy = retry_policies.any(
+    retry_policies.provider_suggested(),
+    retry_policies.network_error(),
+    retry_policies.http_status((429, 500, 502, 503, 504)),
+    _retry_statusless_provider_errors,
+)
+
+
+async def _safe_request_retry(context: RetryPolicyContext) -> Any:
+    from inspect import isawaitable
+
+    from strix.llm.errors import classify_model_failure
+
+    if context.normalized.is_abort or classify_model_failure(context.error) in {
+        "malformed",
+        "authentication",
+        "billing",
+        "context",
+        "incompatible",
+        "policy",
+    }:
+        return False
+    decision = _request_retry_policy(context)
+    return await decision if isawaitable(decision) else decision
+
+
 DEFAULT_MODEL_RETRY = ModelRetrySettings(
     # The SDK owns request-level retries. The execution loop has a much
     # smaller turn-replay budget for failures that surface after streaming has
@@ -556,12 +594,7 @@ DEFAULT_MODEL_RETRY = ModelRetrySettings(
         multiplier=2.0,
         jitter=True,
     ),
-    policy=retry_policies.any(
-        retry_policies.provider_suggested(),
-        retry_policies.network_error(),
-        retry_policies.http_status((429, 500, 502, 503, 504)),
-        _retry_statusless_provider_errors,
-    ),
+    policy=_safe_request_retry,
 )
 
 RECOMMENDED_MODEL_NAMES = (
@@ -627,7 +660,6 @@ def configure_sdk_model_defaults(settings: Settings) -> None:
     if codex.subscription_model(llm.model):
         return
     _configure_litellm_compatibility()
-    _configure_openrouter_attribution(llm.model)
     if llm.api_key:
         set_default_openai_key(llm.api_key, use_for_tracing=False)
         _configure_litellm_default("api_key", llm.api_key)
@@ -664,6 +696,7 @@ def _configure_litellm_compatibility() -> None:
     """Apply LiteLLM compatibility, privacy, and callback settings."""
     import litellm
 
+    litellm.telemetry = False
     litellm.drop_params = True
     litellm.modify_params = True
     litellm.turn_off_message_logging = True
@@ -720,31 +753,8 @@ def _install_openrouter_stream_cost_capture() -> None:
     litellm.OpenrouterConfig = _StrixOpenrouterConfig  # type: ignore[misc]
 
 
-OPENROUTER_ATTRIBUTION_HEADERS = {
-    "HTTP-Referer": "https://strix.ai",
-    "X-Title": "Strix",
-    "X-OpenRouter-Categories": "cli-agent",
-}
-
-
 def is_openrouter_model(model_name: str | None) -> bool:
     return bool(model_name) and "openrouter/" in (model_name or "").strip().lower()
-
-
-def _configure_openrouter_attribution(model_name: str | None) -> None:
-    import litellm
-
-    current: object = litellm.headers
-    existing: dict[str, str] = current if isinstance(current, dict) else {}
-    if not is_openrouter_model(model_name):
-        if any(key in existing for key in OPENROUTER_ATTRIBUTION_HEADERS):
-            remaining = {
-                k: v for k, v in existing.items() if k not in OPENROUTER_ATTRIBUTION_HEADERS
-            }
-            litellm.headers = remaining or None  # type: ignore[assignment]
-        return
-
-    litellm.headers = {**existing, **OPENROUTER_ATTRIBUTION_HEADERS}  # type: ignore[assignment]
 
 
 def _configure_extra_headers(llm: LlmSettings) -> None:

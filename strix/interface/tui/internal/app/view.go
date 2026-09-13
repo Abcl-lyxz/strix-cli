@@ -496,6 +496,13 @@ func (m Model) mainView() string {
 	if palette := m.commandPaletteView(chatWidth); palette != "" {
 		leftParts = append(leftParts, palette)
 	}
+	// Put the Send action in the border without consuming another layout row.
+	inputLines := strings.Split(input, "\n")
+	if len(inputLines) > 0 {
+		i := len(inputLines) - 1
+		inputLines[i] = truncate("╰─ [Ctrl+S Send] · Enter newline · Ctrl+E expand", chatWidth)
+		input = strings.Join(inputLines, "\n")
+	}
 	leftParts = append(leftParts, input)
 	leftColumn := strings.Join(leftParts, "\n")
 
@@ -814,6 +821,13 @@ func (m Model) statusView(width int) string {
 			right = quitHint
 		case "waiting":
 			left = lipgloss.NewStyle().Foreground(dim).Render("Send message to resume")
+			if agent.WaitKind == "provider" {
+				left = lipgloss.NewStyle().Foreground(amber).Render("Waiting for provider · /connect to repair")
+			} else if agent.WaitKind == "agents" {
+				left = lipgloss.NewStyle().Foreground(dim).Render("Waiting for other agents")
+			} else if agent.WaitKind == "stalled" {
+				left = lipgloss.NewStyle().Foreground(amber).Render("Recovery paused · /retry or /stop")
+			}
 			if msg := agent.ErrorMessage; msg != "" {
 				left = statusMessage(msg, red, " · Send message to resume", width)
 			}

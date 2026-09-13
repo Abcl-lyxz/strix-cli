@@ -10,6 +10,29 @@ import (
 
 func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
+	case "ctrl+k":
+		m.openWorkspace("commands", "Commands", "")
+		for _, c := range slashCommands {
+			m.dialog.Rows = append(m.dialog.Rows, map[string]any{"name": "/" + c.name, "description": c.description})
+		}
+		return m, nil
+	case "ctrl+s":
+		return m.sendComposer()
+	case "ctrl+e":
+		m.modal = modalExpanded
+		m.input.SetHeight(max(3, m.height-8))
+		return m, nil
+	case "alt+up", "alt+down":
+		delta := 1
+		if key.String() == "alt+up" {
+			delta = -1
+		}
+		m.draftIndex = max(0, min(len(m.draftHistory)-1, m.draftIndex+delta))
+		if len(m.draftHistory) > 0 {
+			m.input.SetValue(m.draftHistory[m.draftIndex])
+			m.resizeViewport()
+		}
+		return m, nil
 	case "f1":
 		m.openModal(modalHelp)
 		return m, nil
@@ -25,6 +48,11 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+o":
 		return m, send(m.client, "viewer.open", map[string]any{})
 	case "tab":
+		if m.focus == focusInput && strings.HasPrefix(m.input.Value(), "@") {
+			query := strings.TrimPrefix(m.input.Value(), "@")
+			m.openWorkspace("paths", "Attach a path", "")
+			return m, send(m.client, "paths.complete", map[string]any{"query": query})
+		}
 		if m.focus == focusInput && m.completeSlashCommand() {
 			return m, nil
 		}
@@ -90,19 +118,7 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if key.String() == "enter" && m.focus == focusInput {
-			value := m.input.Value()
-			if strings.TrimSpace(value) == "" {
-				return m, nil
-			}
-			if len([]byte(value)) > maxPromptBytes {
-				m.errorText = "Prompt is too large (maximum 256 KiB)"
-				return m, nil
-			}
-			m.input.SetValue("")
-			m.resizeViewport()
-			return m.submit(value)
-		}
+
 	case "pgup":
 		if m.focus == focusVulnerabilities && len(m.snapshot.Vulnerabilities) > 0 {
 			m.moveVulnerabilitySelection(-m.vulnerabilityPageItems())
@@ -270,6 +286,9 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		statusH = 1
 	}
 	inputTop := chatHeight + statusH
+	if y == inputTop+m.input.Height()+1 && x >= 3 && x < min(17, chatWidth) {
+		return m.sendComposer()
+	}
 	// Chat column: chat box on top, input box below the (optional) status row.
 	if x < chatWidth {
 		switch {
@@ -448,6 +467,15 @@ func scrollbarOffset(row, height, total, visible int) int {
 }
 
 func (m Model) updateSetupMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		rows := strings.Split(ansi.Strip(m.View()), "\n")
+		if msg.Y >= 0 && msg.Y < len(rows) {
+			column := strings.Index(rows[msg.Y], "ctrl+s Send")
+			if column >= 0 && msg.X >= column && msg.X < column+11 {
+				return m.sendComposer()
+			}
+		}
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		m.focus = focusChat
@@ -617,6 +645,25 @@ func clampCycle(value, length int) int {
 }
 
 func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.modal == modalWorkspace {
+		return m.updateWorkspace(key)
+	}
+	if m.modal == modalExpanded {
+		if key.String() == "esc" {
+			m.closeModal()
+			m.resizeViewport()
+			return m, nil
+		}
+		if key.String() == "ctrl+s" {
+			m.closeModal()
+			m.resizeViewport()
+			return m.sendComposer()
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(key)
+		return m, cmd
+	}
+
 	if m.modal == modalAPIKey {
 		switch key.String() {
 		case "esc":
@@ -736,6 +783,7 @@ func (m *Model) openModal(mode modalMode) {
 }
 
 func (m *Model) closeModal() {
+	m.dialog = workspaceDialog{}
 	if m.modal == modalAPIKey {
 		m.apiKeyInput.SetValue("")
 		m.apiKeyInput.Blur()

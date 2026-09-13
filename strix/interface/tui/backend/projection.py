@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+from strix.security.secrets import redact_secrets
+
 
 SCAN_MODES = ("quick", "standard", "deep")
 SCOPE_MODES = ("auto", "diff", "full")
@@ -18,8 +20,8 @@ STATE_TARGET_BYTES = 48 * 1024
 TERMINAL_ESCAPE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_][0-?]*[ -/]*[@-~]")
 
 
-def sanitize_terminal_text(value: str) -> str:
-    without_escapes = TERMINAL_ESCAPE_RE.sub("", value)
+def sanitize_terminal_text(value: str, *, redact: bool = True) -> str:
+    without_escapes = TERMINAL_ESCAPE_RE.sub("", redact_secrets(value) if redact else value)
     return "".join(
         character
         for character in without_escapes
@@ -52,7 +54,7 @@ def terminal_projection(  # noqa: PLR0911
     if isinstance(value, dict):
         items = list(value.items())
         projected = {
-            sanitize_terminal_text(str(key)): terminal_projection(
+            sanitize_terminal_text(str(key), redact=False): terminal_projection(
                 item,
                 max_string=max_string,
                 max_items=max_items,

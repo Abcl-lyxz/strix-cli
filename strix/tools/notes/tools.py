@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import tempfile
 import threading
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents import RunContextWrapper, function_tool
 
 from strix.tools.nullish import clean_optional
+from strix.utils.atomic import atomic_write_text
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
@@ -88,22 +91,10 @@ def _persist() -> None:
     if path is None:
         return
     try:
-        payload = json.dumps(_notes_storage, ensure_ascii=False, default=str)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with (
-            _notes_lock,
-            tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp,
-        ):
-            tmp.write(payload)
-            tmp_path = Path(tmp.name)
-        tmp_path.replace(path)
+        with _notes_lock:
+            atomic_write_text(
+                path, lambda: json.dumps(_notes_storage, ensure_ascii=False, default=str)
+            )
     except Exception:
         logger.exception("notes persist to %s failed", path)
 

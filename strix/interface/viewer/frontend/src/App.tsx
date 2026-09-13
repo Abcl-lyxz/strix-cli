@@ -1,848 +1,1325 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeft,
-  AlertCircle,
-  Bot,
-  Mail,
-  ChevronDown,
-  Radar,
-  Rocket,
-  ArrowUpRight,
-  Building2,
+  Activity,
+  ArrowUp,
+  Bell,
+  FolderOpen,
   History,
+  Paperclip,
+  Plus,
+  Search,
+  Settings,
+  Sliders,
+  Square,
+  X,
 } from "lucide-react";
-import type { Vulnerability, VulnerabilitySeverity } from "@/types/issues";
-import { SEVERITY_COLORS } from "@/types/issues";
-import { getSeverityDot } from "@/lib/vulnerability-utils";
-import VulnerabilityDetail from "@/components/vulnerability/VulnerabilityDetail";
-import { ContentSection } from "@/components/vulnerability/ContentSection";
-import { IssueSeveritySummary } from "@/components/IssueSeveritySummary";
 import AgentGraph from "@/components/live/AgentGraph";
-import { buildGraphAgents } from "@/components/live/AgentTranscript";
-import AgentDetailModal from "@/components/live/AgentDetailModal";
-import { ScanPromptComposer } from "@/components/live/ScanPromptComposer";
-import { severityCounts, type ParsedRunSummary } from "@/lib/local-run-parser";
 import {
-  fetchAll,
-  fetchAuthStatus,
-  fetchCapabilities,
-  fetchRunSummary,
-  fetchRuns,
-  fetchTranscript,
-  fetchVulnerabilities,
-  forgetAuth,
-  parseMcpConnectionStatus,
-  type AuthStatus,
-  type LoadedRun,
-  type RunsPayload,
-} from "@/data/serverSource";
-import { SIGNUP_URL, DEMO_URL, ctaUrl, trackCta } from "@/lib/cta";
-import { runTitle } from "@/lib/target-utils";
-import Sidebar from "@/components/Sidebar";
-import PastRunsView from "@/components/PastRunsView";
-import EmailReportView from "@/components/EmailReportView";
-import { RunDetails } from "@/components/RunDetails";
-import { TrustToast } from "@/components/TrustToast";
-import FeedbackView from "@/components/FeedbackView";
-import { ProInlineCta } from "@/components/ProCta";
+  AgentTranscript,
+  buildGraphAgents,
+} from "@/components/live/AgentTranscript";
+import Markdown from "@/components/live/tool-renderers/Markdown";
+import "./workspace.css";
 
-export type View = "overview" | "issues" | "agents" | "history" | "email" | "feedback";
-
-const TRUST_BANNER =
-  "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by Strix.";
-
-const SEVERITY_ORDER: VulnerabilitySeverity[] = ["critical", "high", "medium", "low"];
-const POLL_MS = 500;
-
+type Row = Record<string, any>;
+type Dialog = {
+  title: string;
+  command?: string;
+  payload?: Row;
+  fields?: Row[];
+  rows?: Row[];
+  kind?: string;
+  error?: string;
+};
+const uid = () => crypto.randomUUID();
+const label = (row: Row) =>
+  String(row.label || row.title || row.name || row.id || row.path || "Item");
+const text = (value: any) =>
+  typeof value === "string" ? value : JSON.stringify(value, null, 2);
+async function api(path: string, options?: RequestInit) {
+  const response = await fetch(path, { cache: "no-store", ...options });
+  const value = await response.json();
+  if (!response.ok)
+    throw new Error(value.error || `Request failed (${response.status})`);
+  return value;
+}
+export async function command(
+  name: string,
+  payload: Row = {},
+  requestId: string = uid(),
+) {
+  return api("/api/app/commands", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: name, payload, request_id: requestId }),
+  });
+}
+export function mergeEvents(previous: Row[], incoming: Row[], reset = false) {
+  const map = new Map((reset ? [] : previous).map((item) => [item.id, item]));
+  incoming.forEach((item) => map.set(item.id, item));
+  return [...map.values()].slice(-5000);
+}
 export default function App() {
-  const [activeRun, setActiveRun] = useState<string | null>(null);
-  const [run, setRun] = useState<LoadedRun | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("overview");
-  const [auth, setAuth] = useState<AuthStatus | null>(null);
-  const [runs, setRuns] = useState<RunsPayload | null>(null);
-  const [emailPurpose, setEmailPurpose] = useState<"report" | "verify">("report");
-  const [emailSkipDisclosure, setEmailSkipDisclosure] = useState(false);
-  // Whether this viewer can steer a live scan (true only inside the in-TUI
-  // launcher that shares the running scan's coordinator + event loop).
-  const [canSteer, setCanSteer] = useState(false);
-
-  const refreshAuth = useCallback(async () => {
-    try {
-      setAuth(await fetchAuthStatus());
-    } catch {
-      /* auth status is best-effort; the launched run stays viewable */
-    }
-  }, []);
-
-  const refreshRuns = useCallback(async () => {
-    try {
-      setRuns(await fetchRuns());
-    } catch {
-      /* history list is best-effort */
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshAuth();
-    void refreshRuns();
-    // Capabilities never change over a session, so fetch once on mount.
-    fetchCapabilities()
-      .then((caps) => setCanSteer(caps.can_steer))
-      .catch(() => {
-        /* absence of steering is the safe default */
-      });
-  }, [refreshAuth, refreshRuns]);
-
-  // Live polling, scoped to the active run. Re-runs when the active run changes
-  // so switching to a past run (?run=<name>) reloads its data; a finished run
-  // does a single full fetch and stops.
-  const finishedRef = useRef(false);
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    finishedRef.current = false;
-
-    const schedule = () => {
-      timer = setTimeout(tick, POLL_MS);
-    };
-
-    const tick = async () => {
-      if (cancelled) return;
-      try {
-        const { summary, raw, finished } = await fetchRunSummary(activeRun);
-        if (cancelled) return;
-        if (finished && !finishedRef.current) {
-          finishedRef.current = true;
-          const full = await fetchAll(activeRun);
-          if (!cancelled) setRun(full);
-          return; // stop polling
+  const [state, setState] = useState<Row>({ setup_mode: true });
+  const [events, setEvents] = useState<Row[]>([]),
+    [agents, setAgents] = useState<Row[]>([]),
+    [findings, setFindings] = useState<Row[]>([]);
+  const [attachments, setAttachments] = useState<Row[]>([]),
+    [runs, setRuns] = useState<Row[]>([]),
+    [artifacts, setArtifacts] = useState<Row[]>([]);
+  const [view, setView] = useState("workspace"),
+    [search, setSearch] = useState(""),
+    [error, setError] = useState("");
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [showGraph, setShowGraph] = useState(false);
+  const [expanded, setExpanded] = useState(false),
+    [streamEpoch, setStreamEpoch] = useState(0);
+  const [inboxFilter, setInboxFilter] = useState("all");
+  const [online, setOnline] = useState(false),
+    [dialog, setDialog] = useState<Dialog | null>(null),
+    [filter, setFilter] = useState("");
+  const [draft, setDraft] = useState(
+    () => sessionStorage.getItem("strix-draft") || "",
+  );
+  const [delivery, setDelivery] = useState(""),
+    [historical, setHistorical] = useState<Row | null>(null);
+  const pending = useRef<{ id: string; message: string } | null>(
+      (() => {
+        try {
+          return JSON.parse(sessionStorage.getItem("strix-pending") || "null");
+        } catch {
+          return null;
         }
-        const [transcript, vulnerabilities] = await Promise.all([
-          fetchTranscript(activeRun).catch(() => ({ agents: [], events: [] })),
-          fetchVulnerabilities(summary.runId, activeRun).catch(() => [] as Vulnerability[]),
-        ]);
-        if (cancelled) return;
-        setRun((prev) => ({
-          summary,
-          raw,
-          finished,
-          transcript,
-          vulnerabilities,
-          reportMarkdown: prev?.reportMarkdown ?? null,
-        }));
-        schedule();
-      } catch (e) {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : "Could not load run data.");
-        schedule();
-      }
-    };
-
-    (async () => {
-      try {
-        const full = await fetchAll(activeRun);
-        if (cancelled) return;
-        setRun(full);
-        if (full.finished) {
-          finishedRef.current = true;
-        } else {
-          schedule();
-        }
-      } catch (e) {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : "Could not load run data.");
-        schedule();
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [activeRun]);
-
-  const counts = useMemo(
-    () => (run ? severityCounts(run.vulnerabilities) : null),
-    [run]
-  );
-  const selected = run?.vulnerabilities.find((v) => v.id === selectedId) ?? null;
-  const agentCount = run?.transcript.agents.length ?? 0;
-  const verified = auth?.verified === true;
-
-  // The run's persisted MCP roster (from run.json via /api/run), plus the set of
-  // connections with a tool call currently in flight. "In use" is derived here
-  // from the connection-tagged tool events rather than carried on the roster:
-  // an MCP dispatch event carries its connection name and a status that moves
-  // running -> completed, so a connection is in use while one of its events is
-  // still running. This mirrors the terminal UI's MCP panel exactly.
-  const mcpConnections = useMemo(
-    () => (run ? parseMcpConnectionStatus(run.raw) : []),
-    [run]
-  );
-  const mcpInUse = useMemo(() => {
-    const inUse = new Set<string>();
-    for (const event of run?.transcript.events ?? []) {
-      if (event.type !== "tool") continue;
-      const connection = event.data?.mcp_connection;
-      if (typeof connection !== "string" || !connection) continue;
-      if (event.data?.status === "running") inUse.add(connection);
+      })(),
+    ),
+    editor = useRef<HTMLTextAreaElement>(null);
+  const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runQuery = historical
+    ? `?run=${encodeURIComponent(historical.name)}`
+    : "";
+  const perform = useCallback(async (name: string, payload: Row = {}) => {
+    try {
+      setError("");
+      return await command(name, payload);
+    } catch (e) {
+      setError((e as Error).message);
+      throw e;
     }
-    return inUse;
-  }, [run]);
-
-  // Per-run guard for the default view: land on Agents while a scan is live,
-  // Overview once it finishes. Applied at most once per run and never once the
-  // user has navigated manually (userSetView flips the guard).
-  const initialViewAppliedRef = useRef(false);
-
-  // Reset the guard whenever the active run changes so the newly selected run
-  // gets its own default.
-  useEffect(() => {
-    initialViewAppliedRef.current = false;
-  }, [activeRun]);
-
-  useEffect(() => {
-    if (initialViewAppliedRef.current || !run) return;
-    if (run.finished) {
-      initialViewAppliedRef.current = true;
-      setView("overview");
-    } else if (agentCount > 0) {
-      // Live and agents have appeared: default to the agent graph. If it is
-      // live but no agents exist yet, wait (do not apply, do not set the flag).
-      initialViewAppliedRef.current = true;
-      setView("agents");
-    }
-  }, [run, agentCount]);
-
-  // User-initiated navigation: mark the default guard applied so the per-run
-  // default effect never yanks the user off the view they chose.
-  const userSetView = useCallback((v: View) => {
-    initialViewAppliedRef.current = true;
-    setView(v);
   }, []);
-
-  const selectRun = useCallback((name: string) => {
-    setActiveRun(name);
-    setSelectedId(null);
-    setRun(null);
-    setError(null);
-    // Reset the guard so the per-run default applies to the newly selected run.
-    initialViewAppliedRef.current = false;
-  }, []);
-
-  const goEmail = useCallback((skipDisclosure: boolean, surface: string) => {
-    trackCta("email_report", surface);
-    setEmailPurpose("report");
-    setEmailSkipDisclosure(skipDisclosure);
-    userSetView("email");
-  }, [userSetView]);
-
-  // Sidebar entry keeps the disclosure (first place those users see it);
-  const openEmail = useCallback(() => goEmail(false, "sidebar"), [goEmail]);
-  // the Overview CTA already states the tradeoff, so it starts the flow directly.
-  const openEmailFromOverview = useCallback(() => goEmail(true, "overview"), [goEmail]);
-
-  const openHistory = useCallback(() => {
-    void refreshRuns();
-    userSetView("history");
-  }, [refreshRuns, userSetView]);
-
-  const onPastRunsVerified = useCallback(async () => {
-    await refreshAuth();
-    await refreshRuns();
-  }, [refreshAuth, refreshRuns]);
-
-  const onForget = useCallback(async () => {
-    await forgetAuth();
-    await refreshAuth();
-    await refreshRuns();
-  }, [refreshAuth, refreshRuns]);
-
-  return (
-    <div className="min-h-screen bg-black text-white flex">
-      <Sidebar
-        view={view}
-        onSelectView={(v) => {
-          // Clicking a sidebar view always lands on that section's top level,
-          // so leaving a specific issue's detail view and clicking "Issues"
-          // returns to the full findings list.
-          setSelectedId(null);
-          if (v === "history") openHistory();
-          else userSetView(v);
-        }}
-        issuesCount={run?.vulnerabilities.length ?? 0}
-        agentCount={agentCount}
-        mcpConnections={mcpConnections}
-        mcpInUse={mcpInUse}
-        runCount={runs?.count ?? 0}
-        finished={run?.finished ?? false}
-        verified={verified}
-        email={auth?.email ?? null}
-        onOpenEmail={openEmail}
-        onOpenHistory={openHistory}
-        onForget={() => void onForget()}
-      />
-
-      <div className="flex-1 min-w-0">
-        {/* Top bar */}
-        <div className="border-b border-[#222]">
-          <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-4 flex items-center gap-1.5">
-            <a
-              href={ctaUrl("https://app.strix.ai", "logo")}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={() => trackCta("logo", "topbar")}
-              className="flex items-center gap-1.5 opacity-90 transition-opacity hover:opacity-100 lg:hidden"
-              title="Open Strix Cloud"
-            >
-              <img src="./logo.png" alt="Strix" className="w-10 h-8 object-cover" />
-              <div className="text-base text-white font-medium tracking-tight">Strix</div>
-            </a>
-            {run && <LiveIndicator finished={run.finished} />}
-            <div className="ml-auto flex items-center gap-3">
-              {verified && runs && !runs.locked && runs.runs.length > 0 && (
-                <RunSwitcher
-                  runs={runs}
-                  activeRun={activeRun}
-                  launchedName={runTitle(run?.summary.targets[0] ?? null, run?.summary.runName ?? run?.summary.runId ?? "Current run")}
-                  onSelect={selectRun}
-                />
-              )}
-              <a
-                href={ctaUrl(SIGNUP_URL, "run_in_cloud")}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => trackCta("run_in_cloud", "topbar")}
-                className="inline-flex items-center gap-1 rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-black transition-opacity hover:opacity-90"
-              >
-                Run in the cloud
-                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
-              </a>
-            </div>
-          </div>
-        </div>
-
-        <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "history" && view !== "email" && (
-            <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
-              <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
-              <p className="text-sm text-red-300">{error}</p>
-            </div>
-          )}
-
-          {/* Keyed wrapper: re-mounts on every view / finding / run change so the
-              page-in transition replays. */}
-          <div
-            key={`${activeRun ?? "launched"}:${view}:${selectedId ?? ""}`}
-            className="animate-page-in space-y-6"
-          >
-          {view === "email" ? (
-            <EmailReportView
-              activeRun={activeRun}
-              auth={auth}
-              purpose={emailPurpose}
-              skipDisclosure={emailSkipDisclosure}
-              onAuthChanged={() => {
-                void refreshAuth();
-                void refreshRuns();
-              }}
-              onExit={(dest) => setView(dest === "history" ? "history" : "overview")}
-            />
-          ) : view === "feedback" ? (
-            <FeedbackView
-              defaultEmail={auth?.email ?? null}
-              onExit={(dest) => setView(dest)}
-            />
-          ) : view === "history" ? (
-            <div className="space-y-4">
-              <div className="flex items-center gap-2">
-                <History className="w-5 h-5 text-[#888]" aria-hidden="true" />
-                <h1 className="text-2xl font-semibold text-white">Past runs</h1>
-              </div>
-              <PastRunsView
-                runs={runs}
-                activeRun={activeRun}
-                onSelectRun={selectRun}
-                onVerified={() => void onPastRunsVerified()}
-              />
-            </div>
-          ) : !run && !error ? (
-            <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
-              <div className="w-6 h-6 mx-auto mb-3 rounded-full border-2 border-[#333] border-t-white animate-spin" />
-              <p className="text-sm text-[#888]">Loading run data…</p>
-            </div>
-          ) : run && counts ? (
-            <>
-              <SummaryHeader summary={run.summary} />
-
-              {/* Tab strip: shown on small screens where the sidebar is hidden. */}
-              <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
-                <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
-                  Pentest Overview
-                </TabButton>
-                <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
-                  Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
-                </TabButton>
-                {agentCount > 0 && (
-                  <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
-                    Agents ({agentCount})
-                  </TabButton>
-                )}
-              </div>
-
-              {view === "overview" ? (
-                <OverviewTab
-                  summary={run.summary}
-                  counts={counts}
-                  total={run.vulnerabilities.length}
-                  reportMarkdown={run.reportMarkdown}
-                  raw={run.raw}
-                  finished={run.finished}
-                  onOpenEmail={openEmailFromOverview}
-                />
-              ) : view === "agents" && agentCount > 0 ? (
-                <AgentsTab run={run} canSteer={canSteer} />
-              ) : selected ? (
-                <div className="space-y-4">
-                  <button
-                    onClick={() => setSelectedId(null)}
-                    className="cursor-pointer inline-flex items-center gap-1.5 text-sm text-[#888] hover:text-white transition-colors"
-                  >
-                    <ArrowLeft className="w-4 h-4" /> Back to all findings
-                  </button>
-                  <VulnerabilityDetail vulnerability={selected} />
-                </div>
-              ) : (
-                <FindingsList
-                  vulnerabilities={run.vulnerabilities}
-                  finished={run.finished}
-                  onSelect={(id) => setSelectedId(id)}
-                />
-              )}
-            </>
-          ) : null}
-          </div>
-        </div>
-      </div>
-      <TrustToast message={TRUST_BANNER} />
-    </div>
-  );
-}
-
-function RunSwitcher({
-  runs,
-  activeRun,
-  launchedName,
-  onSelect,
-}: {
-  runs: RunsPayload;
-  activeRun: string | null;
-  launchedName: string;
-  onSelect: (name: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const activeEntry = runs.runs.find((r) => r.name === activeRun);
-  const current = activeEntry ? runTitle(activeEntry.target, activeEntry.name) : launchedName;
-  return (
-    <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-        aria-label="Switch pentest"
-        className="flex items-center gap-2 rounded-lg border border-[#3a3a3a] bg-[rgba(255,255,255,0.05)] px-3 py-2 text-sm text-white transition-colors hover:border-[#555] hover:bg-[rgba(255,255,255,0.09)]"
-      >
-        <History className="h-4 w-4 flex-shrink-0 text-[#888]" aria-hidden="true" />
-        <span className="flex-shrink-0 text-[#888]">Pentest</span>
-        <span className="max-w-[260px] truncate font-medium">{current}</span>
-        <ChevronDown className="h-4 w-4 flex-shrink-0 text-[#aaa]" aria-hidden="true" />
-      </button>
-      {open && (
-        <div
-          className="absolute right-0 z-50 mt-2 max-h-96 w-96 overflow-y-auto rounded-xl py-1.5 shadow-2xl"
-          style={{ border: "1px solid #3a3a3a", background: "#0a0a0a" }}
-        >
-          <div className="border-b border-[#222] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#666]">
-            Switch pentest
-          </div>
-          {runs.runs.map((r) => {
-            const active = r.name === activeRun;
-            return (
-              <button
-                key={r.name}
-                onMouseDown={() => onSelect(r.name)}
-                className={`flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm transition-colors hover:bg-[rgba(255,255,255,0.06)] ${
-                  active ? "bg-[rgba(255,255,255,0.04)] text-white" : "text-[#aaa]"
-                }`}
-              >
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate font-medium">{runTitle(r.target, r.name)}</span>
-                  {r.target && <span className="block truncate font-mono text-xs text-[#666]">{r.target}</span>}
-                </span>
-                {active && <span className="h-2 w-2 flex-shrink-0 rounded-full bg-emerald-400" />}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function LiveIndicator({ finished }: { finished: boolean }) {
-  if (finished) {
-    return (
-      <span className="ml-3 inline-flex items-center gap-1.5 text-xs text-[#888]">
-        <span className="w-1.5 h-1.5 rounded-full bg-[#555]" />
-        Complete
-      </span>
-    );
-  }
-  return (
-    <span className="ml-3 inline-flex items-center gap-1.5 text-xs text-emerald-400">
-      <span className="relative flex h-1.5 w-1.5">
-        <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
-        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
-      </span>
-      Live
-    </span>
-  );
-}
-
-function formatDuration(seconds: number | null): string | null {
-  if (seconds == null) return null;
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-function SummaryHeader({ summary }: { summary: ParsedRunSummary }) {
-  const duration = formatDuration(summary.durationSeconds);
-  return (
-    <div>
-      <h1 className="text-2xl font-semibold text-white">
-        {runTitle(summary.targets[0] ?? null, summary.runName ?? summary.runId ?? "Pentest results")}
-      </h1>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[#888]">
-        {summary.targets.length > 0 && (
-          <span className="font-mono text-[#aaa]">{summary.targets.join(", ")}</span>
-        )}
-        {summary.scanMode && <Meta label={summary.scanMode} />}
-        {duration && <Meta label={duration} />}
-        {summary.status && <Meta label={summary.status} />}
-      </div>
-    </div>
-  );
-}
-
-function Meta({ label }: { label: string }) {
-  return (
-    <>
-      <span className="text-[#333]">·</span>
-      <span className="capitalize">{label}</span>
-    </>
-  );
-}
-
-function FindingsList({
-  vulnerabilities,
-  finished,
-  onSelect,
-}: {
-  vulnerabilities: Vulnerability[];
-  finished: boolean;
-  onSelect: (id: string) => void;
-}) {
-  const sorted = [...vulnerabilities].sort(
-    (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
-  );
-  if (sorted.length === 0) {
-    return (
-      <div className="space-y-4">
-        <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-8 text-center text-sm text-[#888]">
-          {finished ? "No findings in this run." : "No findings yet. The pentest is still running…"}
-        </div>
-        {finished && (
-          <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-            <p className="text-sm font-medium text-white">Stay ahead of new exposures</p>
-            <p className="mt-0.5 mb-3 text-xs text-[#666]">
-              Attack surface monitoring catches new exposures for your org over time.
-            </p>
-            <ProInlineCta
-              label="Attack surface monitoring"
-              desc="Continuous coverage for your whole org."
-              slug="asm"
-              surface="empty_state"
-              icon={Radar}
-            />
-          </div>
-        )}
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-2">
-      {sorted.map((v) => (
-        <button
-          key={v.id}
-          onClick={() => onSelect(v.id)}
-          className="animate-card-in cursor-pointer w-full text-left rounded-lg border border-[#222] hover:border-[#444] bg-[rgba(255,255,255,0.02)] px-4 py-3 transition-colors flex items-center gap-3"
-        >
-          <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${getSeverityDot(v.severity)}`} aria-hidden="true" />
-          <span className="flex-1 min-w-0">
-            <span className="block text-sm font-medium text-white truncate">{v.title}</span>
-            {v.target && (
-              <span className="block text-xs text-[#666] font-mono truncate">{v.target}</span>
-            )}
-          </span>
-          <span
-            className={`text-xs font-semibold px-2 py-0.5 rounded-full border capitalize ${SEVERITY_COLORS[v.severity]}`}
-          >
-            {v.severity}
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-/** Strip a single leading markdown heading (report sections embed their own). */
-function stripLeadingHeading(md: string): string {
-  return md.replace(/^\s*#{1,6}[ \t]+.*(?:\r?\n)+/, "").trimStart();
-}
-
-function dedupeHeadings(md: string): string {
-  const out: string[] = [];
-  let lastHeading: string | null = null;
-  for (const line of md.split("\n")) {
-    const m = line.match(/^#{1,6}\s+(.*)$/);
-    if (m) {
-      const norm = m[1].trim().toLowerCase();
-      if (norm === lastHeading) continue;
-      lastHeading = norm;
-    } else if (line.trim() !== "") {
-      lastHeading = null;
+  const openList = async (
+    title: string,
+    name: string,
+    key: string,
+    kind: string,
+    payload: Row = {},
+  ) => {
+    setFilter("");
+    setDialog({ title, rows: [], kind });
+    try {
+      const data = await perform(name, payload);
+      setDialog({ title, rows: data[key] || [], kind });
+    } catch (e) {
+      setDialog((d) => d && { ...d, error: (e as Error).message });
     }
-    out.push(line);
-  }
-  return out.join("\n");
-}
-
-/** Primary local CTA: email an encrypted PDF. Verify-email affordance, no lock. */
-function EmailReportCta({ onOpenEmail }: { onOpenEmail: () => void }) {
-  return (
-    <button
-      onClick={onOpenEmail}
-      className="group w-full cursor-pointer rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] p-4 text-left transition-colors hover:border-emerald-500/40"
-    >
-      <div className="flex items-center gap-3">
-        <div
-          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg"
-          style={{ border: "1px solid rgba(16,185,129,0.3)", background: "rgba(16,185,129,0.08)" }}
-        >
-          <Mail className="h-4 w-4 text-emerald-400" aria-hidden="true" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold text-white">Email an encrypted PDF report of this run</p>
-          <p className="mt-0.5 text-xs text-[#888]">
-            Encrypted with a key only you can see, email verified with a one-time code before sending.
-          </p>
-        </div>
-        <span className="flex-shrink-0 rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-black transition-opacity group-hover:opacity-90">
-          Export report to PDF
-        </span>
-      </div>
-    </button>
-  );
-}
-
-function OverviewTab({
-  summary,
-  counts,
-  total,
-  reportMarkdown,
-  raw,
-  finished,
-  onOpenEmail,
-}: {
-  summary: ParsedRunSummary;
-  counts: Record<VulnerabilitySeverity, number>;
-  total: number;
-  reportMarkdown: string | null;
-  raw: Record<string, unknown>;
-  finished: boolean;
-  onOpenEmail: () => void;
-}) {
-  const sections = (
-    [
-      ["Executive Summary", summary.executiveSummary],
-      ["Technical Analysis", summary.technicalAnalysis],
-      ["Methodology", summary.methodology],
-      ["Recommendations", summary.recommendations],
-    ] as const
-  )
-    .filter(([, content]) => !!content)
-    .map(([title, content]) => ({ title, content: stripLeadingHeading(content as string) }));
-
-  return (
-    <div className="space-y-6">
-      <div className="animate-card-in">
-        <RunDetails raw={raw} durationSeconds={summary.durationSeconds} />
-      </div>
-
-      {total > 0 && (
-        <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-          <IssueSeveritySummary findings={{ total, ...counts }} />
-        </div>
-      )}
-
-      {/* Primary CTA: the one primary on Overview. Hidden until the run is
-          finished, since a live scan would only email a partial report. */}
-      {finished && (
-        <div className="animate-card-in">
-          <EmailReportCta onOpenEmail={onOpenEmail} />
-        </div>
-      )}
-
-      {finished && (
-        <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-          <p className="text-sm font-semibold text-white">Strix Cloud</p>
-          <p className="mt-0.5 text-xs text-[#666]">Run your next pentest in Strix Cloud.</p>
-          <div className="mt-3 flex flex-wrap gap-2.5">
-            <ProInlineCta
-              label="Run a pentest in Strix Cloud"
-              desc="Validated findings, autofix, and PR reviews."
-              slug="overview_cloud"
-              surface="overview"
-              icon={Rocket}
-              primary
-            />
-            <ProInlineCta
-              label="Try Strix Enterprise"
-              desc="SSO, compliance-ready reports, VPC or self-hosted deployment."
-              slug="book_demo"
-              surface="overview"
-              icon={Building2}
-              href={DEMO_URL}
-            />
-          </div>
-        </div>
-      )}
-
-      {sections.length > 0 ? (
-        <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5 space-y-8">
-          {sections.map((s) => (
-            <ContentSection key={s.title} title={s.title} content={s.content} />
-          ))}
-        </div>
-      ) : reportMarkdown ? (
-        <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-          <ContentSection content={dedupeHeadings(reportMarkdown)} />
-        </div>
-      ) : (
-        total === 0 && (
-          <p className="text-sm text-[#888]">No summary available for this run yet.</p>
+  };
+  const openProviders = () =>
+    openList("Connect a provider", "providers.list", "providers", "providers");
+  const openSettings = () =>
+    openList("Settings", "settings.list", "fields", "settings");
+  const openInbox = () =>
+    openList(
+      "Notifications",
+      "notifications.manage",
+      "notifications",
+      "notifications",
+      { operation: "list" },
+    );
+  const attach = (path = "") =>
+    setDialog({
+      title: "Attach a file or folder",
+      command: "attachments.add",
+      fields: [
+        { id: "path", label: "Path on this computer", value: path },
+        {
+          id: "role",
+          label: "Use as",
+          value: "context",
+          options: ["context", "target"],
+        },
+      ],
+    });
+  const completePath = (value: string) => {
+    if (completionTimer.current) clearTimeout(completionTimer.current);
+    completionTimer.current = setTimeout(() => {
+      void command("paths.complete", { query: value })
+        .then((data) =>
+          setDialog((current) =>
+            current?.command === "attachments.add"
+              ? {
+                  ...current,
+                  fields: current.fields?.map((field) =>
+                    field.id === "path"
+                      ? {
+                          ...field,
+                          suggestions: data.paths.map((item: Row) => item.path),
+                        }
+                      : field,
+                  ),
+                }
+              : current,
+          ),
         )
-      )}
-
-    </div>
+        .catch(() => {});
+    }, 180);
+  };
+  const scanOptions = () =>
+    setDialog({
+      title: "Scan options",
+      command: "setup.configure",
+      fields: [
+        {
+          id: "scan_mode",
+          label: "Scan mode",
+          value: state.scan_mode,
+          options: ["quick", "standard", "deep"],
+        },
+        {
+          id: "max_budget_usd",
+          label: "Budget (USD, blank for unlimited)",
+          value: state.max_budget_usd,
+          type: "number",
+        },
+        {
+          id: "max_turns",
+          label: "Maximum turns",
+          value: state.max_turns,
+          type: "number",
+        },
+        {
+          id: "max_agents",
+          label: "Maximum agents",
+          value: state.max_agents,
+          type: "number",
+        },
+        {
+          id: "scope_mode",
+          label: "Scope",
+          value: state.scope_mode,
+          options: ["auto", "full", "diff"],
+        },
+        { id: "diff_base", label: "Diff base", value: state.diff_base },
+      ],
+    });
+  useEffect(() => {
+    const url = new URL(location.href);
+    url.searchParams.delete("token");
+    history.replaceState(null, "", url);
+    const stream = new EventSource("/api/app/events");
+    stream.onopen = () => setOnline(true);
+    stream.onerror = () => setOnline(false);
+    stream.onmessage = (event) => {
+      let data: Row;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        setError(
+          "Invalid workspace update; reconnecting for a fresh snapshot.",
+        );
+        stream.close();
+        setOnline(false);
+        setStreamEpoch((epoch) => epoch + 1);
+        return;
+      }
+      if (data.state) setState(data.state);
+      if (data.events)
+        setEvents((old) => mergeEvents(old, data.events, data.reset));
+      if (data.agents) setAgents(data.agents);
+      if (data.findings) setFindings(data.findings);
+      if (data.attachments) setAttachments(data.attachments);
+    };
+    return () => stream.close();
+  }, [streamEpoch]);
+  useEffect(() => {
+    api("/api/capabilities")
+      .then((data) => {
+        if (data.initial_run) void browse({ name: data.initial_run });
+      })
+      .catch(() => {});
+    return () => {
+      if (completionTimer.current) clearTimeout(completionTimer.current);
+    };
+  }, []);
+  useEffect(() => {
+    sessionStorage.setItem("strix-draft", draft);
+  }, [draft]);
+  useEffect(() => {
+    if (dialog)
+      document
+        .querySelector<HTMLInputElement>("dialog input, dialog select")
+        ?.focus();
+  }, [dialog?.title]);
+  useEffect(() => {
+    if (view === "history")
+      api("/api/runs")
+        .then((data) => setRuns(data.runs))
+        .catch((e) => setError(e.message));
+  }, [view, state.scan_state]);
+  useEffect(() => {
+    if (view === "evidence")
+      api("/api/artifacts" + runQuery)
+        .then((data) => setArtifacts(data.artifacts))
+        .catch((e) => setError(e.message));
+  }, [view, runQuery, state.scan_state]);
+  const send = async () => {
+    if (!draft.trim() || delivery === "pending") return;
+    if (new TextEncoder().encode(draft).length > 262144) {
+      setError("Prompt exceeds 256 KiB. Attach a file or shorten the prompt.");
+      return;
+    }
+    if (!pending.current || pending.current.message !== draft)
+      pending.current = { id: uid(), message: draft };
+    sessionStorage.setItem("strix-pending", JSON.stringify(pending.current));
+    setDelivery("pending");
+    setError("");
+    try {
+      await command("scan.submit", { message: draft }, pending.current.id);
+      setDraft((current) => (current === draft ? "" : current));
+      pending.current = null;
+      sessionStorage.removeItem("strix-pending");
+      setDelivery("accepted");
+      editor.current?.focus();
+    } catch (e) {
+      setError((e as Error).message);
+      setDelivery("failed");
+    }
+  };
+  const browse = async (run: Row) => {
+    try {
+      const query = `?run=${encodeURIComponent(run.name)}`;
+      const [transcript, reports] = await Promise.all([
+        api("/api/transcript" + query),
+        api("/api/vulnerabilities" + query),
+      ]);
+      setHistorical({ ...run, ...transcript, findings: reports });
+      setView("workspace");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+  const choose = (row: Row) => {
+    if (dialog?.kind === "routing") {
+      setDialog({
+        title: `Advanced routing · ${row.name}`,
+        command: "providers.advanced",
+        payload: { name: row.name },
+        fields: [
+          {
+            id: "priority",
+            label: "Priority",
+            type: "number",
+            value: row.priority,
+          },
+          {
+            id: "max_concurrency",
+            label: "Concurrent requests",
+            type: "number",
+            value: row.max_concurrency,
+          },
+          {
+            id: "rpm",
+            label: "Requests per minute (blank for unlimited)",
+            type: "number",
+            value: row.rpm,
+          },
+          {
+            id: "tpm",
+            label: "Tokens per minute (blank for unlimited)",
+            type: "number",
+            value: row.tpm,
+          },
+          {
+            id: "enabled",
+            label: "Enabled",
+            type: "checkbox",
+            value: row.enabled,
+          },
+          {
+            id: "persist",
+            label: "Save as default",
+            type: "checkbox",
+            value: false,
+          },
+        ],
+      });
+    }
+    if (dialog?.kind === "profiles") {
+      void perform("routes.manage", { operation: "select", name: row.name })
+        .then(() => setDialog(null))
+        .catch(() => {});
+    }
+    if (dialog?.kind === "providers")
+      setDialog({
+        title: row.name,
+        command: "providers.connect",
+        payload: { provider_id: row.id },
+        fields: [
+          { id: "name", label: "Connection name", value: row.id },
+          { id: "base_url", label: "Endpoint", value: row.base_url },
+          { id: "api_key", label: "API key", type: "password" },
+          { id: "model_id", label: "Model ID", value: "" },
+          {
+            id: "persist",
+            label: "Save as default",
+            type: "checkbox",
+            value: false,
+          },
+        ],
+      });
+    if (dialog?.kind === "settings")
+      setDialog({
+        title: row.label,
+        command: "settings.update",
+        payload: { id: row.id },
+        fields: [
+          {
+            id: "value",
+            label: `${row.label} · ${row.source} · ${row.apply}`,
+            value: row.value,
+            type:
+              row.type === "secret"
+                ? "password"
+                : row.type === "boolean"
+                  ? "checkbox"
+                  : row.type === "number"
+                    ? "number"
+                    : "text",
+          },
+          {
+            id: "persist",
+            label: "Save as default",
+            type: "checkbox",
+            value: false,
+          },
+        ],
+      });
+    if (dialog?.kind === "commands") {
+      setDialog(null);
+      row.run();
+    }
+  };
+  const submitForm = async (form: HTMLFormElement, discover = false) => {
+    const values = new FormData(form),
+      payload: Row = { ...dialog?.payload };
+    dialog?.fields?.forEach((field) => {
+      const value = values.get(field.id);
+      payload[field.id] =
+        field.type === "checkbox"
+          ? value === "on"
+          : field.type === "number"
+            ? value === ""
+              ? null
+              : Number(value)
+            : value;
+    });
+    try {
+      if (discover) {
+        const data = await perform("providers.discover", payload);
+        setDialog(
+          (d) =>
+            d && {
+              ...d,
+              fields: d.fields?.map((field) => ({
+                ...field,
+                value: payload[field.id],
+                ...(field.id === "model_id"
+                  ? { suggestions: data.models?.map((m: Row) => m.id) }
+                  : {}),
+              })),
+              error:
+                data.error ||
+                `Models from ${data.source}. You can also enter a model ID.`,
+            },
+        );
+      } else {
+        await perform(dialog!.command!, payload);
+        setDialog(null);
+      }
+    } catch (e) {
+      setDialog((d) => d && { ...d, error: (e as Error).message });
+    }
+  };
+  const displayedAgents = historical?.agents || agents;
+  const displayedEvents = historical?.events || events;
+  const graph = useMemo(
+    () => buildGraphAgents(displayedAgents, displayedEvents),
+    [displayedAgents, displayedEvents],
   );
-}
-
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
+  const upload = async (files: FileList | null) => {
+    if (!files) return;
+    for (const file of Array.from(files)) {
+      try {
+        setDelivery("uploading");
+        await api("/api/attachments/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-File-Name": encodeURIComponent(file.name),
+          },
+          body: file,
+        });
+        setDelivery("attached");
+      } catch (e) {
+        setError((e as Error).message);
+        setDelivery("upload failed");
+        break;
+      }
+    }
+  };
+  const displayedFindings = historical?.findings || findings;
+  const visibleEvents = displayedEvents
+    .filter(
+      (event: Row) =>
+        (!selectedAgent || event.agent_id === selectedAgent) &&
+        text(event).toLowerCase().includes(search.toLowerCase()),
+    )
+    .slice(-300);
+  const palette = () => {
+    setFilter("");
+    setDialog({
+      title: "Commands",
+      kind: "commands",
+      rows: [
+        { label: "Connect provider", run: openProviders },
+        {
+          label: "Advanced routing",
+          run: () =>
+            openList(
+              "Advanced routing",
+              "providers.list",
+              "profiles",
+              "routing",
+            ),
+        },
+        {
+          label: "Choose saved model connection",
+          run: () =>
+            openList(
+              "Model connections",
+              "providers.list",
+              "profiles",
+              "profiles",
+            ),
+        },
+        {
+          label: "Test model and tool support",
+          run: () =>
+            perform("providers.test")
+              .then(() => setDelivery("Model and tool support verified"))
+              .catch(() => {}),
+        },
+        { label: "Settings", run: openSettings },
+        {
+          label: "Configure MCP",
+          run: () =>
+            setDialog({
+              title: "MCP connection · next scan",
+              command: "mcp.update",
+              fields: [
+                { id: "name", label: "Name" },
+                {
+                  id: "transport",
+                  label: "Transport",
+                  value: "http",
+                  options: ["http", "stdio"],
+                },
+                { id: "url", label: "HTTP endpoint" },
+                { id: "command", label: "Executable (stdio)" },
+                { id: "args", label: "Arguments (JSON array)", value: "[]" },
+                { id: "token", label: "Bearer token", type: "password" },
+                {
+                  id: "persist",
+                  label: "Save as default",
+                  type: "checkbox",
+                  value: false,
+                },
+              ],
+            }),
+        },
+        {
+          label: "Notification preferences",
+          run: () =>
+            setDialog({
+              title: "Notification preferences",
+              command: "notifications.preferences",
+              fields: [
+                {
+                  id: "category",
+                  label: "Category",
+                  value: "runtime",
+                  options: ["runtime", "security", "model", "scan", "storage"],
+                },
+                {
+                  id: "minimum_severity",
+                  label: "Minimum severity",
+                  value: "warning",
+                  options: ["info", "warning", "error", "critical"],
+                },
+                {
+                  id: "immediate",
+                  label: "Show immediate alerts",
+                  type: "checkbox",
+                  value: true,
+                },
+              ],
+            }),
+        },
+        { label: "Scan options", run: scanOptions },
+        { label: "Attach file or folder", run: () => attach() },
+        { label: "Notifications", run: openInbox },
+        { label: "History", run: () => setView("history") },
+      ],
+    });
+  };
   return (
-    <button
-      onClick={onClick}
-      className={`cursor-pointer relative pb-2.5 text-sm font-semibold transition-colors ${
-        active ? "text-white" : "text-[#666] hover:text-white"
-      }`}
+    <div
+      className="workspace-shell"
+      onKeyDown={(e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+          e.preventDefault();
+          palette();
+        }
+        if (e.key === "Escape") setDialog(null);
+      }}
     >
-      {children}
-      {active && <span className="absolute bottom-0 inset-x-0 h-0.5 bg-white rounded-full" />}
-    </button>
-  );
-}
-
-function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
-  const { agents, events } = run.transcript;
-  const graphAgents = useMemo(() => buildGraphAgents(agents, events), [agents, events]);
-  // Clicking a graph node opens the agent's transcript in a modal; no node selected means no modal.
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selectedAgent = selectedId ? (agents.find((a) => a.id === selectedId) ?? null) : null;
-
-  // Live steering is only possible in-process (canSteer) while the scan runs.
-  const steerable = canSteer && !run.finished;
-
-  return (
-    <div className="space-y-5">
-      <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-        <div className="flex items-center gap-2">
-          <Bot className="w-4 h-4 text-[#888]" aria-hidden="true" />
-          <h2 className="text-sm font-semibold text-white">Agent graph</h2>
-          <span className="text-xs text-[#666]">
-            {agents.length} agent{agents.length === 1 ? "" : "s"}
-          </span>
+      <aside className="workspace-nav">
+        <div className="brand">
+          <Activity size={24} />
+          <strong>strix</strong>
+          <span>LOCAL</span>
         </div>
-        <p className="mt-1 mb-4 text-xs text-[#666]">
-          Click an agent to open its full transcript.
-        </p>
-        <div className="h-[480px] rounded-lg border border-[#1a1a1a] overflow-hidden">
-          <AgentGraph
-            agents={graphAgents}
-            selectedAgentId={selectedId}
-            onSelectAgent={(id) => setSelectedId(id)}
-            eventsLoaded
-            eventsEmpty={graphAgents.size === 0}
-            scanCompleted={run.finished}
-          />
+        <button
+          className="new-scan"
+          onClick={() =>
+            perform("scan.new")
+              .then(() => {
+                setHistorical(null);
+                setView("workspace");
+              })
+              .catch(() => {})
+          }
+        >
+          <Plus size={17} />
+          New scan
+        </button>
+        {[
+          ["workspace", "Workspace", Activity],
+          ["findings", "Findings", FolderOpen],
+          ["evidence", "Evidence & reports", Paperclip],
+          ["history", "History", History],
+        ].map(([id, title, Icon]: any) => (
+          <button
+            key={id}
+            aria-current={view === id ? "page" : undefined}
+            onClick={() => setView(id)}
+          >
+            <Icon size={17} />
+            {title}
+          </button>
+        ))}
+        <div className="nav-bottom">
+          <button onClick={openInbox}>
+            <Bell size={17} />
+            Notifications{" "}
+            <span className="count">{state.notification_unread || 0}</span>
+          </button>
+          <button onClick={openSettings}>
+            <Settings size={17} />
+            Settings
+          </button>
+          <button onClick={palette}>
+            <Search size={17} />
+            Commands <kbd>Ctrl K</kbd>
+          </button>
         </div>
-      </div>
-
-      {/* Live steering: only in-process while the scan runs. Otherwise omitted. */}
-      {steerable && <ScanPromptComposer agents={agents} />}
-
-      {/* Re-run always routes to Strix Cloud. */}
-      <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-        <p className="text-sm font-semibold text-white">Run this pentest with more depth</p>
-        <p className="mt-0.5 text-xs text-[#666]">Run this pentest again in Strix Cloud.</p>
-        <div className="mt-3 flex flex-wrap gap-2.5">
-          <ProInlineCta
-            label="Re-run in Strix Pro with more depth"
-            desc="More depth, validated findings, and autofix."
-            slug="live_scan"
-            surface="agents"
-            icon={Rocket}
-            primary
-          />
-          <ProInlineCta
-            label="Try Strix Enterprise"
-            desc="SSO, compliance-ready reports, VPC or self-hosted deployment."
-            slug="book_demo"
-            surface="agents"
-            icon={Building2}
-            href={DEMO_URL}
-          />
+      </aside>
+      <main className="workspace-main">
+        <header>
+          <div>
+            <span className={online ? "status-dot online" : "status-dot"} />
+            {online ? state.scan_state || "Ready" : "Reconnecting…"}
+            <span className="muted">
+              {" "}
+              / {historical?.name || state.run_name || "New workspace"}
+            </span>
+          </div>
+          <button onClick={openProviders}>
+            {state.selected_route || state.model || "Connect provider"}
+          </button>
+        </header>
+        {error && (
+          <div role="alert" className="error-banner">
+            {error}
+            <button aria-label="Dismiss error" onClick={() => setError("")}>
+              <X size={16} />
+            </button>
+          </div>
+        )}
+        {historical && (
+          <div className="notice">
+            Viewing saved run <strong>{historical.name}</strong>
+            <button
+              onClick={() =>
+                perform("scan.resume", { run: historical.name })
+                  .then(() => {
+                    setHistorical(null);
+                    setDraft("Continue this scan.");
+                  })
+                  .catch(() => {})
+              }
+            >
+              Resume
+            </button>
+            <button onClick={() => setHistorical(null)}>
+              Return to active workspace
+            </button>
+          </div>
+        )}
+        {view === "workspace" && (
+          <>
+            <section className="workspace-feed">
+              {state.recovery?.title && (
+                <div className="notice" role="status">
+                  <strong>{state.recovery.title}</strong>
+                  <p>{state.recovery.detail}</p>
+                  <button onClick={openProviders}>
+                    Change provider or model
+                  </button>
+                  <button
+                    onClick={() =>
+                      perform("scan.retry", {
+                        agent_id: state.recovery.agent_id,
+                      }).catch(() => {})
+                    }
+                  >
+                    Retry
+                  </button>
+                  <button onClick={() => perform("scan.stop").catch(() => {})}>
+                    Stop
+                  </button>
+                </div>
+              )}
+              {state.setup_mode && !historical && (
+                <div className="welcome">
+                  <Activity size={38} />
+                  <h1>What would you like to test?</h1>
+                  <p>
+                    Describe the task, choose the scope, and attach the files
+                    you need.
+                  </p>
+                  <div className="readiness">
+                    <span>
+                      {state.api_key_configured
+                        ? "Credential configured"
+                        : "Provider setup needed"}
+                    </span>
+                    <span>{state.scan_mode || "deep"} scan</span>
+                    <span>{state.target_count || 0} targets</span>
+                  </div>
+                  {state.recent_runs?.length > 0 && (
+                    <div className="recent-home">
+                      <p>Recent sessions</p>
+                      {state.recent_runs.slice(0, 3).map((run: Row) => (
+                        <button key={run.name} onClick={() => browse(run)}>
+                          {run.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {displayedAgents.length > 0 && (
+                <>
+                  <div className="agent-strip">
+                    <button onClick={() => setShowGraph(!showGraph)}>
+                      {showGraph ? "Hide graph" : "Agent graph"}
+                    </button>
+                    <button onClick={() => setSelectedAgent(null)}>
+                      All agents
+                    </button>
+                    {displayedAgents.map((agent: Row) => (
+                      <button
+                        key={agent.id}
+                        onClick={() => setSelectedAgent(agent.id)}
+                        aria-pressed={selectedAgent === agent.id}
+                      >
+                        {agent.name}{" "}
+                        <small>
+                          {agent.wait_kind === "provider"
+                            ? "provider required"
+                            : agent.status}
+                        </small>
+                      </button>
+                    ))}
+                  </div>
+                  {showGraph && (
+                    <div style={{ height: 360 }}>
+                      <AgentGraph
+                        agents={graph}
+                        selectedAgentId={selectedAgent}
+                        onSelectAgent={setSelectedAgent}
+                        eventsLoaded
+                        eventsEmpty={!displayedEvents.length}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+              {displayedEvents.length > 0 && (
+                <label className="search">
+                  <Search size={16} />
+                  <input
+                    aria-label="Search transcript"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search transcript and tool output"
+                  />
+                </label>
+              )}
+              {visibleEvents.map((event: Row, index: number) => {
+                const data = event.data || event;
+                if (event.type === "tool")
+                  return (
+                    <AgentTranscript
+                      key={event.id || index}
+                      agent={
+                        displayedAgents.find(
+                          (a: Row) => a.id === event.agent_id,
+                        ) || {
+                          id: event.agent_id,
+                          name: event.agent_id,
+                          status: "running",
+                        }
+                      }
+                      events={[event as any]}
+                      showHeader={false}
+                    />
+                  );
+                return (
+                  <article className="event" key={event.id || index}>
+                    <div className="event-label">
+                      {data.role ||
+                        data.tool_name ||
+                        data.name ||
+                        event.type ||
+                        "Event"}
+                      <small>{event.agent_id}</small>
+                    </div>
+                    {data.content || data.text || data.message ? (
+                      <Markdown
+                        text={text(data.content || data.text || data.message)}
+                      />
+                    ) : (
+                      <details>
+                        <summary>{data.status || "Details"}</summary>
+                        <pre>{text(data)}</pre>
+                      </details>
+                    )}
+                  </article>
+                );
+              })}
+              {!historical &&
+                state.messages?.map((message: Row) => (
+                  <div className={`notice ${message.level}`} key={message.id}>
+                    {message.text}
+                  </div>
+                ))}
+            </section>
+            {!historical && (
+              <section
+                className={
+                  expanded ? "composer-panel expanded" : "composer-panel"
+                }
+              >
+                <div className="chips">
+                  {state.targets?.map((target: string, index: number) => (
+                    <span key={target}>
+                      Target · {target}
+                      <button
+                        aria-label={`Remove target ${target}`}
+                        onClick={() =>
+                          perform("setup.remove_target", {
+                            target,
+                            target_id: state.target_ids?.[index],
+                          }).catch(() => {})
+                        }
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  {attachments.map((item) => (
+                    <span key={item.id} title={item.workspace_path}>
+                      {item.role} · {item.name}
+                      <button
+                        aria-label={`Remove ${item.name}`}
+                        onClick={() =>
+                          perform("attachments.remove", { id: item.id }).catch(
+                            () => {},
+                          )
+                        }
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <textarea
+                  ref={editor}
+                  aria-label="Prompt"
+                  placeholder="Describe your task. Enter adds a new line."
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (
+                      (e.ctrlKey || e.metaKey) &&
+                      e.key.toLowerCase() === "e"
+                    ) {
+                      e.preventDefault();
+                      setExpanded((value) => !value);
+                    }
+                    if (
+                      (e.ctrlKey || e.metaKey) &&
+                      e.key.toLowerCase() === "s"
+                    ) {
+                      e.preventDefault();
+                      void send();
+                    }
+                    if (e.key === "Tab") {
+                      const before = draft.slice(
+                        0,
+                        e.currentTarget.selectionStart,
+                      );
+                      const match = before.match(
+                        /(?:^|\s)@("[^"]*"?|'[^']*'?|[^\s]*)$/,
+                      );
+                      if (match) {
+                        e.preventDefault();
+                        attach(match[1]);
+                        completePath(match[1]);
+                      }
+                    }
+                  }}
+                />
+                <button
+                  className="expand-editor"
+                  onClick={() => setExpanded((value) => !value)}
+                >
+                  {expanded ? "Collapse editor" : "Expand editor"} · Ctrl E
+                </button>
+                <div className="composer-actions">
+                  <button onClick={() => attach()}>
+                    <Paperclip size={16} />
+                    Attach path
+                  </button>
+                  <label className="upload-button">
+                    Upload files
+                    <input
+                      aria-label="Upload files"
+                      type="file"
+                      multiple
+                      onChange={(e) => {
+                        void upload(e.target.files);
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                  <button
+                    onClick={() =>
+                      setDialog({
+                        title: "Add scan target",
+                        command: "setup.add_target",
+                        fields: [
+                          {
+                            id: "target",
+                            label: "URL, file, folder, domain, or IP",
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    Add target
+                  </button>
+                  <button onClick={scanOptions}>
+                    <Sliders size={16} />
+                    {state.scan_mode || "deep"}
+                  </button>
+                  <span className="delivery" role="status">
+                    {delivery}
+                  </span>
+                  {state.scan_started &&
+                    !["completed", "stopped", "failed"].includes(
+                      state.scan_state,
+                    ) && (
+                      <button
+                        onClick={() => perform("scan.stop").catch(() => {})}
+                      >
+                        <Square size={14} />
+                        Stop
+                      </button>
+                    )}
+                  <button
+                    className="send"
+                    disabled={
+                      !draft.trim() || delivery === "pending" || !online
+                    }
+                    onClick={send}
+                  >
+                    <ArrowUp size={17} />
+                    Send <kbd>Ctrl S</kbd>
+                  </button>
+                </div>
+                <small>
+                  Enter for a newline · Ctrl+S to send · @path + Tab to attach ·
+                  Draft saved in this browser tab
+                </small>
+                {state.pending_mount && (
+                  <div className="notice">
+                    Mount {state.pending_mount} as supporting context?
+                    <button
+                      onClick={() =>
+                        perform("setup.confirm_mount", {
+                          approved: true,
+                        }).catch(() => {})
+                      }
+                    >
+                      Mount folder
+                    </button>
+                    <button
+                      onClick={() =>
+                        perform("setup.confirm_mount", {
+                          approved: false,
+                        }).catch(() => {})
+                      }
+                    >
+                      Continue without it
+                    </button>
+                  </div>
+                )}
+              </section>
+            )}
+          </>
+        )}
+        {view === "history" && (
+          <section className="page">
+            <h1>Local history</h1>
+            {runs.length === 0 && <p>No saved scans yet.</p>}
+            {runs.map((run) => (
+              <button
+                className="run-row"
+                key={run.name}
+                onClick={() => browse(run)}
+              >
+                <div>
+                  <strong>{run.name}</strong>
+                  <p>{run.target}</p>
+                </div>
+                <span>{run.status}</span>
+              </button>
+            ))}
+          </section>
+        )}
+        {view === "findings" && (
+          <section className="page">
+            <h1>
+              Findings <span className="muted">{displayedFindings.length}</span>
+            </h1>
+            {!displayedFindings.length && <p>No findings recorded.</p>}
+            {displayedFindings.map((finding: Row, i: number) => (
+              <details className="finding" key={finding.id || i}>
+                <summary>
+                  <span className={`severity ${finding.severity}`}>
+                    {finding.severity}
+                  </span>
+                  {finding.title || finding.name}
+                </summary>
+                <Markdown
+                  text={Object.entries(finding)
+                    .filter(
+                      ([k, v]) =>
+                        typeof v === "string" &&
+                        !["id", "title", "severity"].includes(k),
+                    )
+                    .map(([k, v]) => `### ${k.replaceAll("_", " ")}\n${v}`)
+                    .join("\n\n")}
+                />
+              </details>
+            ))}
+          </section>
+        )}
+        {view === "evidence" && (
+          <section className="page">
+            <h1>Evidence & reports</h1>
+            <p>Download artifacts directly from this computer.</p>
+            <a
+              className="artifact"
+              href={"/api/report/pdf" + runQuery}
+              download
+            >
+              Download PDF report
+            </a>
+            {artifacts.map((item) => (
+              <a
+                className="artifact"
+                key={item.path}
+                href={`/api/artifact?path=${encodeURIComponent(item.path)}${historical ? `&run=${encodeURIComponent(historical.name)}` : ""}`}
+                download
+              >
+                <Paperclip size={17} />
+                {item.path}
+                <span>{Math.ceil(item.size / 1024)} KiB</span>
+              </a>
+            ))}
+          </section>
+        )}
+      </main>
+      {dialog && (
+        <div
+          className="dialog-backdrop"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setDialog(null);
+          }}
+        >
+          <dialog
+            open
+            aria-modal="true"
+            aria-label={dialog.title}
+            onKeyDown={(e) => {
+              if (e.key !== "Tab") return;
+              const items = Array.from(
+                e.currentTarget.querySelectorAll<HTMLElement>(
+                  "button:not(:disabled),input,select,textarea,a[href]",
+                ),
+              );
+              const first = items[0],
+                last = items[items.length - 1];
+              if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault();
+                last?.focus();
+              } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first?.focus();
+              }
+            }}
+          >
+            <div className="dialog-title">
+              <h2>{dialog.title}</h2>
+              <button aria-label="Close dialog" onClick={() => setDialog(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            {dialog.error && (
+              <p role="status" className="notice">
+                {dialog.error}
+              </p>
+            )}
+            {dialog.fields && (
+              <form
+                key={dialog.fields.map((f) => `${f.id}:${f.value}`).join("|")}
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void submitForm(e.currentTarget);
+                }}
+              >
+                {dialog.fields.map((field) => (
+                  <label key={field.id}>
+                    {field.label}
+                    {field.options ? (
+                      <select name={field.id} defaultValue={field.value}>
+                        {field.options.map((option: string) => (
+                          <option key={option}>{option}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        name={field.id}
+                        type={field.type || "text"}
+                        defaultValue={
+                          field.type === "checkbox"
+                            ? undefined
+                            : (field.value ?? "")
+                        }
+                        defaultChecked={
+                          field.type === "checkbox" && !!field.value
+                        }
+                        list={
+                          field.suggestions ? field.id + "-models" : undefined
+                        }
+                        onChange={
+                          field.id === "path"
+                            ? (e) => completePath(e.target.value)
+                            : undefined
+                        }
+                        autoComplete={
+                          field.type === "password" ? "new-password" : "off"
+                        }
+                      />
+                    )}
+                    {field.suggestions && (
+                      <datalist id={field.id + "-models"}>
+                        {field.suggestions.map((model: string) => (
+                          <option key={model} value={model} />
+                        ))}
+                      </datalist>
+                    )}
+                  </label>
+                ))}
+                <div className="form-actions">
+                  {dialog.command === "providers.connect" && (
+                    <button
+                      type="button"
+                      onClick={(e) => submitForm(e.currentTarget.form!, true)}
+                    >
+                      Discover models
+                    </button>
+                  )}
+                  <button className="primary" type="submit">
+                    Apply
+                  </button>
+                </div>
+              </form>
+            )}
+            {dialog.rows && (
+              <>
+                {dialog.kind === "notifications" && (
+                  <select
+                    aria-label="Notification filter"
+                    value={inboxFilter}
+                    onChange={(e) => setInboxFilter(e.target.value)}
+                  >
+                    <option value="all">All notifications</option>
+                    <option value="unread">Unread</option>
+                    <option value="error">Errors</option>
+                    <option value="run">Current run</option>
+                  </select>
+                )}
+                <input
+                  aria-label="Filter items"
+                  placeholder="Search…"
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                />
+                <div className="dialog-list">
+                  {dialog.rows
+                    .filter(
+                      (row) =>
+                        (dialog.kind !== "notifications" ||
+                          inboxFilter === "all" ||
+                          (inboxFilter === "unread" && row.unread) ||
+                          (inboxFilter === "error" &&
+                            ["error", "critical"].includes(row.severity)) ||
+                          (inboxFilter === "run" &&
+                            row.run_id === state.run_name)) &&
+                        text(row).toLowerCase().includes(filter.toLowerCase()),
+                    )
+                    .map((row, i) =>
+                      dialog.kind === "notifications" ? (
+                        <article
+                          className={`notification ${row.unread ? "unread" : ""}`}
+                          key={row.id}
+                        >
+                          <strong>{row.title}</strong>
+                          <p>{row.detail}</p>
+                          <small>
+                            {row.severity} · {row.count || 1} events
+                          </small>
+                          <div>
+                            <button
+                              onClick={() =>
+                                perform("notifications.manage", {
+                                  operation: "read",
+                                  id: row.id,
+                                })
+                                  .then(openInbox)
+                                  .catch(() => {})
+                              }
+                            >
+                              Mark read
+                            </button>
+                            <button
+                              onClick={() =>
+                                perform("notifications.manage", {
+                                  operation: "dismiss",
+                                  id: row.id,
+                                })
+                                  .then(openInbox)
+                                  .catch(() => {})
+                              }
+                            >
+                              Dismiss
+                            </button>
+                            {row.actions?.map((action: Row, index: number) => (
+                              <button
+                                key={index}
+                                onClick={() =>
+                                  perform("notifications.manage", {
+                                    operation: "action",
+                                    id: row.id,
+                                    index,
+                                  })
+                                    .then((result) => {
+                                      if (result.action === "open_routes")
+                                        void openProviders();
+                                      else if (
+                                        result.action === "retry_route_test"
+                                      )
+                                        void perform("providers.test").catch(
+                                          () => {},
+                                        );
+                                      else if (result.action === "dismiss") {
+                                        void perform("notifications.manage", {
+                                          operation: "dismiss",
+                                          id: result.target,
+                                        })
+                                          .then(openInbox)
+                                          .catch(() => {});
+                                      } else {
+                                        if (result.action === "open_agent")
+                                          setSelectedAgent(result.target);
+                                        setDialog(null);
+                                        setView(
+                                          result.action === "open_finding"
+                                            ? "findings"
+                                            : "workspace",
+                                        );
+                                      }
+                                    })
+                                    .catch(() => {})
+                                }
+                              >
+                                {action.label || action.action}
+                              </button>
+                            ))}
+                          </div>
+                        </article>
+                      ) : (
+                        <button
+                          className="list-row"
+                          key={row.id || i}
+                          onClick={() => choose(row)}
+                        >
+                          <span>{label(row)}</span>
+                          <small>
+                            {row.source || row.description || row.apply}
+                          </small>
+                        </button>
+                      ),
+                    )}
+                </div>
+              </>
+            )}
+          </dialog>
         </div>
-      </div>
-
-      <AgentDetailModal
-        open={selectedAgent !== null}
-        agent={selectedAgent}
-        events={events}
-        steerable={steerable}
-        onClose={() => setSelectedId(null)}
-      />
+      )}
     </div>
   );
 }

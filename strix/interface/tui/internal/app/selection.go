@@ -27,6 +27,12 @@ func (m *Model) showToast(text string) tea.Cmd {
 }
 
 func (m *Model) showToastFor(text string, duration time.Duration) tea.Cmd {
+	if m.toast != "" {
+		if len(m.toastQueue) < 50 {
+			m.toastQueue = append(m.toastQueue, text)
+		}
+		return nil
+	}
 	m.toastID++
 	m.toast = text
 	id := m.toastID

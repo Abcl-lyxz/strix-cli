@@ -17,6 +17,33 @@ if TYPE_CHECKING:
     from strix.config.settings import Settings
 
 
+_session_routes: dict[str, RouteConfig] = {}
+_session_selected: list[str] | None = None
+_session_revision = 0
+
+
+def session_routes() -> dict[str, RouteConfig]:
+    return dict(_session_routes)
+
+
+def session_revision() -> int:
+    return _session_revision
+
+
+def invalidate_session_routes() -> None:
+    global _session_revision  # noqa: PLW0603
+    _session_revision += 1
+
+
+def set_session_route(route: RouteConfig, *, select: bool = True) -> None:
+    """Explicit workspace edits take precedence over flags and saved defaults."""
+    global _session_selected, _session_revision  # noqa: PLW0603
+    _session_routes[route.name.casefold()] = route
+    if select:
+        _session_selected = [route.name]
+    _session_revision += 1
+
+
 def _object_dict(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
@@ -55,6 +82,10 @@ def load_routes(settings: Settings, *, selected: list[str] | None = None) -> lis
                     headers_ref=headers_ref if isinstance(headers_ref, str) else None,
                 )
             ]
+    for name, edited in _session_routes.items():
+        routes = [route for route in routes if route.name.casefold() != name]
+        routes.append(edited)
+    selected = _session_selected if _session_selected is not None else selected
     if selected:
         wanted = {name.casefold() for name in selected}
         routes = [route for route in routes if route.name.casefold() in wanted]

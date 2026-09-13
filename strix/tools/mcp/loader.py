@@ -37,6 +37,14 @@ _ONLY_ENV_VAR = "STRIX_MCP_ONLY"
 _EXCLUDE_ENV_VAR = "STRIX_MCP_EXCLUDE"
 
 
+def config_path() -> Path:
+    return _resolve_path(None)
+
+
+def set_session_config(config: McpConnectionConfig) -> None:
+    _session_configs[config.name] = config
+
+
 def _resolve_path(path: Path | None) -> Path:
     if path is not None:
         return path
@@ -100,7 +108,16 @@ def _apply_run_selection(configs: list[McpConnectionConfig]) -> list[McpConnecti
     return selected
 
 
+_session_configs: dict[str, McpConnectionConfig] = {}
+
+
 def load_user_mcp_configs(path: Path | None = None) -> list[McpConnectionConfig]:
+    configs = {c.name: c for c in _load_user_mcp_configs(path)}
+    configs.update(_session_configs)
+    return list(configs.values())
+
+
+def _load_user_mcp_configs(path: Path | None = None) -> list[McpConnectionConfig]:
     """Load MCP connection configs from the user's JSON file.
 
     The path is ``path`` if given, else ``$STRIX_MCP_CONFIG``, else

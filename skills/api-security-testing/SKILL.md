@@ -11,7 +11,6 @@ metadata:
 
 APIs fail differently from web UIs: there is no rendered surface to crawl, the interesting bugs are authorization-shaped rather than injection-shaped, and the same endpoint behaves differently per token. This workflow targets those specifics with Strix's autonomous agents, using the current [OWASP API Security Top 10 (2023)](https://owasp.org/API-Security/editions/2023/en/0x11-t10/) as the coverage checklist. For the web-app equivalent, the current edition is the OWASP Top 10:2025 — see **owasp-top-10-testing**.
 
-Install, LLM setup, full CLI flags, and the managed-cloud path are in the **penetration-testing-with-strix** skill. Read it if `strix --version` fails or the target is not an API. For a run with no Docker and no LLM key, the same binary drives the managed platform: `strix cloud login`, then `strix cloud scans start ...` (details in **managed-pentesting-with-strix**).
 
 ## 1. Gather what the agents need
 
@@ -46,7 +45,6 @@ Out of scope: POST /billing/*, POST /notifications/broadcast."
 - **Add the backend source for depth:** `-t ./services/api -t https://api.staging.example.com`. With code access the agents can reason about authorization checks and object ownership rather than inferring them from responses.
 - **gRPC:** target the endpoint and pass the definition as a workspace file, `-t https://grpc.staging.example.com --workspace-file ./service.proto`. Only `.json`, `.yaml`, and `.yml` specs are recognized as targets, so `-t ./service.proto` fails with "Path exists but is not a directory".
 - **GraphQL:** point at the GraphQL endpoint and say whether introspection is enabled; call out that you want batching/aliasing abuse, depth/complexity limits, and per-field authorization tested.
-- **Internal/private APIs** unreachable from your machine: use the managed platform's network connector — see **managed-pentesting-with-strix**.
 - Use `--instruction-file` when the credential/context block gets long, and keep tokens out of shell history and out of committed files.
 - **Supporting files** the agents should read but not test, such as an endpoint wordlist or handwritten notes about the tenancy model: pass `--workspace-file ./notes.md`. The file lands read-only in `/workspace`. Add `:DEST` to choose the path, for example `--workspace-file ./wordlist.txt:lists/wordlist.txt`.
 

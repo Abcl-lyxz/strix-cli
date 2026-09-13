@@ -83,6 +83,9 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		}
 		draft := m.takeDraft(envelope.RequestID, result.Command)
 		if !result.OK {
+			if m.modal == modalWorkspace && result.Error != nil {
+				m.dialog.Error = result.Error.Message
+			}
 			m.restoreDraft(draft)
 			if result.Command == "collection.resync" {
 				if collection := m.resyncRequests[envelope.RequestID]; collection != "" {
@@ -111,6 +114,9 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			return nil
 		}
 		m.errorText = ""
+		if cmd, handled := m.workspaceResult(result); handled {
+			return cmd
+		}
 		switch result.Command {
 		case "viewer.open":
 			var data struct {
@@ -235,6 +241,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 }
 
 func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) tea.Cmd {
+	var commands []tea.Cmd
 	if m.seenMessages == nil {
 		m.seenMessages = map[string]bool{}
 	}
@@ -251,7 +258,18 @@ func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) tea
 			continue
 		}
 		if !setupMode {
-			return m.showToastFor(message.Text, 7*time.Second)
+			if (message.Level == "error" || message.Level == "critical") && m.toast != "" {
+				m.toastQueue = append([]string{message.Text}, m.toastQueue...)
+				if len(m.toastQueue) > 50 {
+					m.toastQueue = m.toastQueue[:50]
+				}
+				continue
+			}
+			cmd := m.showToastFor(message.Text, 7*time.Second)
+			if cmd != nil {
+				commands = append(commands, cmd)
+			}
+			continue
 		}
 		style := render.Dim()
 		switch message.Level {
@@ -262,7 +280,7 @@ func (m *Model) consumeMessages(messages []protocol.Message, setupMode bool) tea
 		}
 		m.setupMsg(message.Text, style)
 	}
-	return nil
+	return tea.Batch(commands...)
 }
 
 func validCollection(name string) bool {

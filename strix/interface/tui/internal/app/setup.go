@@ -13,8 +13,10 @@ import (
 )
 
 func (m Model) submit(value string) (tea.Model, tea.Cmd) {
-	if model, cmd, handled := m.submitSlashCommand(value); handled {
-		return model, cmd
+	if !m.pastedDraft {
+		if model, cmd, handled := m.submitSlashCommand(value); handled {
+			return model, cmd
+		}
 	}
 	if m.snapshot.SetupMode {
 		return m.submitSetupPrompt(value)
@@ -36,36 +38,14 @@ func (m Model) submit(value string) (tea.Model, tea.Cmd) {
 // instruction, and the prompt alone is enough to launch. With no target, the
 // backend scans the current working directory.
 func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
-	var commands []tea.Cmd
-	fields := strings.Fields(value)
-	targets := 0
-	for _, field := range fields {
-		token := strings.Trim(field, ",;")
-		if !looksLikeTarget(token) || m.hasTarget(token) {
-			continue
-		}
-		targets++
-		commands = append(commands, send(m.client, "setup.add_target", map[string]any{"target": token}))
+	payload := map[string]any{"message": value}
+	candidate := strings.TrimSpace(value)
+	if !strings.ContainsAny(candidate, "\n\r\t ") && looksLikeTarget(candidate) {
+		payload["target"] = candidate
 	}
-	if len(fields) > targets {
-		commands = append(commands, send(m.client, "setup.set_instruction", map[string]any{"instruction": value}))
-	}
-	// The backend verifies the model connection before either kind of launch
-	// and reports on it through the setup log. A bare prompt mounts the working
-	// directory - the backend asks about that from the live view, so the prompt
-	// is held here in case it is declined.
-	payload := map[string]any{}
-	if targets == 0 && len(m.snapshot.Targets) == 0 {
-		m.pendingPrompt = value
-		payload["mount_working_dir"] = true
-	}
-	m.rememberDraft("setup.start", value)
-	commands = append(commands, sendWithDraft(m.client, "setup.start", payload, value))
-	// Ordered, not batched: setup.start leaves setup mode, so it must be the
-	// last command to reach the backend. Batched sends race, and if setup.start
-	// wins the target and instruction commands land after the guard closes and
-	// fail with a red error.
-	return *m, tea.Sequence(commands...)
+	m.rememberDraft("scan.submit", value)
+	return *m, sendWithDraft(m.client, "scan.submit", payload, value)
+
 }
 
 // answerMountConfirmation replies to the working-directory mount the backend is
@@ -433,6 +413,12 @@ func (m Model) setupComposer(width int) string {
 	inner := max(1, width-4)
 	body := m.highlightInputSelection(m.inputView())
 	body += "\n\n" + m.setupSummaryView(inner)
+	for _, item := range m.snapshot.Attachments {
+		body += "\n" + truncate(fmt.Sprint(item["role"])+" · "+fmt.Sprint(item["name"]), inner)
+	}
+	if len(m.snapshot.RecentRuns) > 0 && m.height >= 35 {
+		body += "\n" + render.Dim().Render("Recent · "+fmt.Sprint(m.snapshot.RecentRuns[0]["name"])+" · /sessions")
+	}
 	if targets := m.setupTargetsView(inner); targets != "" {
 		body += "\n" + targets
 	}
@@ -458,10 +444,10 @@ func (m Model) setupSummaryView(width int) string {
 		}
 	} else {
 		chips = append(chips, render.Col(amber).Render("○ no model")+
-			render.Dim().Render(" · type /model provider/model"))
+			render.Dim().Render(" · /connect to set up"))
 	}
 	if m.snapshot.APIKeyConfigured {
-		chips = append(chips, render.Dim().Render("key saved"))
+		chips = append(chips, render.Dim().Render("credential ready"))
 	}
 	if m.snapshot.MaxBudgetUSD != nil {
 		chips = append(chips, render.Dim().Render(fmt.Sprintf("$%.2f budget", *m.snapshot.MaxBudgetUSD)))
@@ -514,9 +500,9 @@ func (m Model) setupHintsView(width int) string {
 	key := lipgloss.NewStyle().Foreground(white).Render
 	label := render.Dim().Render
 	hint := func(k, text string) string { return key(k) + label(" "+text) }
-	left := hint("enter", "launch scan") + label("   ") + hint("/", "commands") + label("   ") + hint("ctrl+c", "quit")
+	left := hint("ctrl+s", "Send") + label("   ") + hint("/", "commands") + label("   ") + hint("ctrl+c", "quit")
 	if lipgloss.Width(left) > inner {
-		left = hint("enter", "launch scan")
+		left = hint("ctrl+s", "Send")
 	}
 	right := label("v" + appVersion)
 	gap := inner - lipgloss.Width(left) - lipgloss.Width(right)

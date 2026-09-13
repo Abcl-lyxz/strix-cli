@@ -1,6 +1,6 @@
 ---
 name: fix-security-vulnerabilities-with-strix
-description: Fix security vulnerabilities found by a Strix pentest (open-source CLI or app.strix.ai cloud) — triage by severity, patch the root cause rather than the symptom, and re-run Strix to prove each fix actually closes the exploit. Handles injection, XSS, SSRF, broken access control, IDOR, and other validated findings. Use after a Strix scan reports findings, or when the user asks to remediate, patch, or fix security issues from a strix_runs report, vulnerabilities.json, findings.sarif, or a cloud scan.
+description: Remediate local Strix findings and verify each fix by rerunning a scoped scan.
 license: Apache-2.0
 metadata:
   author: usestrix
@@ -18,7 +18,6 @@ Get the findings from wherever the scan ran:
 - **OSS CLI** — artifacts in `strix_runs/<run-name>/`:
   - `vulnerabilities/*.md` — one finding per file: description, severity, PoC steps or script, affected code locations, remediation guidance.
   - `vulnerabilities.json` — the same findings as JSON (ids, severity, CWE/CVE, `code_locations` with `fix_before`/`fix_after` suggestions when available).
-- **Cloud (app.strix.ai)** — pull findings with the CLI: `strix cloud vulns list --scan-id <scan-id> --json` (or `strix cloud scans get <scan-id> --json | jq '.vulnerabilities'`, or `strix cloud vulns list --severity critical` org-wide). Each finding carries `severity, cwe, endpoint, method, impact, technical_analysis, poc_description, poc_script_code` and, for code findings, `code_file`/`code_diff`/`code_before`/`code_after`. After a fix is verified, mark it with `strix cloud vulns update <id> --status fixed`. See the **managed-pentesting-with-strix** skill for `strix cloud login` and scopes.
 
 Order work by severity: critical → high → medium → low. Every Strix finding was validated with a working proof-of-concept, so do not dismiss findings as false positives without re-testing the PoC yourself.
 
@@ -35,7 +34,7 @@ Common finding classes and expected fixes: injection → parameterization/escapi
 
 ## 3. Verify by re-running Strix
 
-After fixing, re-scan scoped to the fixed area and confirm the finding is gone. Verify in whichever environment you scanned (or both):
+After fixing, re-scan scoped to the fixed area and confirm the finding is gone. Use the same local scope:
 
 **OSS CLI:**
 ```bash
@@ -62,12 +61,6 @@ strix -n -t ./ --instruction "Verify the SQL injection in app/api/search.py is f
 ```
 Exit codes: `2` = findings remain (read the new `strix_runs/<run>/vulnerabilities/` and iterate); `0` = clean **for what was analyzed**. Before trusting a `0`, confirm the run wasn't cut short — check `run.json` for a completed status and compare its `llm_usage.cost` with `--max-budget`: a hard budget stop leaves `status: "stopped"`, but a run that wrapped up on a budget warning records `"completed"` with partial coverage. Give verification enough budget to finish, and prefer re-running the specific PoC as the ground-truth signal.
 
-**Cloud:** rerun with the same config and re-poll, then confirm the finding no longer appears:
-```bash
-new_id=$(curl -sS "$BASE/scans/$scan_id/rerun" "${auth[@]}" -X POST | jq -r .scan_id)
-# poll GET /scans/$new_id until completed, then check its vulnerabilities[]
-```
-Or, if the cloud scan came from a repo/PR, trigger a fresh PR review on the fix branch (`POST /pr-reviews/start`). The platform also retests a single finding directly: `POST /api/v1/vulnerabilities/{vulnerabilityId}/retest`.
 
 - Also re-run the PoC manually when it is a simple request/script — fastest signal.
 - Run the project's own test suite to make sure the fix does not break behavior.

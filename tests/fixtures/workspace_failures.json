@@ -1,0 +1,12 @@
+{
+  "provider_errors": [
+    "Error code: 400 - {'error': {'message': 'Assistant tool call example.arguments must be valid JSON.', 'type': 'bad_response_status_code'}}",
+    "Validation: messages[2].tool_calls[2].function.arguments must be a valid JSON object string"
+  ],
+  "history": [
+    {"type": "function_call", "name": "list_notes", "call_id": "broken", "arguments": "{\"category\":"},
+    {"type": "function_call_output", "call_id": "broken", "output": "Recorded result from an older session"},
+    {"type": "function_call", "name": "write_stdin", "call_id": "completed", "arguments": "{\"session_id\": 7, \"chars\": \"hello\\n\"}"},
+    {"type": "function_call_output", "call_id": "completed", "output": "Already executed once"}
+  ]
+}

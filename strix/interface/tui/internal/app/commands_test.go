@@ -181,17 +181,14 @@ func TestUnknownAbsolutePathRemainsPromptText(t *testing.T) {
 	}
 }
 
-func TestMissingCommandArgumentDoesNotSendBackendCommand(t *testing.T) {
+func TestMissingCommandArgumentOpensForm(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.snapshot = protocol.Snapshot{SetupMode: true}
-
 	updated, cmd, handled := model.submitSlashCommand("/target")
-	if !handled || cmd != nil || connection.Len() != 0 {
-		t.Fatalf("missing target reached backend: handled=%v cmd=%v frames=%d", handled, cmd, connection.Len())
-	}
-	if log := updated.(Model).setupLog; len(log) == 0 || !strings.Contains(ansi.Strip(log[len(log)-1]), "Usage") {
-		t.Fatalf("missing argument did not show usage: %#v", log)
+	result := updated.(Model)
+	if !handled || cmd != nil || connection.Len() != 0 || result.modal != modalWorkspace || result.dialog.Command != "setup.add_target" {
+		t.Fatalf("target did not open a local form: %#v", result.dialog)
 	}
 }
 

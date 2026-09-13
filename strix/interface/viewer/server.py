@@ -4,12 +4,8 @@ Design notes:
 - Uses only the standard library (no new runtime dependency). The workload is
   serving static files plus a handful of JSON reads off disk, so an async stack
   buys nothing here.
-- The browser polls the JSON endpoints (~1s) rather than using SSE: a finished
-  run stops polling, and short-lived polls survive sleep/network blips without
-  server-side connection state, which suits a stdlib ThreadingHTTPServer.
-- All reads happen per-request straight from disk, so the same server serves a
-  live in-progress run and a finished one identically; the SPA distinguishes
-  them via the ``finished`` flag on /api/run.
+- Workspace changes use incremental server-sent events and a fresh snapshot on
+  reconnect. Historical reports and transcripts are read from disk on demand.
 """
 
 from __future__ import annotations
@@ -17,17 +13,18 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import re
 import secrets
 import threading
+import time
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from strix.core.paths import run_record_path
-from strix.interface.viewer import auth
 from strix.interface.viewer.transcript import (
     build_run_state,
     primary_target,
@@ -78,17 +75,11 @@ def run_list_entry(run_dir: Path) -> dict[str, Any]:
     }
 
 
-def build_runs_payload(base_dir: Path, *, verified: bool) -> dict[str, Any]:
-    """The /api/runs payload. Gates the run list behind email verification.
-
-    The count is always advertised so the UI can tease the history, but the
-    entries only appear once the viewer is verified.
-    """
+def build_runs_payload(base_dir: Path, *, verified: bool = True) -> dict[str, Any]:
+    """All local history is available to an authorized workspace client."""
+    del verified  # Compatibility for embedders; verification gates were removed.
     run_dirs = _iter_run_dirs(base_dir)
-    count = len(run_dirs)
-    if not verified:
-        return {"locked": True, "count": count, "runs": []}
-    return {"locked": False, "count": count, "runs": [run_list_entry(d) for d in run_dirs]}
+    return {"locked": False, "count": len(run_dirs), "runs": [run_list_entry(d) for d in run_dirs]}
 
 
 def resolve_run_dir(base_dir: Path, run_param: str | None, default_run_dir: Path) -> Path | None:
@@ -120,8 +111,10 @@ class _ViewerState:
         run_dir: Path,
         assets_dir: Path,
         steer_handler: Callable[[str, str], bool] | None = None,
+        workspace: Any = None,
     ) -> None:
         self.run_dir = run_dir
+        self.workspace = workspace
         self.assets_dir = assets_dir
         # The strix_runs directory that holds the launched run; used to
         # enumerate and resolve other runs for the history list.
@@ -149,7 +142,11 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         server_version = "StrixViewer/1.0"
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-            logger.debug("viewer %s - %s", self.address_string(), format % args)
+            logger.debug(
+                "viewer %s - %s",
+                self.address_string(),
+                re.sub(r"([?&]token=)[^ &\"]+", r"\1<redacted>", format % args),
+            )
 
         def do_GET(self) -> None:
             parts = urlsplit(self.path)
@@ -169,305 +166,228 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
         def do_POST(self) -> None:
-            path = urlsplit(self.path).path
             try:
-                if path == "/api/event":
-                    self._handle_event()
-                elif path == "/api/auth/otp/start":
-                    self._handle_otp_start()
-                elif path == "/api/auth/otp/verify":
-                    self._handle_otp_verify()
-                elif path == "/api/auth/forget":
-                    self._handle_forget()
-                elif path == "/api/report/send":
-                    self._handle_report_send()
-                elif path == "/api/feedback":
-                    self._handle_feedback()
-                elif path == "/api/agents/steer":
-                    self._handle_steer()
+                self._body_remaining = max(0, int(self.headers.get("Content-Length") or 0))
+            except ValueError:
+                self._body_remaining = 0
+            path = urlsplit(self.path).path
+            if not self._has_session() or not self._same_origin():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            try:
+                if path == "/api/attachments/upload" and state.workspace is not None:
+                    self._upload_attachment()
+                elif path == "/api/app/commands" and state.workspace is not None:
+                    body = self._read_body()
+                    result = state.workspace.command(body)
+                    self._send_json(HTTPStatus.OK, result)
+                elif path == "/api/agents/steer" and state.steer_handler is not None:
+                    body = self._read_body()
+                    message = body.get("message")
+                    agent_id = body.get("agent_id")
+                    if (
+                        not isinstance(message, str)
+                        or not message.strip()
+                        or len(message.encode()) > 262144
+                    ):
+                        raise ValueError("Message must be between 1 byte and 256 KiB")  # noqa: TRY301
+                    if not isinstance(agent_id, str) or not agent_id.strip():
+                        raise ValueError("Select an agent")  # noqa: TRY301
+                    self._send_json(HTTPStatus.OK, {"ok": state.steer_handler(agent_id, message)})
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
-            except BrokenPipeError:
-                logger.debug("viewer client disconnected during POST %s", path)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except (ValueError, TypeError, RuntimeError, OSError) as exc:
+                from strix.security.secrets import redact_secrets
+
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": redact_secrets(str(exc))})
             except Exception:
-                # A bad request must never kill the worker thread.
-                logger.exception("viewer request failed: POST %s", path)
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
+                logger.exception("Local workspace command failed")
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Command failed; see local diagnostics"},
+                )
+
+        def _upload_attachment(self) -> None:
+            from uuid import uuid4
+
+            from strix.interface.attachments import MAX_ATTACHMENT_BYTES
+
+            size = int(self.headers.get("Content-Length") or 0)
+            if size < 0 or size > MAX_ATTACHMENT_BYTES:
+                raise ValueError("Attachment exceeds 250 MiB")
+            name = unquote(self.headers.get("X-File-Name") or "attachment")
+            if not name or name in {".", ".."} or any(c in name for c in "/\\\0\r\n:"):
+                raise ValueError("Use a filename without directories")
+            destination = state.base_dir / ".uploads" / uuid4().hex / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.connection.settimeout(60)
+                remaining = size
+                with destination.open("xb") as output:
+                    while remaining:
+                        chunk = self.rfile.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            raise ValueError("Upload interrupted; no attachment was added")  # noqa: TRY301
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                        self._body_remaining = remaining
+                result = state.workspace.command(
+                    {
+                        "command": "attachments.add",
+                        "payload": {"path": str(destination), "role": "context"},
+                        "request_id": uuid4().hex,
+                    }
+                )
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+            self._send_json(HTTPStatus.OK, result)
+
+        def _same_origin(self) -> bool:
+            if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                return False
+            origin = self.headers.get("Origin")
+            if not origin:
+                return True
+            parsed = urlsplit(origin)
+            return parsed.scheme in {"http", "https"} and parsed.netloc == self.headers.get("Host")
 
         def _read_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
-            try:
-                body = json.loads(raw or b"{}")
-            except json.JSONDecodeError:
-                return {}
-            return body if isinstance(body, dict) else {}
+            if length < 0 or length > 2 * 1024 * 1024:
+                raise ValueError("Request exceeds the 2 MiB limit")
+            raw = self.rfile.read(length)
+            self._body_remaining = max(0, length - len(raw))
+            body = json.loads(raw or b"{}")
+            if not isinstance(body, dict):
+                raise TypeError("Expected a JSON object")
+            return cast("dict[str, Any]", body)
 
-        # Funnel events the viewer is allowed to forward. This handler is the
-        # trust boundary: only these event names, with only their known props,
-        # ever reach PostHog. Everything else (including any PII) is dropped.
-        _EMAIL_EVENTS = frozenset(
-            {"email_submitted", "email_verified", "report_sent", "work_email_required"}
-        )
-
-        def _handle_event(self) -> None:
-            body = self._read_body()
-            # Forwarded as anonymous PostHog events that respect the global
-            # telemetry opt-out. Never forward the email, code, or report body:
-            # only the whitelisted event names and their known props are passed.
-            event = body.get("event")
-            if event == "cta_clicked":
-                from strix.telemetry import posthog
-
-                cta = str(body.get("cta") or "unknown")
-                surface = body.get("surface")
-                posthog.viewer_cta_clicked(cta, surface=str(surface) if surface else None)
-            elif event in self._EMAIL_EVENTS:
-                from strix.telemetry import posthog
-
-                purpose = body.get("purpose")
-                posthog.viewer_email_event(str(event), purpose=str(purpose) if purpose else None)
-            elif event == "agent_steered":
-                from strix.telemetry import posthog
-
-                posthog.viewer_agent_steered()
-            self.send_response(HTTPStatus.NO_CONTENT)
-            self.end_headers()
-
-        def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:
-            # The cross-run history list (/api/runs) unlocks its entries only for
-            # a caller that holds this process's session capability *and* is
-            # email verified, so merely reaching an exposed --host port never
-            # leaks the run list (the payload still advertises the count as a
-            # teaser).
-            if path == "/api/runs":
-                unlocked = self._has_session() and auth.is_verified()
-                payload = build_runs_payload(state.base_dir, verified=unlocked)
-                self._send_json(HTTPStatus.OK, payload)
-                return
-            if path == "/api/capabilities":
-                # Steering is only possible when the viewer shares a live scan's
-                # coordinator + event loop (the TUI launcher wires a handler).
-                self._send_json(HTTPStatus.OK, {"can_steer": state.steer_handler is not None})
-                return
-            if path == "/api/auth/status":
-                self._handle_auth_status()
-                return
-
-            # All remaining GET endpoints expose run metadata or scan output.
-            # Require the capability even for the run used to launch the viewer;
-            # reachability of an exposed --host port must not grant data access.
+        def _handle_api(  # noqa: PLR0911, PLR0912, PLR0915 - one authenticated endpoint dispatch
+            self, path: str, query: dict[str, list[str]]
+        ) -> None:
             if not self._has_session():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
-
-            run_values = query.get("run")
-            run_param = run_values[0] if run_values else None
-            run_dir = resolve_run_dir(state.base_dir, run_param, state.run_dir)
+            if path == "/api/runs":
+                self._send_json(HTTPStatus.OK, build_runs_payload(state.base_dir))
+                return
+            if path == "/api/capabilities":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "can_steer": state.workspace is not None or state.steer_handler is not None,
+                        "workspace": state.workspace is not None,
+                        "initial_run": getattr(state.workspace, "initial_run", None),
+                    },
+                )
+                return
+            if path == "/api/app/state" and state.workspace is not None:
+                self._send_json(HTTPStatus.OK, state.workspace.snapshot())
+                return
+            if path == "/api/app/events" and state.workspace is not None:
+                self._stream_workspace()
+                return
+            default = state.workspace.run_dir() if state.workspace is not None else None
+            run_dir = resolve_run_dir(
+                state.base_dir, (query.get("run") or [""])[0], default or state.run_dir
+            )
             if run_dir is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown run"})
                 return
-
-            # Any run other than the one used to launch the viewer is part of the
-            # email-gated history. The session check above applies to both paths;
-            # verification adds a second gate for historical run data.
-            if run_dir.resolve() != state.run_dir.resolve() and not auth.is_verified():
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unverified"})
-                return
-
             if path == "/api/run":
                 self._send_json(HTTPStatus.OK, read_run_summary(run_dir))
             elif path == "/api/vulnerabilities":
                 self._send_json(HTTPStatus.OK, read_vulnerabilities(run_dir))
             elif path == "/api/report":
                 self._send_json(HTTPStatus.OK, {"markdown": read_report_markdown(run_dir)})
+            elif path == "/api/report/pdf":
+                from strix.interface.viewer.report_pdf import generate_report_pdf
+
+                content = generate_report_pdf(run_dir)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition", 'attachment; filename="strix-report.pdf"')
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
             elif path == "/api/transcript":
                 self._send_json(HTTPStatus.OK, build_run_state(run_dir))
+            elif path == "/api/artifacts":
+                self._send_json(HTTPStatus.OK, {"artifacts": self._artifacts(run_dir)})
+            elif path == "/api/artifact":
+                requested = (query.get("path") or [""])[0]
+                allowed = {entry["path"] for entry in self._artifacts(run_dir)}
+                if requested not in allowed:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown artifact"})
+                    return
+                target = (run_dir / requested).resolve()
+                if run_dir.resolve() not in target.parents:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                content = target.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header(
+                    "Content-Disposition",
+                    "attachment; filename*=UTF-8''" + quote(target.name),
+                )
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(content)
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
 
-        def _handle_auth_status(self) -> None:
-            # The cached verified email is only disclosed to a caller holding this
-            # process's session capability, so a cookie-less client on an exposed
-            # --host port cannot read it; everyone else looks unverified.
-            # Verification is reported through is_verified() so an expired record
-            # is advertised as unverified -- otherwise the SPA would suppress
-            # re-verification while history stays locked, stranding the user.
-            if not self._has_session():
-                self._send_json(HTTPStatus.OK, {"verified": False, "email": None})
-                return
-            record = auth.read_auth()
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "verified": auth.is_verified(),
-                    "email": record.get("email") if record else None,
-                },
-            )
+        @staticmethod
+        def _artifacts(run_dir: Path) -> list[dict[str, Any]]:
+            files = [
+                run_dir / name
+                for name in ("penetration_test_report.md", "vulnerabilities.json", "findings.sarif")
+            ]
+            for folder in ("vulnerabilities", "browser"):
+                directory = run_dir / folder
+                if directory.is_dir():
+                    files.extend(directory.rglob("*"))
+            root = run_dir.resolve()
+            return [
+                {"path": f.relative_to(run_dir).as_posix(), "size": f.stat().st_size}
+                for f in files
+                if f.is_file() and not f.is_symlink() and root in f.resolve().parents
+            ][:2000]
 
-        def _handle_otp_start(self) -> None:
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            email = str(self._read_body().get("email") or "").strip()
-            if not email:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_email"})
-                return
+        def _stream_workspace(self) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            previous: dict[str, Any] = {}
+            cursor: int | None = None
             try:
-                auth.otp_start(email)
-            except auth.RelayError as exc:
-                self._send_relay_error(exc)
+                while not state.workspace.closed:
+                    payload = state.workspace.snapshot(cursor)
+                    if previous and payload["state"].get("run_name") != previous.get(
+                        "state", {}
+                    ).get("run_name"):
+                        payload = state.workspace.snapshot()
+                    cursor = payload.pop("cursor")
+                    delta = {
+                        key: value for key, value in payload.items() if value != previous.get(key)
+                    }
+                    previous = payload
+                    if delta:
+                        event = "snapshot" if payload.get("reset") else "update"
+                        self.wfile.write(
+                            ("data: " + json.dumps({"type": event, **delta}) + "\n\n").encode()
+                        )
+                    else:
+                        self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, RuntimeError):
                 return
-            self._send_json(HTTPStatus.OK, {"ok": True})
-
-        def _handle_otp_verify(self) -> None:
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            body = self._read_body()
-            email = str(body.get("email") or "").strip()
-            code = str(body.get("code") or "").strip()
-            if not email or not code:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_code"})
-                return
-            try:
-                result = auth.otp_verify(email, code)
-            except auth.RelayError as exc:
-                self._send_relay_error(exc)
-                return
-            auth.write_auth(
-                email=result.get("email") or email,
-                token=result["token"],
-                verified_at=result.get("expires_at") or "",
-            )
-            verified_email = result.get("email") or email
-            self._send_json(HTTPStatus.OK, {"verified": True, "email": verified_email})
-
-        def _handle_forget(self) -> None:
-            # Clearing the cached verification is a state change, so it requires
-            # this process's session capability: a cookie-less caller on an
-            # exposed --host port must not be able to log the operator out.
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            auth.forget()
-            self._send_json(HTTPStatus.OK, {"ok": True})
-
-        def _handle_report_send(self) -> None:
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            record = auth.read_auth()
-            if record is None:
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unverified"})
-                return
-            run_param = str(self._read_body().get("run") or "") or None
-            run_dir = resolve_run_dir(state.base_dir, run_param, state.run_dir)
-            if run_dir is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown run"})
-                return
-
-            summary = read_run_summary(run_dir)
-            # Emailing only makes sense for a completed run; a live scan would
-            # send a partial report. The UI hides the entry point, but fail
-            # closed here too so the endpoint can't be driven mid-scan.
-            if not summary.get("finished", False):
-                self._send_json(HTTPStatus.CONFLICT, {"error": "run_not_finished"})
-                return
-
-            from strix.interface.viewer.report_pdf import build_encrypted_report
-
-            pdf_bytes, password, filename = build_encrypted_report(run_dir)
-            run_name = str(summary.get("run_name") or run_dir.name)
-            target = primary_target(summary) or "unknown target"
-            try:
-                # The password is intentionally NOT passed here; only the
-                # encrypted PDF bytes reach the relay.
-                auth.report_send(record["token"], pdf_bytes, filename, run_name, target)
-            except auth.RelayError as exc:
-                self._send_relay_error(exc)
-                return
-            # The password is returned only to a session-authorized browser.
-            self._send_json(
-                HTTPStatus.OK,
-                {"ok": True, "password": password, "filename": filename},
-            )
-
-        # Cap on a feedback message so a runaway client cannot flood the relay.
-        _FEEDBACK_MESSAGE_MAX = 5000
-
-        def _handle_feedback(self) -> None:
-            # Requires this process's session capability, like the other POSTs,
-            # so an exposed --host port can't be used to spam the relay.
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            body = self._read_body()
-            email = str(body.get("email") or "").strip()
-            message = str(body.get("message") or "").strip()
-            if not email:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_email"})
-                return
-            if not message:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_message"})
-                return
-            message = message[: self._FEEDBACK_MESSAGE_MAX]
-            try:
-                auth.feedback_submit(email, message)
-            except auth.RelayError as exc:
-                self._send_relay_error(exc)
-                return
-            # Server-authoritative: fire only after a successful relay (respects
-            # the telemetry opt-out; no message/email content is sent).
-            from strix.telemetry import posthog
-
-            posthog.viewer_feedback_submitted()
-            self._send_json(HTTPStatus.OK, {"ok": True})
-
-        # Cap on a steering message so a runaway client cannot flood the agent.
-        _STEER_MESSAGE_MAX = 4000
-
-        def _handle_steer(self) -> None:
-            if not self._has_session():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            body = self._read_body()
-            agent_id = body.get("agent_id")
-            message = body.get("message")
-            if not isinstance(agent_id, str) or not agent_id.strip():
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_agent_id"})
-                return
-            if (
-                not isinstance(message, str)
-                or not message.strip()
-                or len(message) > self._STEER_MESSAGE_MAX
-            ):
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_message"})
-                return
-            if state.steer_handler is None:
-                # Standalone / finished-run viewing has no live scan to steer.
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "steering_unavailable"})
-                return
-            delivered = state.steer_handler(agent_id, message)
-            if delivered:
-                self._send_json(HTTPStatus.OK, {"ok": True})
-            else:
-                self._send_json(HTTPStatus.OK, {"ok": False, "error": "not_delivered"})
-
-        def _send_relay_error(self, exc: auth.RelayError) -> None:
-            status_by_code = {
-                "rate_limited": HTTPStatus.TOO_MANY_REQUESTS,
-                "invalid_email": HTTPStatus.BAD_REQUEST,
-                "invalid_message": HTTPStatus.BAD_REQUEST,
-                "work_email_required": HTTPStatus.BAD_REQUEST,
-                "invalid_code": HTTPStatus.FORBIDDEN,
-                "reverify": HTTPStatus.UNAUTHORIZED,
-                "forbidden": HTTPStatus.FORBIDDEN,
-                "too_large": HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "unavailable": HTTPStatus.BAD_GATEWAY,
-            }
-            status = status_by_code.get(exc.code, HTTPStatus.BAD_GATEWAY)
-            self._send_json(status, {"error": exc.code})
 
         def _cookies(self) -> dict[str, str]:
             jar: dict[str, str] = {}
@@ -538,7 +458,19 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             return candidate if candidate.is_file() else None
 
         def _send_json(self, status: HTTPStatus, payload: Any) -> None:
-            body = json.dumps(payload).encode("utf-8")
+            from strix.interface.viewer.workspace import public_value
+
+            # Closing a socket with unread request bytes can discard the error
+            # response on Windows. Drain small rejected bodies with a deadline.
+            remaining = getattr(self, "_body_remaining", 0)
+            if status >= 400 and 0 < remaining <= 1024 * 1024:
+                try:
+                    self.connection.settimeout(1)
+                    self.rfile.read(remaining)
+                except (OSError, TimeoutError):
+                    pass
+                self._body_remaining = 0
+            body = json.dumps(public_value(payload)).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -566,6 +498,7 @@ def serve(
     port: int = 0,
     open_browser: bool = True,
     steer_handler: Callable[[str, str], bool] | None = None,
+    workspace: Any = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -581,7 +514,9 @@ def serve(
     ``None`` (standalone ``strix view``), steering is reported unavailable.
     """
     assets_dir = bundle_dir()
-    state = _ViewerState(run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler)
+    state = _ViewerState(
+        run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler, workspace=workspace
+    )
     handler = _make_handler(state)
 
     try:
@@ -610,7 +545,7 @@ def _open_browser(url: str) -> None:
     try:
         webbrowser.open(url)
     except Exception:  # noqa: BLE001 - launching the browser is best-effort
-        logger.debug("could not open browser for %s", url, exc_info=True)
+        logger.debug("could not open local browser", exc_info=True)
 
 
 __all__ = ["authorized_url", "bundle_dir", "bundle_is_built", "serve"]

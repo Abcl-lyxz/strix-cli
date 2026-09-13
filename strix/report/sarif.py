@@ -51,10 +51,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+
+from strix.utils.atomic import atomic_write_text
 
 
 logger = logging.getLogger(__name__)
@@ -323,14 +324,7 @@ def write_sarif_report(
         repository_context=repository_context,
         coverage=coverage,
     )
-    tmp_path = output_path.with_name(f"{output_path.name}.{os.getpid()}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as sarif_file:
-            json.dump(sarif, sarif_file, ensure_ascii=False, indent=2)
-            sarif_file.write("\n")
-        tmp_path.replace(output_path)  # atomic on the same filesystem
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_text(output_path, json.dumps(sarif, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_sarif(

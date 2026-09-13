@@ -195,3 +195,31 @@ async def test_run_cycle_does_not_retry_permanent_error(
     streams = [_FakeStream(exc=bad_request), _FakeStream()]
     with pytest.raises(BadRequestError):
         await _run_once(monkeypatch, streams)
+
+
+@pytest.mark.asyncio
+async def test_malformed_provider_response_is_bounded_without_crash_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = BadRequestError(
+        "Assistant tool call x.arguments must be valid JSON.",
+        response=httpx.Response(400, request=_request()),
+        body=None,
+    )
+    with pytest.raises(BadRequestError):
+        await _run_once(monkeypatch, [_FakeStream(exc=error) for _ in range(3)])
+
+
+@pytest.mark.asyncio
+async def test_malformed_response_recovers_without_replaying_a_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = BadRequestError(
+        "Assistant tool call x.arguments must be valid JSON.",
+        response=httpx.Response(400, request=_request()),
+        body=None,
+    )
+    streams = [_FakeStream(exc=error), _FakeStream()]
+    result, attempts, _ = await _run_once(monkeypatch, streams)
+    assert result is streams[1]
+    assert attempts == 2

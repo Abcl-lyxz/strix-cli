@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from strix.core.sessions import session_write_lock
+from strix.notifications import notify
+from strix.utils.atomic import atomic_write_text
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from agents.items import TResponseInputItem
     from agents.memory import Session
@@ -72,6 +73,7 @@ class AgentCoordinator:
         self._parent_notified: set[str] = set()
         self._lock = asyncio.Lock()
         self._snapshot_path: Path | None = None
+        self._snapshot_lock = asyncio.Lock()
         self.is_shutting_down = False
         self._budget_stopped = False
         self._reserve_stopped = False
@@ -584,23 +586,30 @@ class AgentCoordinator:
         path = self._snapshot_path
         if path is None:
             return
-        try:
-            data = await self.snapshot()
-            payload = json.dumps(data, ensure_ascii=False, default=str)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                tmp.write(payload)
-                tmp_path = Path(tmp.name)
-            tmp_path.replace(path)
-        except Exception:
-            logger.exception("coordinator snapshot to %s failed", path)
+        async with self._snapshot_lock:
+            try:
+                data = await self.snapshot()
+                write = asyncio.create_task(
+                    asyncio.to_thread(
+                        atomic_write_text, path, json.dumps(data, ensure_ascii=False, default=str)
+                    )
+                )
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    # Keep the destination lock until the worker has flushed. Otherwise
+                    # a cancelled capture can replace the next scan's newer snapshot.
+                    await write
+                    raise
+            except OSError:
+                logger.exception("coordinator snapshot to %s failed", path)
+                notify(
+                    "storage.failed",
+                    title="Agent state could not be saved",
+                    detail=str(path),
+                    severity="error",
+                    dedupe_key=f"storage:{path}",
+                )
 
 
 def coordinator_from_context(ctx: dict[str, Any]) -> AgentCoordinator | None:

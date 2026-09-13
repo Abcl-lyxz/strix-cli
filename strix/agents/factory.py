@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from strix.agents.prompt import render_system_prompt
 from strix.config import load_settings
+from strix.llm.tool_arguments import InvalidToolArgumentsError, parse_tool_arguments
 from strix.tools.agents_graph.tools import (
     agent_finish,
     create_agent,
@@ -26,6 +27,7 @@ from strix.tools.agents_graph.tools import (
     view_agent_graph,
     wait_for_agents,
 )
+from strix.tools.browser.tool import browser_action
 from strix.tools.coverage.tools import list_coverage, record_coverage, update_coverage
 from strix.tools.finish.tool import finish_scan
 from strix.tools.load_skill.tool import load_skill, search_skills
@@ -261,6 +263,10 @@ def _with_coerced_arguments(tool: FunctionTool) -> FunctionTool:
     nullish = tool.name.startswith(_QUERY_TOOL_PREFIXES)
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
+        try:
+            parse_tool_arguments(raw_input)
+        except InvalidToolArgumentsError:
+            return f"{tool.name}: arguments must be a valid JSON object. No action was executed."
         return await invoke_tool(ctx, _coerce_arguments(raw_input, schema, nullish=nullish))
 
     tool.on_invoke_tool = invoke
@@ -336,7 +342,10 @@ def _bound_custom_tool(tool: CustomTool) -> CustomTool:
     invoke_tool = tool.on_invoke_tool
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
-        return await _bound_result(await invoke_tool(ctx, raw_input))
+        try:
+            return await _bound_result(await invoke_tool(ctx, raw_input))
+        except (ValueError, ValidationError) as exc:
+            return _format_tool_error(exc)
 
     tool.on_invoke_tool = invoke
     return tool
@@ -560,6 +569,7 @@ def _finish_tool_use_behavior(
 
 
 _BASE_TOOLS: tuple[Tool, ...] = (
+    browser_action,
     think,
     search_skills,
     load_skill,

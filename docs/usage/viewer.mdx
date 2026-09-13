@@ -1,49 +1,32 @@
 ---
-title: "Local Web Viewer"
-description: "Browse a run in a local dashboard with strix view"
+title: "Local workspace"
+description: "Start, control, resume, and review scans in the TUI or browser"
 ---
 
-Every scan writes its results to disk as it runs. `strix view` serves those files in a local dashboard, for a live run or a finished one.
+Run `strix` for the terminal workspace, or `strix view` for the local browser workspace. Both open without a target or an existing run. `strix view RUN` opens a saved run. Headless automation keeps the existing `-n`, `--target`, mode, scope, and limit flags.
 
-```bash
-strix view                                    # the most recent run
-strix view my-run-name                        # a specific run under ./strix_runs
-strix view --host 0.0.0.0 --port 8080 --no-open
-```
+## Compose and configure
 
-The UI ships prebuilt with Strix, so there is no extra install and no JavaScript build step. The dashboard reads the run files straight off disk. Nothing leaves your machine, and you do not need a cloud account.
+Enter inserts a newline. **Ctrl+S sends**; both interfaces show a Send action. Pasting never submits or executes slash commands. Prompts accept Unicode, indentation, and blank lines up to 256 KiB. The browser keeps failed drafts in the current tab, and both transports deduplicate acknowledged requests.
 
-## Options
+In the terminal, **Ctrl+K** opens the searchable command palette, **Ctrl+E** expands the composer, `/editor` opens an external editor, and Alt+Up/Down recalls drafts. `/settings` includes an external-editor setting; `VISUAL` and `EDITOR` remain fallbacks. Slash commands without arguments open forms; argument shortcuts still work.
 
-<ParamField path="run" type="string">
-  Run name under `./strix_runs`. Defaults to the most recent run.
-</ParamField>
+Use `/connect` or **Connect provider** to choose a provider, enter a masked key, discover models, and select an exact model ID. Custom gateways use an explicit endpoint. Discovery identifies cached or configured results when offline and allows manual entry. **Test model and tool support** verifies the same transport used by scans. `/routes` selects an existing connection; `/routing` or **Advanced routing** edits priorities, concurrency, and request limits. Settings show their source and when changes apply. Explicit edits override this session; **Save as default** persists them. Provider changes apply at the next call; sandbox, integration, and MCP changes apply to the next scan.
 
-<ParamField path="--host" type="string" default="127.0.0.1">
-  Host to bind to. Use `0.0.0.0` to reach the viewer from other machines.
-</ParamField>
+## Targets and attachments
 
-<ParamField path="--port" type="number" default="0">
-  Port to serve on. The default selects an available ephemeral port.
-</ParamField>
+Use **Add target** or `/target` for explicit scan scope. A standalone URL or path can also start a scan. URLs in ordinary prose do not silently expand scope. `/attach`, **Attach path**, or **Upload files** adds supporting context. `@path` followed by Tab opens path completion in the terminal. Attachments accept files, folders, spaces, quoted Windows paths, Unicode names, and binaries; binary bytes are never inserted into model text. The limit is 250 MiB or 2,000 files per attachment. Explicit attachments are copied into `/workspace/attachments/...` and the agent receives that actual sandbox path. APK-specific analysis is not provided.
 
-<ParamField path="--no-open" type="boolean">
-  Do not open the browser automatically.
-</ParamField>
+## Live work and reports
 
-## What Is In The Dashboard
+The browser provides scan creation, resume, stop, prompts, settings, a selectable notification inbox, searchable transcripts, agent graphs, findings, browser evidence, and local downloads. One process owns one active scan; historical runs remain browsable. Abandoned runs are marked interrupted and can be resumed. The event stream reconnects with a fresh snapshot and bounds rendered history.
 
-- **Overview** — run status, target, and a severity breakdown of everything found so far.
-- **Vulnerabilities** — each validated finding with its severity, details, and reproduction steps.
-- **Agent graph** — a live map of the multi-agent team, and what each agent is doing.
-- **Steering** — send instructions to a live scan to redirect the agents during the run. Steering works only in the dashboard the running scan opens. A standalone `strix view` has no live scan to steer.
-- **History** — browse past runs on this machine and move between them. Verify your email address in the dashboard to unlock the other runs.
-- **Reports** — generate a shareable report and send it by email. Verify your email address first.
+All local history is unlocked. Reports download locally as Markdown, JSON, SARIF, or PDF. There are no managed-cloud commands, promotions, email gates, hosted report delivery, or outbound usage analytics. Provider credentials remain in the local credential store.
 
-## Sharing The Link
+The browser requires the per-process authorization link printed at startup. It exchanges the link token for an HttpOnly, SameSite cookie, enforces origin checks on commands, and confines artifact downloads to the selected run. Treat the startup link as access to your local workspace.
 
-<Warning>
-  The token in the printed URL grants access to the run data, and to the steering of a live scan. Share it only with trusted users.
-</Warning>
+## Recovery and diagnostics
 
-To reach the viewer from another machine, start it with `--host 0.0.0.0` and replace `0.0.0.0` in the printed URL with a reachable IP address or hostname. Restrict the port with your firewall. A request without the token-derived session cannot read run data.
+Malformed tool arguments are quarantined from model history while the original transcript and completed results are retained. Recovery is limited to two attempts per turn. The inbox distinguishes retries, provider repair, authentication, stopped execution, and actual user-input waits. Repeated route errors update one incident per run and provider.
+
+Local snapshots use serialized atomic writes with bounded Windows sharing retries. Failed saves remain visible and prevent a successful completion status. Shutdown flushes outstanding writes. Use `/storage` for exact local diagnostic paths.

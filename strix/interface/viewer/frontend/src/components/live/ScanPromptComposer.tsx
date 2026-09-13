@@ -8,7 +8,6 @@ import {
 } from "react";
 import { ArrowUp, ChevronDown, ChevronUp, Loader2, Sparkles } from "lucide-react";
 import { steerAgent, type TranscriptAgent } from "@/data/serverSource";
-import { track } from "@/lib/cta";
 import { cn } from "@/lib/utils";
 
 const ROOT_TARGET_VALUE = "__root__";
@@ -129,7 +128,6 @@ export function ScanPromptComposer({
     if (res.ok) {
       setValue("");
       setFeedback(`Sent to ${name}`);
-      track("agent_steered");
     } else if (res.error === "not_delivered") {
       setFeedback("Could not reach that agent (it may have finished).");
     } else {
@@ -243,7 +241,7 @@ export function ScanPromptComposer({
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
               e.preventDefault();
               void handleSend();
             }
@@ -256,7 +254,7 @@ export function ScanPromptComposer({
       </div>
 
       <div className="flex items-center justify-between gap-3 px-4 pb-4">
-        <div className="text-xs text-[#666]">{feedback ?? "Press Enter to send."}</div>
+        <div className="text-xs text-[#666]">{feedback ?? "Ctrl+S sends. Enter adds a new line."}</div>
         <button
           type="button"
           onClick={(event) => {

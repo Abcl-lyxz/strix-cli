@@ -213,14 +213,14 @@ func TestWindowsMultilinePasteNormalizesCRLFWithoutDroppingLines(t *testing.T) {
 	}
 }
 
-func TestEnterSubmitsExactMultilineMessage(t *testing.T) {
+func TestCtrlSSubmitsExactMultilineMessage(t *testing.T) {
 	connection := &recordingConn{}
 	model := inputModel(t)
 	model.client = newClient(connection)
 	model.snapshot.Agents = []protocol.Agent{{ID: "agent-1", Name: "Strix", Status: "running"}}
 	want := "  first\nsecond \n"
 	model.input.SetValue(want)
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	if got := model.input.Value(); got != "" {
 		t.Fatalf("composer not cleared after submit: %q", got)
@@ -247,7 +247,7 @@ func TestFailedSendRestoresExactDraft(t *testing.T) {
 	want := "first\nsecond\nthird"
 	model.input.SetValue(want)
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	if cmd == nil {
 		t.Fatal("submit returned no command")
@@ -271,7 +271,7 @@ func TestBackendRejectionRestoresExactDraft(t *testing.T) {
 	want := "first\nsecond\nthird"
 	model.input.SetValue(want)
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	sent, ok := cmd().(sentMsg)
 	if !ok || sent.err != nil {
@@ -304,7 +304,7 @@ func TestMalformedBackendResultRestoresDraftAndReleasesCommand(t *testing.T) {
 	want := "first\nsecond"
 	model.input.SetValue(want)
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	sent := cmd().(sentMsg)
 	updated, _ = model.Update(sent)
@@ -326,7 +326,7 @@ func TestOversizedPromptIsKeptForEditing(t *testing.T) {
 	want := strings.Repeat("x", maxPromptBytes+1)
 	model.input.SetValue(want)
 
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model = updated.(Model)
 	if cmd != nil {
 		t.Fatal("oversized prompt was submitted")
@@ -372,5 +372,21 @@ func TestDragSelectionInInputCopiesText(t *testing.T) {
 	}
 	if copied != "copy me" {
 		t.Fatalf("copied %q, want %q", copied, "copy me")
+	}
+}
+
+func TestEnterNeverSendsUnbracketedPaste(t *testing.T) {
+	connection := &recordingConn{}
+	model := inputModel(t)
+	model.client = newClient(connection)
+	model.snapshot.SetupMode = true
+	for _, line := range []string{"/target https://example.invalid", "Unicode café 日本語", "  indented"} {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(line)})
+		model = updated.(Model)
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(Model)
+	}
+	if connection.Len() != 0 || !strings.Contains(model.input.Value(), "\nUnicode café 日本語\n") {
+		t.Fatalf("unbracketed paste submitted or changed: %q", model.input.Value())
 	}
 }

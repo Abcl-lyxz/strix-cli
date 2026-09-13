@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import logging
-import time
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -17,7 +18,6 @@ from strix.core.paths import (
     runs_base_dir,
 )
 from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
-from strix.interface.viewer.transcript import read_run_summary
 
 
 if TYPE_CHECKING:
@@ -68,46 +68,50 @@ def run_view(argv: list[str]) -> None:
 
     run_dir = _resolve_run_dir(args.run, console)
 
-    httpd, url, token = serve(
-        run_dir,
-        host=args.host,
-        port=args.port,
-        open_browser=not args.no_open,
-    )
-    # The tokened URL is what authorizes the browser (steering, report sending,
-    # history). Print it rather than the bare URL so the operator -- and only
-    # the operator -- can open or share an authorized link.
-    open_url = authorized_url(url, token)
+    async def workspace() -> None:
+        from strix.interface.application_runtime import WorkspaceRuntime
+        from strix.interface.cli_args import parse_arguments
+        from strix.interface.output import WorkspaceOutput
+        from strix.interface.viewer.workspace import BrowserWorkspace
 
-    run_name = run_dir.name
-    summary = read_run_summary(run_dir)
-    live = not summary.get("finished", False)
-
-    from strix.telemetry import posthog
-
-    posthog.viewer_opened(source="cli", live=live)
-
-    state_label = _state_label(summary)
-    console.print()
-    console.print(f"Serving [bold white]{run_name}[/] ({state_label}) at:")
-    # Print the URL alone on its own line with soft_wrap so Rich never inserts a
-    # wrap into the (long, tokened) link -- that keeps it selectable/copyable.
-    console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
-    console.print("[dim]This link authorizes the browser; anyone you share it with can steer[/]")
-    console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
-    console.print()
+        runtime = WorkspaceRuntime(parse_arguments([]))
+        runtime.controller.scan_loop = asyncio.get_running_loop()
+        bridge = BrowserWorkspace(
+            runtime.controller, asyncio.get_running_loop(), initial_run=args.run
+        )
+        httpd, url, token = serve(
+            run_dir, host=args.host, port=args.port, open_browser=not args.no_open, workspace=bridge
+        )
+        sync = asyncio.create_task(runtime.sync_state())
+        console.print("Local Strix workspace:")
+        console.print(authorized_url(url, token), soft_wrap=True, markup=False)
+        console.print("Press Ctrl-C to stop the workspace.")
+        loop = asyncio.get_running_loop()
+        output = WorkspaceOutput(
+            lambda line: loop.call_soon_threadsafe(runtime.controller.record_output, line)
+        )
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                await asyncio.Event().wait()
+        finally:
+            bridge.closed = True
+            await asyncio.to_thread(httpd.shutdown)
+            httpd.server_close()
+            sync.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sync
+            await runtime.quit()
+            output.close()
+            await asyncio.sleep(0)  # Deliver the final flushed output before closing subscribers.
+            runtime.controller.close()
 
     try:
-        while True:
-            time.sleep(1.0)
+        asyncio.run(workspace())
     except KeyboardInterrupt:
-        console.print("\n[dim]Viewer stopped.[/]")
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+        console.print("Workspace stopped.")
 
 
-def _state_label(summary: dict[str, object]) -> str:
+def state_label(summary: dict[str, object]) -> str:
     if not summary.get("finished", False):
         return "[#eab308]live[/]"
 
@@ -119,6 +123,9 @@ def _state_label(summary: dict[str, object]) -> str:
     return "[#22c55e]finished[/]"
 
 
+_state_label = state_label  # Compatibility for existing local integrations.
+
+
 def _resolve_run_dir(run: str | None, console: Console) -> Path:
     if run:
         run_dir = run_dir_for(run)
@@ -127,9 +134,7 @@ def _resolve_run_dir(run: str | None, console: Console) -> Path:
         return run_dir
 
     latest = latest_run_dir()
-    if latest is None:
-        _fail_no_run(console, requested=None)
-    return latest
+    return latest if latest is not None else runs_base_dir() / "workspace"
 
 
 def _fail_no_run(console: Console, *, requested: str | None) -> NoReturn:

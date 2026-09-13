@@ -98,3 +98,7 @@ schema.graphql
 /.benchmarks/
 /references/
 /strix_runs_main/
+
+# Frontend test output
+strix/interface/viewer/frontend/test-results/
+strix/interface/viewer/frontend/playwright-report/

@@ -33,11 +33,15 @@ from strix.core.sessions import (
     replace_session_items,
     seed_initial_input,
     strip_all_images_from_session,
+    transform_session_items,
 )
 from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.llm.errors import classify_model_failure
+from strix.llm.tool_arguments import quarantine_history
 from strix.notifications import NotificationAction, notify
 from strix.resilience import full_jitter_delay, retry_after_seconds
 from strix.routing import AllRoutesUnavailableError
+from strix.tools.browser.tool import browser_lifecycle
 
 
 if TYPE_CHECKING:
@@ -179,7 +183,12 @@ async def _salvage_stream_to_session(
     except Exception:
         logger.exception("could not build salvage history for %s", agent_id)
         return False
-    desired = list(pre_run_items) + replay
+    # SDK session runs include the loaded history in to_input_list(). Appending
+    # it again doubles the conversation on every recovered provider failure.
+    if replay[: len(pre_run_items)] == pre_run_items:
+        desired = replay
+    else:
+        desired = list(pre_run_items) + replay
     if len(desired) <= len(pre_run_items):
         return False
     try:
@@ -214,6 +223,7 @@ async def _seed_and_prepare_first_input(
     return initial_input
 
 
+@browser_lifecycle
 async def run_agent_loop(  # noqa: PLR0912
     *,
     agent: Any,
@@ -740,6 +750,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     image_strips = 0
     compactions = 0
     model_retries = 0
+    malformed_retries = 0
     model_retry_started_at: float | None = None
     crash_restarts = 0
     while True:
@@ -781,6 +792,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                             # this session is healthy again.
                             crash_restarts = 0
                             model_retries = 0
+                            malformed_retries = 0
                             model_retry_started_at = None
                         tool_output_committed = tool_output_committed or tool_completed
                         if event_sink is not None:
@@ -845,6 +857,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 image_strips < 3
                 and session is not None
                 and getattr(exc, "status_code", None) in _INPUT_REJECTION_CODES
+                and classify_model_failure(exc) != "malformed"
             ):
                 try:
                     stripped = await strip_all_images_from_session(session)
@@ -879,6 +892,39 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
                     input_data = []
                     continue
+            if classify_model_failure(exc) == "malformed" and malformed_retries < 2:
+                safe = not tool_output_committed
+                if tool_output_committed and session is not None:
+                    safe = await _salvage_stream_to_session(
+                        session, pre_run_items, stream, agent_id
+                    )
+                if safe:
+                    malformed_retries += 1
+                    if session is not None:
+                        repaired = await transform_session_items(session, quarantine_history)
+                        if not repaired:
+                            await session.add_items(
+                                [
+                                    {
+                                        "role": "user",
+                                        "content": "The provider returned malformed arguments. "
+                                        "Continue from saved results using strict JSON objects. "
+                                        "Do not repeat completed tool actions.",
+                                    }
+                                ]
+                            )
+                        input_data = []
+                    notify(
+                        "model.history_recovery",
+                        title="Repairing model conversation history",
+                        detail=(
+                            f"Attempt {malformed_retries}/2; completed tool actions are preserved."
+                        ),
+                        severity="warning",
+                        agent_id=agent_id,
+                        dedupe_key=f"history-recovery:{agent_id}",
+                    )
+                    continue
             safe_tool_state = not tool_output_committed
             if tool_output_committed and session is not None:
                 safe_tool_state = await _salvage_stream_to_session(
@@ -912,6 +958,14 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         delay,
                         exc,
                     )
+                    notify(
+                        "model.retry",
+                        title=f"Retrying model in {delay:.1f}s",
+                        detail=f"Attempt {model_retries}/{_MAX_TRANSIENT_MODEL_RETRIES}",
+                        severity="warning",
+                        agent_id=agent_id,
+                        dedupe_key=f"model-retry:{context.get('scan_id', '')}:{agent_id}",
+                    )
                     await asyncio.sleep(delay)
                     if session is not None:
                         input_data = []
@@ -925,7 +979,13 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 return None
             if isinstance(exc, MaxTurnsExceeded):
                 status: Status = "stopped"
-            elif isinstance(exc, UserError | AgentsException | APIError):
+            elif classify_model_failure(exc) in {
+                "authentication",
+                "billing",
+                "incompatible",
+                "malformed",
+                "context",
+            } or isinstance(exc, UserError | AgentsException | APIError):
                 status = "failed"
             else:
                 status = "crashed"

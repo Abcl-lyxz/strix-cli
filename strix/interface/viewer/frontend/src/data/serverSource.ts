@@ -169,19 +169,6 @@ export interface RunsPayload {
   runs: RunListEntry[];
 }
 
-export interface AuthStatus {
-  verified: boolean;
-  email: string | null;
-}
-
-export type OtpStartResult = { ok: true } | { ok: false; error: string };
-export type OtpVerifyResult =
-  | { verified: true; email: string }
-  | { verified: false; error: string };
-export type SendReportResult =
-  | { ok: true; password: string; filename: string }
-  | { ok: false; error: string };
-
 async function postJson(
   path: string,
   body: Record<string, unknown>
@@ -230,55 +217,5 @@ export async function steerAgent(agentId: string, message: string): Promise<Stee
     message,
   });
   if (ok && data.ok === true) return { ok: true };
-  return { ok: false, error: String(data.error ?? "unavailable") };
-}
-
-export type SubmitFeedbackResult = { ok: true } | { ok: false; error: string };
-
-/**
- * POST /api/feedback. Sends a feedback message plus a work email (no
- * verification) to the local server, which relays it to Strix.
- */
-export async function submitFeedback(
-  message: string,
-  email: string
-): Promise<SubmitFeedbackResult> {
-  const { ok, data } = await postJson("/api/feedback", { message, email });
-  if (ok && data.ok === true) return { ok: true };
-  return { ok: false, error: String(data.error ?? "unavailable") };
-}
-
-export async function fetchAuthStatus(): Promise<AuthStatus> {
-  const obj = (await getJson("/api/auth/status")) as Partial<AuthStatus>;
-  return { verified: obj?.verified === true, email: obj?.email ?? null };
-}
-
-export async function otpStart(email: string): Promise<OtpStartResult> {
-  const { ok, data } = await postJson("/api/auth/otp/start", { email });
-  if (ok && data.ok === true) return { ok: true };
-  return { ok: false, error: String(data.error ?? "unavailable") };
-}
-
-export async function otpVerify(email: string, code: string): Promise<OtpVerifyResult> {
-  const { ok, data } = await postJson("/api/auth/otp/verify", { email, code });
-  if (ok && data.verified === true) {
-    return { verified: true, email: String(data.email ?? email) };
-  }
-  return { verified: false, error: String(data.error ?? "invalid_code") };
-}
-
-export async function forgetAuth(): Promise<void> {
-  await postJson("/api/auth/forget", {});
-}
-
-export async function sendReport(runName?: string | null): Promise<SendReportResult> {
-  const { ok, data } = await postJson("/api/report/send", runName ? { run: runName } : {});
-  if (ok && data.ok === true) {
-    return {
-      ok: true,
-      password: String(data.password ?? ""),
-      filename: String(data.filename ?? "strix-report.pdf"),
-    };
-  }
   return { ok: false, error: String(data.error ?? "unavailable") };
 }

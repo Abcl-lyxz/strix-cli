@@ -8,8 +8,10 @@ import pytest
 
 from strix import notifications as notification_module
 from strix.config import loader as config_loader
+from strix.config import routes as route_config
 from strix.security import SecretStore
 from strix.security import secrets as secret_module
+from strix.tools.mcp import loader as mcp_loader
 
 
 if TYPE_CHECKING:
@@ -38,6 +40,12 @@ def _isolate_global_strix_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     """Keep tests away from the developer's routes and notification inbox."""
     monkeypatch.setattr(config_loader, "_override", tmp_path / "cli-config.json")
     monkeypatch.setattr(config_loader, "_cached", None)
+    monkeypatch.setattr(config_loader, "_session_fields", {})
+    monkeypatch.setattr(route_config, "_session_routes", {})
+    monkeypatch.setattr(route_config, "_session_selected", None)
+    monkeypatch.setattr(route_config, "_session_revision", 0)
+    monkeypatch.setattr(mcp_loader, "_session_configs", {})
+    monkeypatch.setattr(secret_module, "_known_values", set())
     monkeypatch.setattr(notification_module, "_DEFAULT_PATH", tmp_path / "state.db")
     monkeypatch.setattr(notification_module, "_default_service", None)
     for name in (
@@ -94,16 +102,4 @@ def _plain_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("TERM", "dumb")
     for name in ("COLORTERM", "FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE"):
-        monkeypatch.delenv(name, raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_wallet_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a developer's real mppx wallet out of the top-up tests.
-
-    ``strix cloud billing topup`` chooses the Stripe Link flow or the
-    preconfigured mppx wallet from these variables, so leaving them set would
-    silently switch which branch a test runs.
-    """
-    for name in ("MPPX_ACCOUNT", "MPPX_STRIPE_SECRET_KEY", "MPPX_STRIPE_PAYMENT_METHOD"):
         monkeypatch.delenv(name, raising=False)

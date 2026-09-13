@@ -7,9 +7,7 @@ import io
 import json
 import logging
 import re
-import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from pygments.lexers import PythonLexer, get_lexer_by_name, guess_lexer
@@ -17,9 +15,12 @@ from pygments.lexers.special import TextLexer
 from pygments.util import ClassNotFound
 
 from strix.core.paths import run_record_path
+from strix.utils.atomic import atomic_write_text
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from pygments.lexer import Lexer
 
 logger = logging.getLogger(__name__)
@@ -196,28 +197,6 @@ def write_vulnerabilities(
         )
     logger.info("Updated vulnerability index: %s", csv_path)
     return len(new_reports)
-
-
-def atomic_write_text(path: Path, payload: str) -> None:
-    """Write *payload* to *path* via a sibling temp file and an atomic rename.
-
-    ``newline=""`` disables newline translation so *payload* lands byte-for-byte:
-    the CSV index carries its own ``\\r\\n`` terminators, which text mode would turn
-    into ``\\r\\r\\n`` on Windows.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        newline="",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as tmp:
-        tmp.write(payload)
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
 
 
 def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PLR0915

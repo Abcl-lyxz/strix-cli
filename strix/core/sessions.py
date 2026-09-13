@@ -14,7 +14,7 @@ from weakref import WeakKeyDictionary
 from agents.items import ItemHelpers
 from agents.memory import SQLiteSession
 
-from strix.security import redact_secrets
+from strix.security.secrets import redact_secrets, redact_value
 
 
 if TYPE_CHECKING:
@@ -103,11 +103,39 @@ class _PooledConnectionSession(SQLiteSession):
                 if not self._journal_suspended:
                     connection.executemany(
                         "insert into transcript_entries(session_id,message_data) values (?,?)",
-                        [(self.session_id, redact_secrets(json.dumps(item))) for item in items],
+                        [(self.session_id, json.dumps(redact_value(item))) for item in items],
                     )
                 connection.commit()
 
         await asyncio.to_thread(_append)
+
+    async def replace_items_atomic(self, items: list[Any], expected: list[Any]) -> bool:
+        """Commit a history projection in one transaction without touching the transcript."""
+
+        def replace() -> bool:
+            with self._locked_connection() as connection:
+                try:
+                    connection.execute("begin immediate")
+                    rows = connection.execute(
+                        "select message_data from agent_messages where session_id=? order by id",
+                        (self.session_id,),
+                    ).fetchall()
+                    current = [json.loads(row[0]) for row in rows]
+                    if current != expected:
+                        connection.rollback()
+                        return False
+                    connection.execute(
+                        "delete from agent_messages where session_id=?", (self.session_id,)
+                    )
+                    self._insert_items(connection, items)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    return True
+
+        return await asyncio.to_thread(replace)
 
 
 def open_agent_session(agent_id: str, path: Path) -> SQLiteSession:
@@ -168,7 +196,7 @@ def session_write_lock(session: Session) -> asyncio.Lock:
     return lock
 
 
-async def _rewrite_session(
+async def transform_session_items(
     session: Session,
     transform: Callable[[list[Any]], tuple[list[Any], bool]],
 ) -> bool:
@@ -180,6 +208,8 @@ async def _rewrite_session(
         rebuilt, changed = transform(list(items))
         if not changed:
             return False
+        if isinstance(session, _PooledConnectionSession):
+            return await session.replace_items_atomic(rebuilt, list(items))
         rebuilt_items = cast("list[TResponseInputItem]", rebuilt)
         original_items = cast("list[TResponseInputItem]", list(items))
         with _journal_suspension(session):
@@ -215,6 +245,8 @@ async def replace_session_items(
                 len(original),
             )
             return False
+        if isinstance(session, _PooledConnectionSession):
+            return await session.replace_items_atomic(new_items, original)
         rebuilt = cast("list[TResponseInputItem]", new_items)
         with _journal_suspension(session):
             await session.clear_session()
@@ -363,7 +395,7 @@ async def strip_all_images_from_session(session: Session) -> bool:
                 rebuilt.append(item)
         return rebuilt, changed
 
-    return await _rewrite_session(session, _transform)
+    return await transform_session_items(session, _transform)
 
 
 async def enforce_image_budget(session: Session, max_images: int) -> bool:
@@ -388,7 +420,7 @@ async def enforce_image_budget(session: Session, max_images: int) -> bool:
         ]
         return rebuilt, True
 
-    return await _rewrite_session(session, _transform)
+    return await transform_session_items(session, _transform)
 
 
 def scrub_images_from_items(items: list[Any]) -> list[Any]:

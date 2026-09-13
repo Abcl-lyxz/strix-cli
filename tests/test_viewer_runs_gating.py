@@ -30,14 +30,9 @@ def _make_run(base: Path, name: str, *, severity: str = "high") -> Path:
     return run_dir
 
 
-def test_runs_payload_locked_when_unverified(tmp_path: Path) -> None:
-    base = tmp_path / "strix_runs"
-    _make_run(tmp_path, "alpha")
-    _make_run(tmp_path, "beta")
-
-    payload = build_runs_payload(base, verified=False)
-    assert payload["locked"] is True
-    assert payload["count"] == 2
+def test_runs_payload_is_available_without_email_verification(tmp_path: Path) -> None:
+    payload = build_runs_payload(tmp_path, verified=False)
+    assert payload["locked"] is False
     assert payload["runs"] == []
 
 

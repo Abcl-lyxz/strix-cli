@@ -111,11 +111,23 @@ def redact_secrets(value: object, additional: Iterable[str] = ()) -> str:
         r"\1[REDACTED]",
         text,
     )
+    text = re.sub(r"(?i)([?&]token=)[^\s&\"]+", r"\1[REDACTED]", text)
     return re.sub(
         r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*)[^\s,;]+",
         r"\1[REDACTED]",
         text,
     )
+
+
+def redact_value(value: Any) -> Any:
+    """Redact strings without damaging structured JSON or mutating the source."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [redact_value(item) for item in cast("list[object]", value)]
+    if isinstance(value, dict):
+        return {key: redact_value(item) for key, item in cast("dict[str, Any]", value).items()}
+    return value
 
 
 class _CommandBackend:

@@ -69,6 +69,8 @@ const (
 	modalConfig
 	modalWorkspaceSearch
 	modalAPIKey
+	modalWorkspace
+	modalExpanded
 )
 
 type focusMode int
@@ -99,6 +101,7 @@ type workspaceSearchMatch struct {
 }
 
 type Model struct {
+	dialog                 workspaceDialog
 	client                 *Client
 	width, height          int
 	snapshot               protocol.Snapshot
@@ -138,6 +141,10 @@ type Model struct {
 	budgetPauseNotified    bool
 	followOutput           bool
 	selection              selectionState
+	toastQueue             []string
+	draftHistory           []string
+	draftIndex             int
+	pastedDraft            bool
 	toast                  string
 	toastID                int
 	draggingScrollbar      scrollbarTarget
@@ -225,8 +232,8 @@ func newChatInput() textarea.Model {
 	input.MaxHeight = 0
 	input.SetHeight(1)
 	input.KeyMap.InsertNewline = key.NewBinding(
-		key.WithKeys("shift+enter", "alt+enter", "ctrl+j"),
-		key.WithHelp("shift+enter", "insert newline"),
+		key.WithKeys("enter", "shift+enter", "alt+enter", "ctrl+j"),
+		key.WithHelp("enter", "insert newline"),
 	)
 	plain := lipgloss.NewStyle()
 	text := lipgloss.NewStyle().Foreground(textColor)
@@ -479,10 +486,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			text = "Copy failed: " + msg.err.Error()
 		}
-		return m, m.showToast(text)
+		cmd := m.showToast(text)
+		return m, cmd
 	case toastExpiredMsg:
 		if msg.id == m.toastID {
 			m.toast = ""
+			if len(m.toastQueue) > 0 {
+				next := m.toastQueue[0]
+				m.toastQueue = m.toastQueue[1:]
+				cmd := m.showToastFor(next, 5*time.Second)
+				return m, cmd
+			}
 			if !m.selection.dragging {
 				m.selection.active = false
 			}
@@ -495,8 +509,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.vulnerabilityCopyError = msg.err.Error()
 		}
 		return m, nil
+	case editorResult:
+		if msg.Err != nil {
+			cmd := m.showToast(msg.Err.Error())
+			return m, cmd
+		}
+		m.input.SetValue(msg.Text)
+		m.pastedDraft = true
+		m.resizeViewport()
+		return m, nil
 	case tea.KeyMsg:
 		msg = normalizePastedNewlines(msg)
+		if msg.Paste && m.modal == modalNone {
+			m.pastedDraft = true
+		}
 		if m.showSplash {
 			switch msg.String() {
 			case "ctrl+c", "ctrl+q", "q", "esc":

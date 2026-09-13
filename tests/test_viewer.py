@@ -250,128 +250,6 @@ def test_server_serves_api_and_static(tmp_path: Path, monkeypatch: pytest.Monkey
         httpd.server_close()
 
 
-def test_server_event_endpoint_forwards_cta(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = _make_run(tmp_path, "evt", status="running", end_time=None)
-    assets = tmp_path / "bundle"
-    assets.mkdir()
-    (assets / "index.html").write_text("x", encoding="utf-8")
-    monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
-
-    seen: list[tuple[str, str | None]] = []
-    monkeypatch.setattr(
-        "strix.telemetry.posthog.viewer_cta_clicked",
-        lambda cta, surface=None: seen.append((cta, surface)),
-    )
-
-    httpd, url, _ = serve(run_dir, open_browser=False)
-    try:
-        body = json.dumps(
-            {"event": "cta_clicked", "cta": "PR reviews", "surface": "sidebar_nav"}
-        ).encode()
-        req = urllib.request.Request(  # noqa: S310 - localhost test server
-            f"{url}/api/event", data=body, headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
-            assert resp.status == 204
-        assert seen == [("PR reviews", "sidebar_nav")]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_server_event_endpoint_forwards_email_funnel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = _make_run(tmp_path, "evt2", status="running", end_time=None)
-    assets = tmp_path / "bundle"
-    assets.mkdir()
-    (assets / "index.html").write_text("x", encoding="utf-8")
-    monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
-
-    seen: list[tuple[str, str | None]] = []
-    monkeypatch.setattr(
-        "strix.telemetry.posthog.viewer_email_event",
-        lambda step, purpose=None: seen.append((step, purpose)),
-    )
-
-    httpd, url, _ = serve(run_dir, open_browser=False)
-    try:
-        # A whitelisted funnel event is forwarded; an unknown event is ignored.
-        for payload, expected in (
-            ({"event": "email_verified", "purpose": "report"}, [("email_verified", "report")]),
-            ({"event": "not_a_real_event"}, [("email_verified", "report")]),
-        ):
-            req = urllib.request.Request(  # noqa: S310 - localhost test server
-                f"{url}/api/event",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
-                assert resp.status == 204
-            assert seen == expected
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_server_event_endpoint_forwards_agent_steered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = _make_run(tmp_path, "steerevt", status="running", end_time=None)
-    _bundle(tmp_path, monkeypatch)
-
-    seen: list[bool] = []
-    monkeypatch.setattr("strix.telemetry.posthog.viewer_agent_steered", lambda: seen.append(True))
-
-    httpd, url, _ = serve(run_dir, open_browser=False)
-    try:
-        req = urllib.request.Request(  # noqa: S310 - localhost test server
-            f"{url}/api/event",
-            data=json.dumps({"event": "agent_steered"}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
-            assert resp.status == 204
-        assert seen == [True]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_feedback_records_telemetry_on_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = _make_run(tmp_path, "fbtel", status="running", end_time=None)
-    _bundle(tmp_path, monkeypatch)
-
-    sent: list[bool] = []
-    monkeypatch.setattr("strix.interface.viewer.auth.feedback_submit", lambda *_a: None)
-    monkeypatch.setattr(
-        "strix.telemetry.posthog.viewer_feedback_submitted", lambda: sent.append(True)
-    )
-
-    httpd, url, token = serve(run_dir, open_browser=False)
-    try:
-        cookie = _session_cookie(url, token)
-        # A successful, session-holding submission relays and records telemetry.
-        status, _ = _post(
-            url, "/api/feedback", {"email": "a@b.com", "message": "hi"}, cookie=cookie
-        )
-        assert status == 200
-        assert sent == [True]
-
-        # A cookie-less caller is rejected and records nothing.
-        sent.clear()
-        status, _ = _post(url, "/api/feedback", {"email": "a@b.com", "message": "hi"})
-        assert status == 403
-        assert sent == []
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
 def _post(
     url: str, path: str, payload: Mapping[str, object], *, cookie: str | None = None
 ) -> tuple[int, bytes]:
@@ -499,52 +377,6 @@ def test_run_data_requires_session(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         httpd.server_close()
 
 
-def test_auth_status_reflects_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    run_dir = _make_run(tmp_path, "status", status="running", end_time=None)
-    _bundle(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
-    )
-    verified = {"value": True}
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: verified["value"])
-
-    httpd, url, token = serve(run_dir, open_browser=False)
-    try:
-        cookie = _session_cookie(url, token)
-        _, _, body = _get(f"{url}/api/auth/status", cookie=cookie)
-        assert json.loads(body) == {"verified": True, "email": "a@b.com"}
-
-        # Once expired, status must advertise unverified so the SPA re-prompts.
-        verified["value"] = False
-        _, _, body = _get(f"{url}/api/auth/status", cookie=cookie)
-        assert json.loads(body)["verified"] is False
-
-        # A cookie-less caller never sees the cached email or verified state.
-        verified["value"] = True
-        _, _, body = _get(f"{url}/api/auth/status")
-        assert json.loads(body) == {"verified": False, "email": None}
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_auth_mutations_require_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    run_dir = _make_run(tmp_path, "authmut", status="running", end_time=None)
-    _bundle(tmp_path, monkeypatch)
-    forgotten = {"value": False}
-    monkeypatch.setattr("strix.interface.viewer.auth.forget", lambda: forgotten.update(value=True))
-
-    httpd, url, _ = serve(run_dir, open_browser=False)
-    try:
-        for path in ("/api/auth/forget", "/api/auth/otp/start", "/api/auth/otp/verify"):
-            status, _ = _post(url, path, {"email": "a@b.com", "code": "123456"})
-            assert status == 403, path
-        assert forgotten["value"] is False
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
 def test_steer_requires_session_cookie(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = _make_run(tmp_path, "steer", status="running", end_time=None)
     _bundle(tmp_path, monkeypatch)
@@ -573,119 +405,6 @@ def test_steer_requires_session_cookie(tmp_path: Path, monkeypatch: pytest.Monke
         httpd.server_close()
 
 
-def test_report_send_requires_session_cookie(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = _make_run(tmp_path, "report", status="completed", end_time="2026-01-01T00:00:00Z")
-    _bundle(tmp_path, monkeypatch)
-
-    # A verified machine token exists, but that alone must not authorize a caller.
-    monkeypatch.setattr(
-        "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
-    )
-
-    httpd, url, token = serve(run_dir, open_browser=False)
-    try:
-        # No cookie: forbidden before the machine token is ever consulted.
-        status, _ = _post(url, "/api/report/send", {})
-        assert status == 403
-
-        # With the cookie the request clears the session gate; it then reaches
-        # the run resolver, so an unknown run is a 404 rather than a 403.
-        status, _ = _post(
-            url, "/api/report/send", {"run": "does-not-exist"}, cookie=_session_cookie(url, token)
-        )
-        assert status == 404
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_report_send_rejects_live_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A running scan would only produce a partial report, so the endpoint must
-    # fail closed even for a verified, session-holding caller.
-    run_dir = _make_run(tmp_path, "live", status="running", end_time=None)
-    _bundle(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
-    )
-
-    httpd, url, token = serve(run_dir, open_browser=False)
-    try:
-        status, _ = _post(url, "/api/report/send", {}, cookie=_session_cookie(url, token))
-        assert status == 409
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_historical_run_data_requires_verification(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    launched = _make_run(tmp_path, "launched", status="completed", end_time="2026-01-01T00:00:00Z")
-    _make_run(tmp_path, "other", status="completed", end_time="2026-01-01T00:00:00Z")
-    _bundle(tmp_path, monkeypatch)
-
-    verified = {"value": False}
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: verified["value"])
-
-    httpd, url, token = serve(launched, open_browser=False)
-    try:
-        # The launched run needs the session capability, but not email verification.
-        assert _get_status(f"{url}/api/run") == 403
-        cookie = _session_cookie(url, token)
-        assert _get_status(f"{url}/api/run", cookie=cookie) == 200
-
-        # A different run needs the session capability first: a cookie-less
-        # caller is forbidden even once the machine is verified.
-        verified["value"] = True
-        assert _get_status(f"{url}/api/run?run=other") == 403
-
-        # With the cookie but not verified, the history gate returns 401.
-        verified["value"] = False
-        assert _get_status(f"{url}/api/run?run=other", cookie=cookie) == 401
-
-        # With both the cookie and verification, the historical run resolves.
-        verified["value"] = True
-        assert _get_status(f"{url}/api/run?run=other", cookie=cookie) == 200
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_runs_list_requires_session_and_verification(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    launched = _make_run(tmp_path, "launched", status="completed", end_time="2026-01-01T00:00:00Z")
-    _make_run(tmp_path, "other", status="completed", end_time="2026-01-01T00:00:00Z")
-    _bundle(tmp_path, monkeypatch)
-
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: True)
-
-    def _runs(cookie: str | None) -> dict[str, object]:
-        headers = {"Cookie": cookie} if cookie else {}
-        req = urllib.request.Request(f"{url}/api/runs", headers=headers)  # noqa: S310
-        with urllib.request.urlopen(req) as resp:  # noqa: S310 - localhost test server  # nosec B310
-            return dict(json.loads(resp.read()))
-
-    httpd, url, token = serve(launched, open_browser=False)
-    try:
-        # A cookie-less caller (even with the machine verified) only sees the
-        # teaser count, never the run entries.
-        payload = _runs(None)
-        assert payload["locked"] is True
-        assert payload["count"] == 2
-        assert payload["runs"] == []
-
-        # With the session cookie and verification, the entries unlock.
-        payload = _runs(_session_cookie(url, token))
-        assert payload["locked"] is False
-        assert {r["name"] for r in payload["runs"]} == {"launched", "other"}  # type: ignore[attr-defined]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
 def test_concurrent_servers_use_distinct_cookies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -695,10 +414,6 @@ def test_concurrent_servers_use_distinct_cookies(
     run_a = _make_run(tmp_path / "a", "run-a", status="running", end_time=None)
     run_b = _make_run(tmp_path / "b", "run-b", status="running", end_time=None)
     _bundle(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
-    )
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: True)
 
     httpd_a, url_a, token_a = serve(run_a, open_browser=False)
     httpd_b, url_b, token_b = serve(run_b, open_browser=False)
@@ -711,21 +426,13 @@ def test_concurrent_servers_use_distinct_cookies(
         assert cookie_b.split("=", 1)[0] == _cookie_name(url_b)
         assert cookie_a.split("=", 1)[0] != cookie_b.split("=", 1)[0]
 
-        def _status(url: str, cookie: str) -> dict[str, object]:
-            _, _, body = _get(f"{url}/api/auth/status", cookie=cookie)
-            return dict(json.loads(body))
-
-        # Each server honors its own cookie...
-        assert _status(url_a, cookie_a)["verified"] is True
-        assert _status(url_b, cookie_b)["verified"] is True
-        # ...but treats the other server's cookie as session-less.
-        assert _status(url_a, cookie_b)["verified"] is False
-        assert _status(url_b, cookie_a)["verified"] is False
-        # Even both cookies together (what a real browser would send) only
-        # match the token minted by the receiving server.
+        assert _get_status(f"{url_a}/api/run", cookie=cookie_a) == 200
+        assert _get_status(f"{url_b}/api/run", cookie=cookie_b) == 200
+        assert _get_status(f"{url_a}/api/run", cookie=cookie_b) == 403
+        assert _get_status(f"{url_b}/api/run", cookie=cookie_a) == 403
         both = f"{cookie_a}; {cookie_b}"
-        assert _status(url_a, both)["verified"] is True
-        assert _status(url_b, both)["verified"] is True
+        assert _get_status(f"{url_a}/api/run", cookie=both) == 200
+        assert _get_status(f"{url_b}/api/run", cookie=both) == 200
     finally:
         httpd_a.shutdown()
         httpd_a.server_close()
@@ -748,6 +455,26 @@ def test_server_rejects_path_traversal(tmp_path: Path, monkeypatch: pytest.Monke
         # A traversal target must never leak the file; it falls back to index.html.
         _, _, body = _get(f"{url}/..%2f..%2fsecret.txt")
         assert b"top secret" not in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_all_local_history_requires_only_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launched = _make_run(tmp_path, "launched", status="completed", end_time="2026-01-01T00:00:00Z")
+    _make_run(tmp_path, "other", status="completed", end_time="2026-01-01T00:00:00Z")
+    _bundle(tmp_path, monkeypatch)
+    httpd, url, token = serve(launched, open_browser=False)
+    try:
+        assert _get_status(f"{url}/api/runs") == 403
+        cookie = _session_cookie(url, token)
+        assert _get_status(f"{url}/api/run?run=other", cookie=cookie) == 200
+        _, _, body = _get(f"{url}/api/runs", cookie=cookie)
+        assert len(json.loads(body)["runs"]) == 2
+        for endpoint in ("/api/auth/status", "/api/report/send", "/api/event", "/api/feedback"):
+            assert _get_status(url + endpoint, cookie=cookie) == 404
     finally:
         httpd.shutdown()
         httpd.server_close()

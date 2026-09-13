@@ -136,12 +136,23 @@ async def test_unknown_and_null_arguments_are_untouched() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_object_payloads_pass_through_unchanged() -> None:
-    captured: dict[str, str] = {}
-    wrapped = factory._with_coerced_arguments(_capturing_tool(captured, _ARRAY))
+async def test_invalid_arguments_return_tool_error_without_execution() -> None:
+    invoked = []
 
-    assert await wrapped.on_invoke_tool(cast("Any", None), "not json") == "ok"
-    assert captured["raw_input"] == "not json"
+    async def invoke(_ctx: Any, raw: str) -> str:
+        invoked.append(raw)
+        return "ok"
+
+    tool = FunctionTool(
+        name="probe",
+        description="Probe",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=invoke,
+    )
+    wrapped = factory._with_coerced_arguments(tool)
+    for raw in ("not json", "[]", "null"):
+        assert "No action was executed" in await wrapped.on_invoke_tool(cast("Any", None), raw)
+    assert invoked == []
 
 
 @pytest.mark.asyncio

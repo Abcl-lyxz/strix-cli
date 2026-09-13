@@ -125,13 +125,15 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
         {
             "model": "openrouter/openai/gpt-5.4",
             "api_key": "sk-do-not-echo",
-            "api_base": "https://gateway.example/v1?token=also-hidden",
+            "api_base": "https://gateway.example/v1",
+            "persist": True,
             "reasoning_effort": "medium",
         },
     )
 
     assert result == {
         "saved": True,
+        "selected_route": "",
         "model": "openrouter/openai/gpt-5.4",
         "api_key_configured": True,
         "api_base": "https://gateway.example/v1",
@@ -152,7 +154,6 @@ async def test_tui_config_supports_runtime_model_controls() -> None:
     await controller.handle(
         "config.update",
         {
-            "telemetry_enabled": False,
             "streaming_enabled": False,
             "prompt_cache": False,
             "llm_timeout": 45,
@@ -162,7 +163,7 @@ async def test_tui_config_supports_runtime_model_controls() -> None:
     )
 
     snapshot = controller.snapshot()
-    assert snapshot["telemetry_enabled"] is False
+    assert "telemetry_enabled" not in snapshot
     assert snapshot["streaming_enabled"] is False
     assert snapshot["prompt_cache"] is False
     assert snapshot["llm_timeout"] == 45

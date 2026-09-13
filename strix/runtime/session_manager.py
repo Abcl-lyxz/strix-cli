@@ -33,6 +33,11 @@ _CONTAINER_CAIDO_PORT = 48080
 
 _SESSION_CACHE: dict[str, dict[str, Any]] = {}
 
+
+def cached_session(scan_id: str) -> dict[str, Any] | None:
+    return _SESSION_CACHE.get(scan_id)
+
+
 # Manifest root inside the container; entry keys hang off this path.
 _WORKSPACE_ROOT = "/workspace"
 

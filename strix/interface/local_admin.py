@@ -23,8 +23,6 @@ from strix.config.routes import (
     set_route_enabled,
     set_route_key,
 )
-from strix.interface import platform_cli
-from strix.interface.viewer import auth as viewer_auth
 from strix.notifications import Notification, get_notification_service, notify
 from strix.routing import RouteConfig, RoutedModel, RoutePool
 from strix.security import get_secret_store
@@ -210,8 +208,6 @@ def _migrate_every_secret_source() -> dict[str, list[str]]:
     failed = list(report["failed"])
     for label, migrate in (
         ("ChatGPT OAuth", _migrate_codex),
-        ("managed cloud", platform_cli.read_record),
-        ("viewer relay", viewer_auth.read_auth),
         ("MCP bearer tokens", load_user_mcp_configs),
     ):
         try:

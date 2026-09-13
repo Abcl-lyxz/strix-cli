@@ -1136,7 +1136,7 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
     if not target or not isinstance(target, str):
         raise ValueError("Target must be a non-empty string")
 
-    target = target.strip()
+    target = target.strip().strip("\"'")
 
     if target.startswith("git@"):
         return "repository", {"target_repo": target}
@@ -1194,7 +1194,11 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
                     "target_spec": str(path.resolve()),
                     "spec_format": spec_format,
                 }
-            raise ValueError(f"Path exists but is not a directory: {target}")
+            if path.is_file():
+                with path.open("rb"):
+                    pass
+                return "local_file", {"target_path": str(path.resolve())}
+            raise ValueError(f"Path is not a regular file or folder: {target}")
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Invalid path: {target} - {e!s}") from e
 

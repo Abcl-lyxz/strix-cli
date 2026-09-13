@@ -30,7 +30,6 @@ from strix.interface.scan_setup import (
     ModelConnectionError,
     preflight_model_connection,
     prepare_run,
-    telemetry_start,
 )
 from strix.interface.update_check import (
     is_binary_install,
@@ -43,7 +42,7 @@ from strix.interface.utils import (
     build_final_stats_text,
 )
 from strix.llm.warmup import start_import_warmup, wait_for_import_warmup
-from strix.telemetry import posthog, report_error, scarf, set_scan_phase
+from strix.telemetry import report_error, set_scan_phase
 from strix.telemetry.logging import configure_dependency_logging
 
 
@@ -66,7 +65,6 @@ logger = logging.getLogger(__name__)
 
 _ROOT_SUBCOMMAND_HELP = """
 Additional commands:
-  strix cloud ...          Use the managed Strix platform
   strix auth ...           Manage model-subscription sign-in
   strix doctor [--network] Diagnose installation, Docker, VPN/proxy, and model setup
   strix view [RUN]         View a completed or running scan
@@ -343,11 +341,6 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
         "[#60a5fa]docs.strix.ai[/]  [dim]·[/]  "
         "[#60a5fa]discord.gg/strix-ai[/]"
     )
-    if not args.non_interactive:
-        console.print(
-            "[dim]Run a pentest in Strix Cloud[/]  [#60a5fa]app.strix.ai[/]  [dim]·[/]  "
-            "[dim]Enterprise[/]  [#60a5fa]strix.ai/demo[/]"
-        )
     console.print()
     if not args.non_interactive:
         notify_update(console)
@@ -427,7 +420,6 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
         report_error("scan_preparation_failed", e)
         _print_error_panel("SCAN PREPARATION FAILED", str(e))
         sys.exit(1)
-    telemetry_start(args)
 
 
 def _ensure_interactive_setup_for_model(args: argparse.Namespace) -> None:
@@ -482,13 +474,6 @@ def main() -> None:
         from strix.interface.completions import run_completions
 
         sys.exit(run_completions(sys.argv[2:]))
-
-    # `strix cloud …` drives the managed platform (app.strix.ai) and exits;
-    # it needs no target, Docker, or scan setup.
-    if len(sys.argv) > 1 and sys.argv[1] == "cloud":
-        from strix.interface.cloud import run_cloud
-
-        sys.exit(run_cloud(sys.argv[2:]))
 
     if len(sys.argv) > 1 and sys.argv[1] in {"routes", "secrets", "notifications"}:
         from strix.interface.local_admin import (
@@ -568,8 +553,9 @@ def main() -> None:
             # second Ctrl-C lands here; abandon them rather than trading a clean
             # exit for a traceback.
             with contextlib.suppress(KeyboardInterrupt, Exception):
-                posthog.end(report_state, exit_reason=exit_reason)
-                scarf.end(report_state, exit_reason=exit_reason)
+                report_state.scan_ended_exit_reason = (
+                    report_state.scan_ended_exit_reason or exit_reason
+                )
 
     if not args.run_name:
         # Setup mode where the user quit before starting a scan: nothing ran.

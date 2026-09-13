@@ -215,8 +215,6 @@ class TuiBackendServer:
                 if isinstance(raw_command, str):
                     command = raw_command[:128]
             request_id, command, payload = self._decode_message(raw)
-            if request_id in self._seen_request_ids:
-                raise ValueError(f"duplicate request_id: {request_id}")  # noqa: TRY301
             self._seen_request_ids.add(request_id)
             self._request_id_order.append(request_id)
             if len(self._request_id_order) > 10_000:
@@ -229,7 +227,7 @@ class TuiBackendServer:
                 result: dict[str, Any] = {"collection": collection, "resyncing": True}
                 resync = collection
             else:
-                result = await self.controller.handle(command, payload)
+                result = await self.controller.workspace.dispatch(command, payload, request_id)
             response = envelope(
                 "command_result",
                 {"ok": True, "command": command, "result": result},

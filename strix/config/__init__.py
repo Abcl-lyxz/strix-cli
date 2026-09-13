@@ -3,7 +3,7 @@
 Public surface:
 
 - :class:`Settings` — composite model. Get via :func:`load_settings`.
-- :class:`LlmSettings`, :class:`RuntimeSettings`, :class:`TelemetrySettings`,
+- :class:`LlmSettings`, :class:`RuntimeSettings`,
   :class:`IntegrationSettings` — sub-models, attribute-accessed off
   ``Settings``.
 - :func:`load_settings` — memoized resolve (env > JSON file > defaults).
@@ -30,7 +30,6 @@ from strix.config.settings import (
     RoutingSettings,
     RuntimeSettings,
     Settings,
-    TelemetrySettings,
 )
 
 
@@ -42,7 +41,6 @@ __all__ = [
     "RoutingSettings",
     "RuntimeSettings",
     "Settings",
-    "TelemetrySettings",
     "apply_config_override",
     "config_path",
     "load_settings",

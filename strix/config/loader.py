@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import AliasChoices, BaseModel
 
@@ -28,8 +28,20 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PATH: Path = Path.home() / ".strix" / "cli-config.json"
 _override: Path | None = None
 _cached: Settings | None = None
+_session_fields: dict[str, dict[str, Any]] = {}
 
 CONFIG_VERSION = 2
+
+
+def session_fields() -> dict[str, dict[str, Any]]:
+    return {section: dict(values) for section, values in _session_fields.items()}
+
+
+def set_session_field(section: str, name: str, value: Any) -> None:
+    global _cached  # noqa: PLW0603
+    _session_fields.setdefault(section, {})[name] = value
+    _cached = None
+
 
 # These values are credentials even when their provider accepts them through a
 # generic settings field. They are never written back into cli-config.json.
@@ -74,6 +86,11 @@ def load_settings() -> Settings:
         source_path = _override or _DEFAULT_PATH
         init_kwargs: dict[str, Any] = _read_json_overrides(source_path)
         _cached = Settings(**init_kwargs)
+        for section, changes in _session_fields.items():
+            current = cast("BaseModel", getattr(_cached, section))
+            setattr(
+                _cached, section, type(current).model_validate({**current.model_dump(), **changes})
+            )
         _register_resolved_secrets(_cached)
         logger.debug(
             "load_settings: resolved (override=%s, file_used=%s, json_keys=%d)",
@@ -134,6 +151,7 @@ def apply_config_override(path: Path) -> None:
     global _override, _cached  # noqa: PLW0603
     _override = path
     _cached = None
+    _session_fields.clear()
     logger.info("config override applied: %s", path)
 
 

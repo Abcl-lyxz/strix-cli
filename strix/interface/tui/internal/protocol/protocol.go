@@ -2,7 +2,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = 6
+const Version = 7
 
 var Capabilities = []string{
 	"state-revisions",
@@ -14,6 +14,9 @@ var Capabilities = []string{
 	"model-route-pools",
 	"notification-inbox",
 	"storage-locations",
+	"workspace-forms",
+	"attachments",
+	"provider-discovery",
 }
 
 type Envelope struct {
@@ -35,6 +38,7 @@ type Agent struct {
 	ParentID     *string `json:"parent_id"`
 	Status       string  `json:"status"`
 	ErrorMessage string  `json:"error_message"`
+	WaitKind     string  `json:"wait_kind"`
 }
 
 // Connection is one MCP connection the run may reach, as the backend projects
@@ -62,6 +66,9 @@ type Hello struct {
 }
 
 type Snapshot struct {
+	EditorCommand       string           `json:"editor_command"`
+	Attachments         []map[string]any `json:"attachments"`
+	RecentRuns          []map[string]any `json:"recent_runs"`
 	SetupMode           bool             `json:"setup_mode"`
 	ScanStarted         bool             `json:"scan_started"`
 	ScanState           string           `json:"scan_state"`
@@ -81,7 +88,6 @@ type Snapshot struct {
 	APIKeyConfigured    bool             `json:"api_key_configured"`
 	APIBase             string           `json:"api_base"`
 	ReasoningEffort     string           `json:"reasoning_effort"`
-	TelemetryEnabled    bool             `json:"telemetry_enabled"`
 	StreamingEnabled    bool             `json:"streaming_enabled"`
 	PromptCache         bool             `json:"prompt_cache"`
 	LLMTimeout          int              `json:"llm_timeout"`

@@ -191,7 +191,10 @@ class TuiLiveView:
             "chat",
             {
                 "role": "assistant",
-                "content": (f"An error occurred: {error}\nI'm now waiting for new instructions."),
+                "content": (
+                    f"Model execution stopped: {error}\n"
+                    "Check the provider or model, then choose Retry, send a correction, or stop."
+                ),
                 "metadata": {"source": "agent_error"},
             },
         )

@@ -11,7 +11,6 @@ metadata:
 
 Entry point for "make my application secure" requests, where the target is not yet a single URL or repo. The job here is to pick the right test per asset, run it, and produce one ranked plan — not to run everything at maximum depth.
 
-Install, LLM setup, all CLI flags, and the managed-cloud path live in the **penetration-testing-with-strix** skill. Read it first if `strix --version` fails. For a run with no Docker and no LLM key, the same binary drives the managed platform: `strix cloud login`, then `strix cloud scans start ...` (details in **managed-pentesting-with-strix**).
 
 Only test assets the user owns or is authorized to test. Confirm authorization before the first run, and prefer staging over production, because the agents send real exploit payloads and can change data.
 
@@ -36,7 +35,6 @@ If there is no staging environment and production is off limits, say so early. A
 | REST/GraphQL/gRPC API | **api-security-testing** |
 | Assessment mapped to OWASP categories | **owasp-top-10-testing** |
 | Every pull request, continuously | **ci-security-scanning-with-strix** |
-| No Docker, no LLM key, or a report an auditor will accept | **managed-pentesting-with-strix** |
 
 Those skills carry the flags, credential handling, and result-reading details. Do not duplicate their instructions here.
 

@@ -11,8 +11,7 @@ Playwright or Puppeteer dependency. Accessibility-tree snapshots with compact
 `@eN` refs let agents interact with pages in ~200-400 tokens instead of
 parsing raw HTML.
 
-Pre-installed in the sandbox image. Always invoke via the
-``exec_command`` shell tool. The Caido HTTP/HTTPS proxy is already
+Pre-installed in the sandbox image. Use the structured `browser_action` tool for navigation, snapshots, interactions, tabs, files, evidence, and state. It enforces an isolated session for each agent and serializes actions. The CLI reference below documents the underlying engine. The Caido HTTP/HTTPS proxy is already
 wired via ``http_proxy`` / ``https_proxy`` env vars — **do not pass
 ``--proxy``**; agent-browser picks it up automatically and Caido
 captures all page traffic. Localhost (CDP) traffic is excluded via

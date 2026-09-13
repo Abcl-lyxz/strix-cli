@@ -1,6 +1,6 @@
 [project]
 name = "strix-agent"
-version = "1.7.0"
+version = "1.8.0"
 description = "Open-source AI Hackers for your apps"
 readme = "README.md"
 license = "Apache-2.0"
@@ -227,10 +227,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Shared command handlers load optional transports lazily to avoid controller cycles.
+"strix/interface/workspace.py" = ["PLC0415"]
 # Test doubles use fixture tokens/passwords and match a callee signature whose
 # args they intentionally ignore.
-"tests/test_viewer_auth.py" = ["S105", "S106", "ARG001"]
-"tests/test_cloud_cli.py" = ["S105", "ARG001"]
 "tests/test_codex_auth.py" = ["S105", "S106", "SLF001"]
 # Hatchling loads the build hook by path, not as an importable package.
 "scripts/tui_sidecar_hook.py" = ["INP001"]
@@ -250,8 +250,6 @@ ignore = [
 # Stdlib HTTP handler overrides (do_GET/do_POST) and lazy imports that avoid a
 # circular dependency with strix.telemetry / strix.interface.viewer.report_pdf.
 "strix/interface/viewer/server.py" = ["N802", "PLC0415"]
-"strix/interface/cloud/payment_proxy.py" = ["N802"]
-# Lazy telemetry import to avoid importing PostHog before the viewer starts.
 "strix/interface/viewer/cli.py" = ["PLC0415"]
 # Lazy imports inside functions to avoid circular dependency with
 # strix.telemetry / strix.report.dedupe / cvss.
@@ -326,7 +324,9 @@ ignore = [
 # the sidecar entry point stays fast and avoids circular imports.
 "strix/interface/interactive.py" = ["PLC0415"]
 "strix/interface/tui/runtime.py" = ["PLC0415"]
+"strix/interface/application_runtime.py" = ["PLC0415"]
 "strix/interface/tui/backend/controller.py" = ["PLC0415"]
+"strix/interface/application.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
 force-single-line = false

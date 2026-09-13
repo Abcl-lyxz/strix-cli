@@ -404,24 +404,18 @@ def test_scan_targets_drop_empty_and_duplicate_entries() -> None:
     assert build_scan_targets(config) == ["https://app.example.com"]
 
 
-def test_openrouter_attribution_rides_on_the_request_headers() -> None:
-    # litellm.headers is ignored once a request carries any header of its own,
-    # so the attribution must be part of the per-request headers.
+def test_no_automatic_application_attribution_on_provider_requests() -> None:
     headers = make_model_settings(
         None, model_name="openrouter/anthropic/claude-sonnet-4-5"
     ).extra_headers
-    assert headers == {
-        "HTTP-Referer": "https://strix.ai",
-        "X-Title": "Strix",
-        "X-OpenRouter-Categories": "cli-agent",
-    }
+    assert headers is None
 
 
 def test_openrouter_attribution_absent_for_other_providers() -> None:
     assert make_model_settings(None, model_name="anthropic/claude-sonnet-4-5").extra_headers is None
 
 
-def test_user_headers_override_openrouter_attribution() -> None:
+def test_only_explicit_user_headers_are_forwarded() -> None:
     headers = make_model_settings(
         None,
         model_name="openrouter/anthropic/claude-sonnet-4-5",
@@ -430,4 +424,4 @@ def test_user_headers_override_openrouter_attribution() -> None:
     assert headers is not None
     assert headers["X-Title"] == "Custom"
     assert headers["X-Tenant"] == "acme"
-    assert headers["HTTP-Referer"] == "https://strix.ai"
+    assert "HTTP-Referer" not in headers

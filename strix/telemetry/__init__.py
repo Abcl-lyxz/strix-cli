@@ -1,19 +1,14 @@
-from . import posthog, scarf
+"""Local diagnostics only. Strix does not send usage analytics."""
+
+import logging as std_logging
+
 from ._common import set_scan_phase
 
 
 def report_error(error_type: str, exc: BaseException | None = None) -> None:
-    """Beacon a failure category, plus the exception class when one is given.
-
-    Only class names travel: never the message, arguments, or traceback.
-    """
-    posthog.error(error_type, exc)
-    scarf.error(error_type, exc)
+    std_logging.getLogger(__name__).debug(
+        "%s: %s", error_type, type(exc).__name__ if exc else "error"
+    )
 
 
-__all__ = [
-    "posthog",
-    "report_error",
-    "scarf",
-    "set_scan_phase",
-]
+__all__ = ["report_error", "set_scan_phase"]

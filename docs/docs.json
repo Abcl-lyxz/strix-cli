@@ -73,18 +73,6 @@
             ]
           }
         ]
-      },
-      {
-        "tab": "Cloud",
-        "groups": [
-          {
-            "group": "Strix Cloud",
-            "pages": [
-              "cloud/overview",
-              "cloud/cli"
-            ]
-          }
-        ]
       }
     ],
     "global": {
@@ -103,12 +91,7 @@
     }
   },
   "navbar": {
-    "links": [],
-    "primary": {
-      "type": "button",
-      "label": "Try Strix Cloud",
-      "href": "https://app.strix.ai"
-    }
+    "links": []
   },
   "footer": {
     "socials": {
