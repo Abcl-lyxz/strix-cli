@@ -38,6 +38,7 @@ from openai.types.shared import Reasoning
 
 from strix.config import codex
 from strix.config.loader import load_settings
+from strix.config.provider_catalog import recommended_models
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
 from strix.config.tool_call_limits import TurnToolCallLimiter
 from strix.llm.tool_arguments import safe_model_input
@@ -597,35 +598,7 @@ DEFAULT_MODEL_RETRY = ModelRetrySettings(
     policy=_safe_request_retry,
 )
 
-RECOMMENDED_MODEL_NAMES = (
-    "zai/glm-5.3",
-    "zai/glm-5.3-flash",
-    "openai/gpt-5.6-sol",
-    "openai/gpt-5.6-terra",
-    "openai/gpt-5.6-luna",
-    "openai/gpt-5.6",
-    "openai/gpt-5.5-pro",
-    "openai/gpt-5.5",
-    "openai/gpt-5.4",
-    "openai/gpt-5.3-codex",
-    "anthropic/claude-fable-5-1",
-    "anthropic/claude-fable-5",
-    "anthropic/claude-opus-5",
-    "anthropic/claude-opus-4-8",
-    "anthropic/claude-sonnet-5",
-    "anthropic/claude-sonnet-4-6",
-    "vertex_ai/gemini-3.1-pro-preview",
-    "gemini/gemini-3.1-pro-preview",
-    "vertex_ai/gemini-3.7-flash",
-    "gemini/gemini-3.7-flash",
-    "gemini/gemini-3.6-flash",
-    "deepseek/deepseek-v4-pro",
-    "deepseek/deepseek-v4-flash",
-    "dashscope/qwen3.8-max",
-    "dashscope/qwen3.7-max-2026-06-08",
-    "moonshot/kimi-k3",
-    "moonshot/kimi-k2.7-code",
-)
+RECOMMENDED_MODEL_NAMES = recommended_models()
 
 _RECOMMENDED_MODEL_NAME_SET = frozenset(name.lower() for name in RECOMMENDED_MODEL_NAMES)
 

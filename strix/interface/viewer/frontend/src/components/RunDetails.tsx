@@ -72,6 +72,12 @@ export function RunDetails({
   const diffMode = str(diff.mode);
   const diffBase = str(raw.diff_base);
   const nonInteractive = raw.non_interactive === true;
+  const sandboxProfile = str(raw.sandbox_profile);
+  const toolPack = str(raw.tool_pack);
+  const workspaceMode = str(raw.workspace_mode);
+  const scopeCidr = str(raw.scope_cidr);
+  const networkInterface = str(raw.network_interface);
+  const packetRateLimit = num(raw.packet_rate_limit);
   const localSources = arr(raw.local_sources)
     .map((x) => {
       if (typeof x === "string") return x;
@@ -156,6 +162,14 @@ export function RunDetails({
             {scanMode && <Field label="Pentest mode">{scanMode}</Field>}
             <Field label="Scope">{scope}</Field>
             <Field label="Mode">{nonInteractive ? "Non-interactive" : "Interactive"}</Field>
+            {sandboxProfile && <Field label="Sandbox">{sandboxProfile}</Field>}
+            {toolPack && <Field label="Tool pack">{toolPack}</Field>}
+            {workspaceMode && <Field label="Workspace">{workspaceMode}</Field>}
+            {scopeCidr && <Field label="CIDR allowlist">{scopeCidr}</Field>}
+            {networkInterface && <Field label="Interface">{networkInterface}</Field>}
+            {packetRateLimit != null && (
+              <Field label="Packet ceiling">{packetRateLimit} new packets/second</Field>
+            )}
             {localSources.length > 0 && (
               <Field label="Local sources">
                 <div className="space-y-0.5 font-mono text-[#ddd]">
@@ -205,8 +219,12 @@ export function RunDetails({
                   <span className="text-[#22c55e]">$0.00</span>
                   <span className="text-[#666]"> (subscription)</span>
                 </Field>
+              ) : cost != null ? (
+                <Field label="Cost">${cost.toFixed(2)}</Field>
               ) : (
-                cost != null && <Field label="Cost">${cost.toFixed(2)}</Field>
+                <Field label="Cost">
+                  <span className="text-[#888]">Unknown (provider price unavailable)</span>
+                </Field>
               )}
               {agents.length > 0 && <Field label="Agents">{formatNumber(agents.length)}</Field>}
             </dl>

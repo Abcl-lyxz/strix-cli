@@ -53,6 +53,14 @@ strix routes disable primary
 strix routes remove primary
 strix routes strategy
 
+strix providers list
+strix providers refresh
+strix providers detect custom --base-url http://localhost:11434/v1
+strix providers connect bedrock vendor.model:v1 --no-key
+
+strix intel status
+strix intel update
+
 strix secrets status
 strix secrets migrate
 strix secrets purge-legacy
@@ -75,12 +83,37 @@ for routing, secure credentials, recovery, and file locations.
   When the target is an API spec, Strix copies it into the agent's workspace and authorizes the base URLs it declares (including those resolved from a Postman environment) as in-scope hosts - so the agent reads the contract and tests the full declared surface instead of discovering endpoints by crawling. Pair the spec with the deployed base URL (e.g. `--target ./openapi.yaml --target https://api.example.com`) so the agent has a reachable host to attack.
 
   <Note>
-    A local directory is mounted into the sandbox live and **writable**, so the agent edits your real files (`.git` excepted). Commit or stash first.
+    A local directory is mounted live but **read-only** in the default `web`
+    profile. Select `--sandbox-profile remediation --workspace-mode read-write`
+    only when you explicitly want the agent to edit your real files. Git and
+    agent-control metadata remain protected.
   </Note>
 
   <Note>
     Fetching a Postman collection by id requires `POSTMAN_API_KEY`. Add `?env=<environment-uuid>` to also pull a Postman environment, which resolves `{{baseUrl}}` / token variables the collection references (e.g. `postman://<collection-uuid>?env=<environment-uid>`).
   </Note>
+</ParamField>
+
+<ParamField path="--sandbox-profile" type="string" default="web">
+  Privilege profile: `web`, `network`, `lan`, or `remediation`. `network`
+  requires `--scope-cidr`. Linux-only wired L2 work uses `lan` and additionally
+  requires `--network-interface`, `--packet-rate-limit`,
+  `--acknowledge-lan-scope`, and a preconfigured macvlan/ipvlan Docker network.
+</ParamField>
+
+<ParamField path="--tool-pack" type="string" default="auto">
+  Comma-separated scanner packs (`core`, `network`, `identity`, `cloud`,
+  `mobile`, `firmware`) or `auto` to load capabilities from detected targets.
+</ParamField>
+
+<ParamField path="--scope-cidr" type="string">
+  Comma-separated authorized CIDRs. Network jobs validate explicit IP/CIDR
+  arguments and the container installs an egress firewall as a backstop.
+</ParamField>
+
+<ParamField path="--workspace-mode" type="string" default="read-only">
+  Source-mount access. `read-write` is accepted only with the `remediation`
+  profile and never inherits raw-network privileges.
 </ParamField>
 
 <ParamField path="--target-list" type="string">
@@ -232,7 +265,7 @@ On Windows, package updates are staged first. Strix exits so an independent inst
 Versions 1.7.0 and 1.8.0 can incorrectly look up an upstream PyPI version and then report a missing GitHub manifest. For a Windows uv installation, bootstrap the fixed updater once with:
 
 ```powershell
-uv tool install --force https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.8.2/strix_agent-1.8.2-py3-none-win_amd64.whl
+uv tool install --force https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.9.0/strix_agent-1.9.0-py3-none-win_amd64.whl
 strix --version
 ```
 

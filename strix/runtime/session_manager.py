@@ -18,6 +18,7 @@ from strix.config import load_settings
 from strix.runtime.backends import backend_supports_bind_mounts, get_backend
 from strix.runtime.caido_bootstrap import bootstrap_caido
 from strix.runtime.caido_handle import CaidoBootstrapHandle
+from strix.runtime.profiles import active_profile
 
 
 if TYPE_CHECKING:
@@ -61,6 +62,7 @@ def _host_identity_env() -> dict[str, str]:
 
 
 def build_bind_mounts(local_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    read_only = active_profile().workspace_read_only
     bind_mounts: list[dict[str, Any]] = []
     for src in local_sources:
         ws_subdir = src.get("workspace_subdir") or ""
@@ -69,7 +71,7 @@ def build_bind_mounts(local_sources: list[dict[str, Any]]) -> list[dict[str, Any
             continue
         resolved = Path(host_path).expanduser().resolve()
         target = f"{_WORKSPACE_ROOT}/{ws_subdir}"
-        bind_mounts.append({"source": str(resolved), "target": target, "read_only": False})
+        bind_mounts.append({"source": str(resolved), "target": target, "read_only": read_only})
         if src.get("protect_metadata"):
             bind_mounts.extend(_metadata_mounts(resolved, target))
     return bind_mounts
@@ -328,7 +330,19 @@ async def create_or_reuse(
             value={
                 "PYTHONUNBUFFERED": "1",
                 "HOST_GATEWAY": "host.docker.internal",
-                **_host_identity_env(),
+                **(
+                    {}
+                    if load_settings().runtime.sandbox_profile != "remediation"
+                    else _host_identity_env()
+                ),
+                "STRIX_HARDENED_SANDBOX": (
+                    "1" if load_settings().runtime.sandbox_profile != "remediation" else "0"
+                ),
+                "STRIX_SANDBOX_PROFILE": load_settings().runtime.sandbox_profile,
+                "STRIX_SCOPE_CIDR": load_settings().runtime.scope_cidr or "",
+                "STRIX_NETWORK_INTERFACE": load_settings().runtime.network_interface or "",
+                "STRIX_TOOL_PACK": load_settings().runtime.tool_pack,
+                "STRIX_PACKET_RATE_LIMIT": str(load_settings().runtime.packet_rate_limit or ""),
                 "http_proxy": container_caido_url,
                 "https_proxy": container_caido_url,
                 "ALL_PROXY": container_caido_url,

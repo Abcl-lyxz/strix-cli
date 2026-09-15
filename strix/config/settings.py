@@ -92,7 +92,12 @@ class ContextSettings(BaseSettings):
     compact_buffer_tokens: int = Field(default=20_000, gt=0, alias="STRIX_CONTEXT_BUFFER_TOKENS")
     keep_tokens: int = Field(default=8_000, gt=0, alias="STRIX_CONTEXT_KEEP_TOKENS")
     fallback_context_tokens: int = Field(
-        default=200_000, gt=0, alias="STRIX_CONTEXT_FALLBACK_TOKENS"
+        # Unknown/custom model names must fail conservatively.  The previous
+        # 200k fallback delayed compaction until many gateways had already
+        # rejected the request, leaving long-running agents unable to resume.
+        default=32_768,
+        gt=0,
+        alias="STRIX_CONTEXT_FALLBACK_TOKENS",
     )
     summary_max_tokens: int = Field(default=4_096, gt=0, alias="STRIX_CONTEXT_SUMMARY_TOKENS")
     tool_output_max_tokens: int = Field(default=8_000, gt=0, alias="STRIX_TOOL_OUTPUT_MAX_TOKENS")
@@ -113,6 +118,19 @@ class RuntimeSettings(BaseSettings):
     backend: str = Field(default="docker", alias="STRIX_RUNTIME_BACKEND")
     # Max screenshot/image tool outputs kept live per agent context (0 = none).
     max_context_images: int = Field(default=3, ge=0, alias="STRIX_MAX_CONTEXT_IMAGES")
+    sandbox_profile: Literal["web", "network", "lan", "remediation"] = Field(
+        default="web", alias="STRIX_SANDBOX_PROFILE"
+    )
+    tool_pack: str = Field(default="auto", alias="STRIX_TOOL_PACK")
+    workspace_mode: Literal["read-only", "read-write"] = Field(
+        default="read-only", alias="STRIX_WORKSPACE_MODE"
+    )
+    scope_cidr: str | None = Field(default=None, alias="STRIX_SCOPE_CIDR")
+    network_interface: str | None = Field(default=None, alias="STRIX_NETWORK_INTERFACE")
+    packet_rate_limit: int | None = Field(
+        default=None, gt=0, le=100_000, alias="STRIX_PACKET_RATE_LIMIT"
+    )
+    lan_acknowledged: bool = Field(default=False, alias="STRIX_LAN_ACKNOWLEDGED")
 
 
 class RoutingSettings(BaseSettings):
@@ -121,6 +139,7 @@ class RoutingSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
     outage_timeout: int = Field(default=600, ge=1, alias="STRIX_ROUTE_OUTAGE_TIMEOUT")
+    max_attempts_per_route: int = Field(default=2, ge=1, le=10, alias="STRIX_ROUTE_MAX_ATTEMPTS")
 
 
 WebSearchProvider = Literal["auto", "perplexity", "exa"]
@@ -159,6 +178,7 @@ class IntegrationSettings(BaseSettings):
         alias="POSTMAN_API_KEY",
         repr=False,
     )
+    nvd_api_key: str | None = Field(default=None, alias="NVD_API_KEY", repr=False)
 
 
 class KeyboardSettings(BaseSettings):

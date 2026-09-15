@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from agents import RunContextWrapper, function_tool
 
+from strix.llm.error_envelope import error_envelope
 from strix.runtime.caido_handle import CaidoBootstrapHandle
 from strix.tools.nullish import clean_optional
 from strix.tools.proxy import caido_api
@@ -48,6 +49,13 @@ ScopeAction = Literal["get", "list", "create", "update", "delete"]
 # is not concurrency-safe (parallel calls raise "Transport is already
 # connected"). Serialize every host-side proxy call through this lock.
 _CAIDO_CALL_LOCK = asyncio.Lock()
+_HTTPQL_TEXT_TERM = re.compile(
+    r"\b(?:req\.(?:method|host|path|query|ext|raw)|resp\.raw)\."
+    r"(?:eq|ne|cont|ncont|regex|nregex|like|nlike):([^\s()]+)"
+)
+_HTTPQL_NUMERIC_QUOTED = re.compile(
+    r'\b(?:resp\.code|req\.port|roundtrip|id)\.(?:eq|ne|gt|gte|lt|lte):"(-?\d+)"'
+)
 
 
 async def _ctx_client(ctx: RunContextWrapper) -> Client | None:
@@ -125,11 +133,76 @@ def _no_client() -> str:
 
 def _err(name: str, exc: Exception) -> str:
     logger.exception("%s failed", name)
-    return json.dumps(
-        {"success": False, "error": f"{name} failed: {exc}"},
-        ensure_ascii=False,
-        default=str,
+    envelope = error_envelope(
+        exc,
+        category_hint="browser_proxy",
+        safe_to_replay=name
+        in {"list_requests", "view_request", "list_sitemap", "view_sitemap_entry"},
     )
+    return json.dumps({"success": False, "error": envelope.to_dict()}, ensure_ascii=False)
+
+
+def _repair_httpql(value: str) -> str:
+    repaired = re.sub(r"\s*&&\s*", " AND ", value.strip())
+    repaired = re.sub(r"\s*\|\|\s*", " OR ", repaired)
+    repaired = re.sub(r"\b(and|or)\b", lambda match: match.group(1).upper(), repaired, flags=re.I)
+    repaired = re.sub(
+        r"\b([a-z][a-z0-9_.]*)\s*==\s*([^\s()]+)",
+        r"\1.eq:\2",
+        repaired,
+        flags=re.I,
+    )
+    repaired = _HTTPQL_NUMERIC_QUOTED.sub(lambda match: match.group(0).replace('"', ""), repaired)
+
+    def quote_text(match: re.Match[str]) -> str:
+        term = match.group(0)
+        value_part = match.group(1)
+        if value_part.startswith(('"', "'")):
+            return term
+        return term[: -len(value_part)] + json.dumps(value_part)
+
+    return _HTTPQL_TEXT_TERM.sub(quote_text, repaired)
+
+
+def _validate_httpql(  # noqa: PLR0912 - precise grammar diagnostics need distinct checks.
+    value: str,
+) -> str | None:
+    if len(value.encode("utf-8")) > 16_384:
+        return "HTTPQL filter exceeds 16 KiB"
+    if any(ord(char) < 32 and char not in "\t\r\n" for char in value):
+        return "HTTPQL filter contains a control character"
+    escaped = False
+    quoted = False
+    depth = 0
+    for char in value:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quoted:
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char == "(":
+            depth += 1
+        elif not quoted and char == ")":
+            depth -= 1
+            if depth < 0:
+                return "HTTPQL filter has an unmatched closing parenthesis"
+    if quoted:
+        return "HTTPQL filter has an unterminated quoted string"
+    if depth:
+        return "HTTPQL filter has unmatched parentheses"
+    if re.search(r"\bNOT\b", value, re.I):
+        return "HTTPQL has no NOT operator; use ne, ncont, nlike, or nregex"
+    if "&&" in value or "||" in value or "==" in value:
+        return "HTTPQL uses AND/OR and field.eq:value rather than &&, ||, or =="
+    for match in _HTTPQL_TEXT_TERM.finditer(value):
+        if not match.group(1).startswith(('"', "'")):
+            return "HTTPQL text values must be quoted"
+    if _HTTPQL_NUMERIC_QUOTED.search(value):
+        return "HTTPQL numeric values must not be quoted"
+    return None
 
 
 @function_tool(timeout=120)
@@ -198,6 +271,22 @@ async def list_requests(
     after = clean_optional(after)
     scope_id = clean_optional(scope_id)
 
+    repaired_from: str | None = None
+    if httpql_filter:
+        validation_error = _validate_httpql(httpql_filter)
+        if validation_error:
+            repaired = _repair_httpql(httpql_filter)
+            if repaired != httpql_filter and _validate_httpql(repaired) is None:
+                repaired_from = httpql_filter
+                httpql_filter = repaired
+            else:
+                envelope = error_envelope(
+                    ValueError(validation_error), category_hint="tool_validation"
+                )
+                return json.dumps(
+                    {"success": False, "error": envelope.to_dict()}, ensure_ascii=False
+                )
+
     try:
         connection = await _call(
             client,
@@ -248,17 +337,24 @@ async def list_requests(
                 },
             )
 
-        return json.dumps(
-            {
-                "success": True,
-                "entries": entries,
-                "page_info": {
-                    "has_next_page": connection.page_info.has_next_page,
-                    "has_previous_page": connection.page_info.has_previous_page,
-                    "start_cursor": connection.page_info.start_cursor,
-                    "end_cursor": connection.page_info.end_cursor,
-                },
+        payload: dict[str, Any] = {
+            "success": True,
+            "entries": entries,
+            "page_info": {
+                "has_next_page": connection.page_info.has_next_page,
+                "has_previous_page": connection.page_info.has_previous_page,
+                "start_cursor": connection.page_info.start_cursor,
+                "end_cursor": connection.page_info.end_cursor,
             },
+        }
+        if repaired_from is not None:
+            payload["httpql_repair"] = {
+                "original": repaired_from,
+                "executed": httpql_filter,
+                "attempts": 1,
+            }
+        return json.dumps(
+            payload,
             ensure_ascii=False,
             default=str,
         )

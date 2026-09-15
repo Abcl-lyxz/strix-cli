@@ -16,6 +16,7 @@ from uuid import uuid4
 from agents import RunContextWrapper, function_tool
 
 from strix.core.paths import run_dir_for
+from strix.llm.error_envelope import error_envelope
 from strix.security import get_secret_store, redact_secrets
 from strix.security.secrets import redact_value
 
@@ -272,10 +273,16 @@ async def browser_action(
     try:
         return await browser.action(action, selector, value)
     except (ValueError, OSError, TimeoutError, RuntimeError) as exc:
+        envelope = (
+            error_envelope(exc, category_hint="tool_validation", safe_to_replay=action in _READS)
+            if isinstance(exc, ValueError)
+            else error_envelope(exc, category_hint="browser_proxy", safe_to_replay=action in _READS)
+        )
         return {
             "success": False,
             "action": action,
             "error": redact_secrets(exc),
+            "error_envelope": envelope.to_dict(),
             "recovery": "The action was not replayed. Inspect the page before trying again.",
         }
 

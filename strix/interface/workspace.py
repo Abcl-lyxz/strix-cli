@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from strix.config.provider_catalog import provider_descriptors, refresh_provider_catalog
 from strix.config.providers import (
-    PROVIDERS,
     connect_provider,
     discover_models,
     profile_list,
@@ -95,9 +95,18 @@ class WorkspaceCommands:
             return {"saved": True}
         if command == "providers.list":
             return {
-                "providers": PROVIDERS,
+                "providers": provider_descriptors(),
                 "profiles": profile_list(),
                 "selected": c.selected_route,
+            }
+        if command == "providers.refresh":
+            result = await asyncio.to_thread(
+                refresh_provider_catalog, force=payload.get("force") is True
+            )
+            return {
+                "source": result["source"],
+                "providers": provider_descriptors(),
+                "profiles": profile_list(),
             }
         if command == "providers.discover":
             return await asyncio.to_thread(

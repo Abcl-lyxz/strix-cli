@@ -183,7 +183,7 @@ function emptyVulnerabilityDefaults(): Omit<
   };
 }
 
-function parseOneVulnerability(
+export function normalizeVulnerability(
   raw: Record<string, unknown>,
   index: number,
   runId: string | null
@@ -196,7 +196,16 @@ function parseOneVulnerability(
         ? (cweRaw.filter((c) => typeof c === "string" && c) as string[])
         : null;
 
-  const status: VulnerabilityStatus = "open";
+  const rawStatus = asStringOrNull(raw.status);
+  const status: VulnerabilityStatus = [
+    "open",
+    "in_progress",
+    "snoozed",
+    "fixed",
+    "ignored",
+  ].includes(rawStatus || "")
+    ? (rawStatus as VulnerabilityStatus)
+    : "open";
 
   return {
     ...emptyVulnerabilityDefaults(),
@@ -207,8 +216,14 @@ function parseOneVulnerability(
     severity: coerceSeverity(raw.severity),
     status,
     created_at: toIsoTimestamp(raw.timestamp),
-    cve: asStringOrNull(raw.cve),
-    cvss: asNumberOrNull(raw.cvss),
+    cve: asStringOrNull(raw.cve) ?? asStringOrNull(raw.cve_id),
+    cvss: asNumberOrNull(raw.cvss) ?? asNumberOrNull(raw.cvss_score),
+    cvss_vector: asStringOrNull(raw.cvss_vector),
+    epss: asNumberOrNull(raw.epss),
+    known_exploited: typeof raw.known_exploited === "boolean" ? raw.known_exploited : null,
+    intelligence_source: asStringOrNull(raw.intelligence_source),
+    intelligence_fetched_at: asStringOrNull(raw.intelligence_fetched_at),
+    match_confidence: asStringOrNull(raw.match_confidence),
     impact: asStringOrNull(raw.impact),
     endpoint: asStringOrNull(raw.endpoint),
     method: asStringOrNull(raw.method),
@@ -241,7 +256,7 @@ export function parseVulnerabilitiesJson(
     if (!item || typeof item !== "object") {
       throw new RunParseError(`vulnerabilities.json entry #${i + 1} is not an object.`);
     }
-    return parseOneVulnerability(item as Record<string, unknown>, i, runId);
+    return normalizeVulnerability(item as Record<string, unknown>, i, runId);
   });
 }
 

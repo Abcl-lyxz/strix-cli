@@ -7,6 +7,7 @@ import os
 import sqlite3
 import urllib.error
 import urllib.request
+from http.client import HTTPConnection
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -266,11 +267,25 @@ def _post(
         return exc.code, exc.read()
 
 
+def _bootstrap(url: str, token: str) -> tuple[int, dict[str, str]]:
+    """Make a bootstrap request without following its security redirect."""
+    parts = urlsplit(url)
+    connection = HTTPConnection(parts.hostname, parts.port, timeout=3)
+    try:
+        connection.request("GET", f"/?token={token}")
+        response = connection.getresponse()
+        response.read()
+        return response.status, dict(response.getheaders())
+    finally:
+        connection.close()
+
+
 def _session_cookie(url: str, token: str) -> str:
-    """Bootstrap a session via the tokened URL and return its ``name=value`` cookie."""
-    bootstrap = f"{url}/?token={token}"
-    with urllib.request.urlopen(bootstrap) as resp:  # noqa: S310 - localhost test server  # nosec B310
-        raw = str(resp.headers.get("Set-Cookie", ""))
+    """Exchange a one-time nonce and return its ``name=value`` cookie."""
+    status, headers = _bootstrap(url, token)
+    assert status == 303
+    assert headers.get("Location") == "/"
+    raw = headers.get("Set-Cookie", "")
     return raw.split(";", 1)[0]
 
 
@@ -312,15 +327,24 @@ def test_capability_issued_only_for_tokened_bootstrap(
         with urllib.request.urlopen(url + "/") as resp:  # noqa: S310  # nosec B310
             assert resp.headers.get("Set-Cookie") is None
 
-        # A wrong token is likewise refused the capability.
-        with urllib.request.urlopen(f"{url}/?token=wrong") as resp:  # noqa: S310  # nosec B310
-            assert resp.headers.get("Set-Cookie") is None
+        # A wrong token is refused the capability.
+        status, headers = _bootstrap(url, "wrong")
+        assert status == 403
+        assert headers.get("Set-Cookie") is None
 
-        # Only the correct bootstrap token mints the session cookie.
-        with urllib.request.urlopen(f"{url}/?token={token}") as resp:  # noqa: S310  # nosec B310
-            cookie = str(resp.headers.get("Set-Cookie", ""))
+        # Only the correct bootstrap nonce mints the cookie and removes the
+        # secret from browser history with an immediate redirect.
+        status, headers = _bootstrap(url, token)
+        assert status == 303
+        assert headers.get("Location") == "/"
+        cookie = headers.get("Set-Cookie", "")
         assert f"{_cookie_name(url)}=" in cookie
         assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+
+        # Nonces cannot be replayed, even during their 60-second lifetime.
+        replay_status, replay_headers = _bootstrap(url, token)
+        assert replay_status == 403
+        assert replay_headers.get("Set-Cookie") is None
 
         # Static assets never carry it.
         with urllib.request.urlopen(url + "/assets/app.js") as resp:  # noqa: S310  # nosec B310

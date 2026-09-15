@@ -25,6 +25,7 @@ class LLMUsageLedger:
         self._observed_cost = 0.0
         self._estimated_cost = 0.0
         self._has_observed_cost = False
+        self._has_estimated_cost = False
         # When True, tokens are still tracked but cost stays $0 — the run is on a
         # model subscription, so there is no metered per-token charge to report.
         self.zero_cost = False
@@ -59,8 +60,9 @@ class LLMUsageLedger:
 
         if not self.zero_cost:
             estimated = _estimate_litellm_cost(usage, model)
-            if estimated:
+            if estimated is not None:
                 self._estimated_cost += estimated
+                self._has_estimated_cost = True
                 if route and model:
                     route_key = (route, model)
                     self._route_estimated_cost[route_key] = (
@@ -82,9 +84,13 @@ class LLMUsageLedger:
             return 0.0
         return _round_cost(self._observed_cost if self._has_observed_cost else self._estimated_cost)
 
+    @property
+    def cost_known(self) -> bool:
+        return self.zero_cost or self._has_observed_cost or self._has_estimated_cost
+
     def to_record(self) -> dict[str, Any]:
         record = serialize_usage(self._total_usage)
-        record["cost"] = self.total_cost
+        record["cost"] = self.total_cost if self.cost_known else None
         record["agents"] = []
         record["routes"] = []
 
@@ -93,9 +99,13 @@ class LLMUsageLedger:
         for agent_id in sorted(self._agent_usage):
             usage = self._agent_usage[agent_id]
             metadata = self._agent_metadata.get(agent_id, {})
-            agent_cost = (
-                self.total_cost * (agent_tokens[agent_id] / total_tokens) if total_tokens else 0.0
-            )
+            agent_cost = None
+            if self.cost_known:
+                agent_cost = (
+                    self.total_cost * (agent_tokens[agent_id] / total_tokens)
+                    if total_tokens
+                    else 0.0
+                )
 
             agent_record = serialize_usage(usage)
             agent_record.update(
@@ -104,7 +114,7 @@ class LLMUsageLedger:
                     "agent_name": metadata.get("agent_name") or agent_id,
                     "model": metadata.get("model"),
                     "route": metadata.get("route"),
-                    "cost": _round_cost(agent_cost),
+                    "cost": _round_cost(agent_cost) if agent_cost is not None else None,
                 }
             )
             record["agents"].append(agent_record)
@@ -115,7 +125,11 @@ class LLMUsageLedger:
                 {
                     "route": route,
                     "model": model,
-                    "cost": _round_cost(self._route_estimated_cost.get((route, model), 0.0)),
+                    "cost": (
+                        _round_cost(self._route_estimated_cost[(route, model)])
+                        if (route, model) in self._route_estimated_cost
+                        else None
+                    ),
                 }
             )
             record["routes"].append(route_record)
@@ -131,6 +145,7 @@ class LLMUsageLedger:
         self._observed_cost = 0.0
         self._estimated_cost = 0.0
         self._has_observed_cost = False
+        self._has_estimated_cost = False
 
         if not isinstance(raw_usage, dict):
             return
@@ -141,9 +156,11 @@ class LLMUsageLedger:
             logger.exception("Failed to hydrate aggregate llm_usage from run.json")
             self._total_usage = Usage()
 
-        persisted_cost = _float_or_zero(raw_usage.get("cost"))
-        self._observed_cost = persisted_cost
-        self._estimated_cost = persisted_cost
+        if raw_usage.get("cost") is not None:
+            persisted_cost = _float_or_zero(raw_usage.get("cost"))
+            self._observed_cost = persisted_cost
+            self._estimated_cost = persisted_cost
+            self._has_estimated_cost = True
 
         for raw_agent in raw_usage.get("agents") or []:
             if not isinstance(raw_agent, dict):
@@ -182,7 +199,8 @@ class LLMUsageLedger:
             except Exception:
                 logger.exception("Failed to hydrate llm_usage for route %s", route)
                 continue
-            self._route_estimated_cost[key] = _float_or_zero(raw_route.get("cost"))
+            if raw_route.get("cost") is not None:
+                self._route_estimated_cost[key] = _float_or_zero(raw_route.get("cost"))
 
 
 def _resolve_total_tokens(usage: Usage) -> int:

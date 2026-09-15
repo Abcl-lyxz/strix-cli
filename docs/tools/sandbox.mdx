@@ -5,6 +5,28 @@ description: "Pre-installed security tools in the Strix container"
 
 Strix runs inside a Kali Linux-based Docker container with a comprehensive set of security tools pre-installed. The agent can use any of these tools through the [terminal](/tools/terminal).
 
+## Profiles and capability packs
+
+`web` is the default profile: non-root, no added Linux capabilities, read-only
+source/root filesystem, and temporary writable mounts. `network` adds only
+`NET_RAW` and `NET_ADMIN` and requires an enforced CIDR allowlist. `lan` is for
+authorized wired Ethernet L2 work on a native Linux Docker host; it refuses
+Docker Desktop/Windows and requires an explicit interface, CIDR,
+acknowledgement, packet-rate ceiling, and macvlan/ipvlan network. `remediation`
+permits an explicitly writable workspace without raw-network privileges.
+
+Before launch Strix reports the effective profile, mounts, capabilities,
+targets, tool pack, and platform. Wireless testing, denial-of-service,
+credential spraying, destructive exploitation, and lateral movement are not
+default capabilities.
+
+The image publishes `core`, `network`, `identity`, `cloud`, `mobile`, and
+`firmware` packs. Agents first list/describe a compact capability and then start
+a supervised job, so every binary schema is not repeated in every model call.
+Pack inventory and health metadata live in `/opt/strix/tool-packs.json`; the
+image also carries `/opt/strix/package-sbom.tsv` and
+`strix-tool-healthcheck`.
+
 ## Reconnaissance
 
 | Tool                                                       | Description                            |
@@ -73,6 +95,14 @@ Strix runs inside a Kali Linux-based Docker container with a comprehensive set o
 | Tool                       | Description                                    |
 | -------------------------- | ---------------------------------------------- |
 | [Trivy](https://trivy.dev) | Filesystem/container scanning for vulns, misconfigurations, secrets, and licenses |
+
+## Network, identity, cloud, mobile, and firmware
+
+Optional capability packs include Masscan, ARP scanning, tcpdump/TShark,
+Scapy, DNS/SNMP/IKE/TLS utilities; NetExec, Impacket, SMB/LDAP/Kerberos and
+BloodHound collection; Prowler, ScoutSuite and Kubernetes tooling; JADX,
+apktool, ADB and Frida; and Binwalk, SquashFS, YARA and user-mode emulation.
+Active network and identity jobs require a CIDR-enforced profile.
 
 ## HTTP Proxy
 

@@ -1,5 +1,5 @@
-"""StrixDockerSandboxClient — preserves the image's ENTRYPOINT and adds
-NET_ADMIN/NET_RAW capabilities + host-gateway.
+"""StrixDockerSandboxClient — preserves the image's ENTRYPOINT and applies
+explicit least-privilege profiles plus host-gateway.
 
 The SDK's ``DockerSandboxClient._create_container`` does not expose a hook for
 extending ``create_kwargs`` before ``containers.create`` is called. We subclass
@@ -11,8 +11,7 @@ deltas:
    ``docker-entrypoint.sh`` actually run — without it, ``caido-cli`` never
    starts inside the container and ``bootstrap_caido`` retries against a
    dead port.
-2. Append NET_ADMIN/NET_RAW to ``cap_add`` (required by ``nmap -sS`` and
-   other raw-socket tools).
+2. Apply the selected web/network/lan/remediation capability profile.
 3. Add ``host.docker.internal`` → host-gateway to ``extra_hosts`` so the
    agent can reach host-served apps.
 
@@ -46,6 +45,8 @@ from docker.types import LogConfig  # type: ignore[import-untyped, unused-ignore
 from docker.types import Mount as DockerSDKMount  # type: ignore[import-untyped, unused-ignore]
 from docker.utils import parse_repository_tag  # type: ignore[import-untyped, unused-ignore]
 from requests.exceptions import RequestException
+
+from strix.runtime.profiles import apply_profile
 
 
 logger = logging.getLogger(__name__)
@@ -220,14 +221,11 @@ class StrixDockerSandboxClient(DockerSandboxClient):
             }
         # ----- END VERBATIM COPY -----
 
-        # Strix injections — append, don't overwrite, so FUSE/SYS_ADMIN survives.
-        cap_add = create_kwargs.setdefault("cap_add", [])
-        if not isinstance(cap_add, list):
-            cap_add = list(cap_add)
-            create_kwargs["cap_add"] = cap_add
-        for cap in ("NET_ADMIN", "NET_RAW"):
-            if cap not in cap_add:
-                cap_add.append(cap)
+        # Explicit profiles replace the old unconditional NET_ADMIN/NET_RAW
+        # grant.  ``web`` is least privilege; packet capabilities require the
+        # operator-selected network/lan profile.
+        profile = apply_profile(create_kwargs)
+        cap_add = create_kwargs.get("cap_add", [])
 
         extra_hosts = create_kwargs.setdefault("extra_hosts", {})
         extra_hosts["host.docker.internal"] = "host-gateway"
@@ -258,6 +256,7 @@ class StrixDockerSandboxClient(DockerSandboxClient):
             cap_add,
             list(exposed_ports),
         )
+        logger.info("Sandbox profile applied: %s", profile.name)
         container = self.docker_client.containers.create(**create_kwargs)
         logger.info(
             "Sandbox container created: id=%s image=%s",

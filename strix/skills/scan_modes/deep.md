@@ -146,16 +146,21 @@ When initial attempts fail:
 
 ## Agent Strategy
 
-After reconnaissance, decompose the application hierarchically:
+After reconnaissance, build a coverage graph and decompose only independent hypotheses:
 
 1. **Component level** - Auth System, Payment Gateway, User Profile, Admin Panel
 2. **Feature level** - Login Form, Registration API, Password Reset
 3. **Vulnerability level** - SQLi Agent, XSS Agent, Auth Bypass Agent
 
-Spawn specialized agents at each level. Scale horizontally to maximum parallelization:
-- Do NOT overload a single agent with multiple vulnerability types
-- Each agent focuses on one specific area or vulnerability type
-- Creates a massive parallel swarm covering every angle
+Create a specialist only when it owns a distinct target, trust boundary, or test
+hypothesis that is not already covered. Keep runnable agents at or below the
+healthy model-route and scanner capacity shown by the runtime.
+
+- Batch closely related checks when they reuse the same session or evidence.
+- Reuse reconnaissance, proxy traffic, versions, and artifacts instead of repeating scans.
+- Stop a branch when its hypothesis is disproven or the evidence cannot change the conclusion.
+- When a provider is cooling down, leave work queued; do not wake or respawn agents to retry it.
+- Reserve capacity for validation and reporting before expanding discovery work.
 
 ## Mindset
 

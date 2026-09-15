@@ -189,6 +189,25 @@ async def test_maybe_compact_noop_when_within_budget(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_discovered_context_override_can_raise_unknown_model_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_budget(monkeypatch, keep_tokens=50, window=100)
+    session = FakeSession(_turns(10))
+    before = await session.get_items()
+
+    assert (
+        await compaction.maybe_compact(
+            session,
+            model="unknown-model",
+            context_window_tokens=1_000_000,
+        )
+        is False
+    )
+    assert await session.get_items() == before
+
+
+@pytest.mark.asyncio
 async def test_maybe_compact_rewrites_and_keeps_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_budget(monkeypatch, keep_tokens=30, window=4_000)
     _patch_summary(monkeypatch, "SUMMARY BODY")
@@ -298,7 +317,9 @@ async def test_summary_request_fits_when_room_is_below_old_floor(
 
 
 @pytest.mark.asyncio
-async def test_maybe_compact_skips_when_summary_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_maybe_compact_uses_deterministic_checkpoint_when_summary_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _patch_budget(monkeypatch, keep_tokens=30, window=4_000)
 
     class BoomModel:
@@ -311,10 +332,11 @@ async def test_maybe_compact_skips_when_summary_fails(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(compaction, "StrixProvider", BoomProvider)
     session = FakeSession(_turns(12))
-    before = await session.get_items()
-
-    assert await compaction.maybe_compact(session, model="m", force=True) is False
-    assert await session.get_items() == before
+    assert await compaction.maybe_compact(session, model="m", force=True) is True
+    items = await session.get_items()
+    assert items[0]["role"] == "user"
+    assert "Recovery note" in items[0]["content"]
+    assert "do not repeat completed side effects" in items[0]["content"]
 
 
 @pytest.mark.asyncio

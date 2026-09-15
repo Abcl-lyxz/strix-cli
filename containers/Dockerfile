@@ -24,6 +24,9 @@ RUN mkdir -p /out/bin && \
 # ---------------------------------------------------------------------------
 FROM kalilinux/kali-rolling:latest
 
+ARG STRIX_TOOL_PACKS=core,network,identity,cloud,mobile,firmware
+ENV STRIX_TOOL_PACK=${STRIX_TOOL_PACKS}
+
 LABEL description="AI Agent Penetration Testing Environment with Comprehensive Automated Tools"
 
 RUN apt-get update && \
@@ -60,8 +63,35 @@ RUN apt-get update && \
     libnss3-tools \
     chromium fonts-liberation
 
+RUN set -eux; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',network,'; then \
+      apt-get update; apt-get install -y --no-install-recommends \
+        masscan arp-scan netdiscover tcpdump tshark python3-scapy dnsrecon \
+        snmp onesixtyone ike-scan sslscan testssl.sh socat iptables; \
+    fi; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',identity,'; then \
+      apt-get update; apt-get install -y --no-install-recommends \
+        netexec enum4linux-ng smbclient ldap-utils python3-impacket bloodhound.py kerbrute; \
+    fi; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',cloud,'; then \
+      apt-get update; apt-get install -y --no-install-recommends \
+        kubernetes-client kube-bench kube-hunter; \
+    fi; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',mobile,'; then \
+      apt-get update; apt-get install -y --no-install-recommends jadx apktool apksigner adb; \
+    fi; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',firmware,'; then \
+      apt-get update; apt-get install -y --no-install-recommends \
+        binwalk squashfs-tools yara qemu-user-static; \
+    fi
 
-RUN setcap cap_net_raw,cap_net_admin,cap_net_bind_service+eip $(which nmap)
+
+RUN setcap cap_net_raw,cap_net_admin,cap_net_bind_service+eip $(which nmap) && \
+    if command -v tcpdump >/dev/null 2>&1; then setcap cap_net_raw,cap_net_admin+eip $(which tcpdump); fi && \
+    if command -v masscan >/dev/null 2>&1; then setcap cap_net_raw+eip $(which masscan); fi && \
+    if command -v arp-scan >/dev/null 2>&1; then setcap cap_net_raw+eip $(which arp-scan); fi && \
+    if command -v iptables >/dev/null 2>&1; then setcap cap_net_admin+eip $(readlink -f $(which iptables)); fi && \
+    if command -v ip6tables >/dev/null 2>&1; then setcap cap_net_admin+eip $(readlink -f $(which ip6tables)); fi
 
 USER pentester
 RUN openssl ecparam -name prime256v1 -genkey -noout -out /app/certs/ca.key && \
@@ -99,6 +129,14 @@ RUN pipx install arjun && \
     pipx install dirsearch && \
     pipx inject dirsearch 'setuptools<81' && \
     pipx install wafw00f
+
+RUN set -eux; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',cloud,'; then \
+      pipx install prowler; pipx install scoutsuite; \
+    fi; \
+    if echo ",$STRIX_TOOL_PACKS," | grep -q ',mobile,'; then \
+      pipx install frida-tools; \
+    fi
 
 ENV NPM_CONFIG_PREFIX=/home/pentester/.npm-global
 RUN mkdir -p /home/pentester/.npm-global
@@ -264,7 +302,16 @@ RUN echo 'export PATH="/home/pentester/go/bin:/home/pentester/.local/bin:/home/p
 
 USER root
 COPY containers/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY containers/tool-packs.json /opt/strix/tool-packs.json
+COPY containers/tool-healthcheck.sh /usr/local/bin/strix-tool-healthcheck
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/strix-tool-healthcheck && \
+    STRIX_TOOL_PACK="${STRIX_TOOL_PACKS}" \
+      /usr/local/bin/strix-tool-healthcheck > /opt/strix/tool-health.tsv && \
+    dpkg-query -W -f='${Package}\t${Version}\n' | sort > /opt/strix/package-sbom.tsv && \
+    sudo -u pentester -H /usr/bin/pipx list --json > /opt/strix/pipx-sbom.json && \
+    npm list -g --depth=0 --json > /opt/strix/npm-sbom.json && \
+    find /home/pentester/go/bin /home/pentester/.local/bin \
+      -maxdepth 1 -type f -exec sha256sum {} + | sort > /opt/strix/tool-sbom.sha256
 
 USER pentester
 WORKDIR /workspace

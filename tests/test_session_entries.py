@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from agents.sandbox.entries import File, LocalDir
 
+from strix.config.loader import set_session_field
 from strix.runtime import session_manager
 from strix.runtime.backends import (
     _BACKENDS,
@@ -29,12 +30,12 @@ def _source(subdir: str, path: str, *, protect_metadata: bool = False) -> dict[s
     return {"source_path": path, "workspace_subdir": subdir, "protect_metadata": protect_metadata}
 
 
-def test_source_becomes_writable_bind_mount(tmp_path: Path) -> None:
+def test_source_is_read_only_in_default_web_profile(tmp_path: Path) -> None:
     assert build_bind_mounts([_source("repo", str(tmp_path))]) == [
         {
             "source": str(tmp_path.resolve()),
             "target": "/workspace/repo",
-            "read_only": False,
+            "read_only": True,
         }
     ]
 
@@ -45,7 +46,7 @@ def test_git_dir_is_remounted_read_only_when_protected(tmp_path: Path) -> None:
     mounts = build_bind_mounts([_source("repo", str(tmp_path), protect_metadata=True)])
 
     assert mounts == [
-        {"source": str(tmp_path.resolve()), "target": "/workspace/repo", "read_only": False},
+        {"source": str(tmp_path.resolve()), "target": "/workspace/repo", "read_only": True},
         {
             "source": str((tmp_path / ".git").resolve()),
             "target": "/workspace/repo/.git",
@@ -61,7 +62,7 @@ def test_agent_instruction_dirs_are_protected_too(tmp_path: Path) -> None:
     mounts = build_bind_mounts([_source("repo", str(tmp_path), protect_metadata=True)])
 
     assert [(m["target"], m["read_only"]) for m in mounts] == [
-        ("/workspace/repo", False),
+        ("/workspace/repo", True),
         ("/workspace/repo/.agents", True),
         ("/workspace/repo/.codex", True),
     ]
@@ -75,7 +76,7 @@ def test_worktree_git_pointer_file_is_protected(tmp_path: Path) -> None:
     mounts = build_bind_mounts([_source("repo", str(tmp_path), protect_metadata=True)])
 
     assert [(m["target"], m["read_only"]) for m in mounts] == [
-        ("/workspace/repo", False),
+        ("/workspace/repo", True),
         ("/workspace/repo/.git", True),
         ("/workspace/repo/nested/gitdir", True),
     ]
@@ -119,7 +120,7 @@ def test_no_git_guard_without_a_git_dir(tmp_path: Path) -> None:
     assert [m["target"] for m in mounts] == ["/workspace/repo"]
 
 
-def test_clone_keeps_its_git_writable(tmp_path: Path) -> None:
+def test_clone_is_read_only_in_default_web_profile(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     mounts = build_bind_mounts([_source("clone", str(tmp_path), protect_metadata=False)])
     assert [m["target"] for m in mounts] == ["/workspace/clone"]
@@ -134,7 +135,16 @@ def test_multiple_sources_each_get_a_mount(tmp_path: Path) -> None:
     mounts = build_bind_mounts([_source("first", str(first)), _source("second", str(second))])
 
     assert [m["target"] for m in mounts] == ["/workspace/first", "/workspace/second"]
-    assert all(m["read_only"] is False for m in mounts)
+    assert all(m["read_only"] is True for m in mounts)
+
+
+def test_remediation_profile_explicitly_makes_source_writable(tmp_path: Path) -> None:
+    set_session_field("runtime", "sandbox_profile", "remediation")
+    set_session_field("runtime", "workspace_mode", "read-write")
+
+    mounts = build_bind_mounts([_source("repo", str(tmp_path))])
+
+    assert mounts[0]["read_only"] is False
 
 
 def test_incomplete_sources_are_skipped() -> None:

@@ -96,6 +96,12 @@ export interface Vulnerability {
   description: string;
   cve: string | null;
   cvss: number | null;
+  cvss_vector?: string | null;
+  epss?: number | null;
+  known_exploited?: boolean | null;
+  intelligence_source?: string | null;
+  intelligence_fetched_at?: string | null;
+  match_confidence?: string | null;
   created_at: string;
   potential_risk_saving: number | null;
   risk_saving_description: string | null;

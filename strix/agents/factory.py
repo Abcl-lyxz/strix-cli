@@ -30,6 +30,7 @@ from strix.tools.agents_graph.tools import (
 from strix.tools.browser.tool import browser_action
 from strix.tools.coverage.tools import list_coverage, record_coverage, update_coverage
 from strix.tools.finish.tool import finish_scan
+from strix.tools.intelligence import query_vulnerability_intel
 from strix.tools.load_skill.tool import load_skill, search_skills
 from strix.tools.mcp import call_mcp, describe_mcp, list_mcps
 from strix.tools.notes.tools import (
@@ -57,6 +58,14 @@ from strix.tools.reporting.tool import (
     update_vulnerability_report,
 )
 from strix.tools.respond.tool import respond_to_user
+from strix.tools.security_jobs import (
+    describe_capability,
+    list_capabilities,
+    read_security_job,
+    search_artifacts,
+    start_security_job,
+    stop_security_job,
+)
 from strix.tools.thinking.tool import think
 from strix.tools.threat_model.tools import (
     amend_threat_model,
@@ -592,6 +601,13 @@ _BASE_TOOLS: tuple[Tool, ...] = (
     amend_threat_model,
     web_search,
     web_get_contents,
+    query_vulnerability_intel,
+    list_capabilities,
+    describe_capability,
+    start_security_job,
+    read_security_job,
+    stop_security_job,
+    search_artifacts,
     create_vulnerability_report,
     create_dependency_report,
     update_vulnerability_report,

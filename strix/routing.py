@@ -17,7 +17,8 @@ import litellm
 from agents.model_settings import ModelSettings
 from agents.models.interface import Model, ModelProvider
 
-from strix.llm.context_budget import context_window
+from strix.llm.context_budget import context_window, count_tokens
+from strix.llm.error_envelope import error_envelope
 from strix.notifications import NotificationAction, notify
 from strix.resilience import full_jitter_delay, retry_after_seconds
 from strix.security import get_secret_store, redact_secrets, register_secret
@@ -61,8 +62,15 @@ class RouteConfig:
     tpm: int | None = None
     enabled: bool = True
     provider_id: str | None = None
+    adapter_id: str | None = None
     transport: str | None = None
     model_id: str | None = None
+    auth_scheme: str | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
+    metadata_source: str | None = None
+    metadata_confidence: str | None = None
+    metadata_refreshed_at: str | None = None
     api_key_ref: str | None = None
     headers_ref: str | None = None
     api_key_env: str | None = field(default=None, repr=False, compare=False)
@@ -83,6 +91,10 @@ class RouteConfig:
             raise ValueError("route rpm must be at least 1")
         if self.tpm is not None and self.tpm < 1:
             raise ValueError("route tpm must be at least 1")
+        if self.context_window_tokens is not None and self.context_window_tokens < 1:
+            raise ValueError("route context_window_tokens must be positive")
+        if self.max_output_tokens is not None and self.max_output_tokens < 1:
+            raise ValueError("route max_output_tokens must be positive")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], *, allow_env: bool = False) -> RouteConfig:
@@ -102,8 +114,15 @@ class RouteConfig:
             "tpm",
             "enabled",
             "provider_id",
+            "adapter_id",
             "transport",
             "model_id",
+            "auth_scheme",
+            "context_window_tokens",
+            "max_output_tokens",
+            "metadata_source",
+            "metadata_confidence",
+            "metadata_refreshed_at",
             "api_key_ref",
             "headers_ref",
         }
@@ -155,6 +174,31 @@ class RouteState:
     failed_turns: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    attempted_input_tokens: int = 0
+    retry_waste_tokens: int = 0
+    last_request_input_tokens: int = 0
+    last_reserved_output_tokens: int = 0
+    last_progress_at: float | None = None
+    effective_concurrency: int = 0
+    probe_in_flight: bool = False
+    learned_context_window: int | None = None
+    last_error: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        self.effective_concurrency = self.config.max_concurrency
+
+    def context_capacity(self) -> int:
+        configured = self.config.context_window_tokens or context_window(self.config.model)
+        return min(configured, self.learned_context_window or configured)
+
+    def circuit_state(self, now: float) -> str:
+        if self.blocked_reason or self.disabled_for_run or not self.config.enabled:
+            return "open"
+        if self.consecutive_failures and self.cooldown_until > now:
+            return "open"
+        if self.consecutive_failures:
+            return "half_open"
+        return "closed"
 
     def available(self, now: float) -> bool:
         return (
@@ -162,7 +206,8 @@ class RouteState:
             and not self.disabled_for_run
             and self.blocked_reason is None
             and self.cooldown_until <= now
-            and self.active < self.config.max_concurrency
+            and self.active < self.effective_concurrency
+            and (not self.consecutive_failures or not self.probe_in_flight)
         )
 
 
@@ -197,6 +242,8 @@ class RoutePool:
         model_factory: Callable[[RouteConfig, str | None, dict[str, str] | None], Model]
         | None = None,
         route_reloader: Callable[[], tuple[object, list[RouteConfig]]] | None = None,
+        stream_idle_timeout: float = 300.0,
+        max_attempts_per_route: int = 2,
     ) -> None:
         enabled = [route for route in routes if route.enabled]
         if not enabled:
@@ -214,14 +261,21 @@ class RoutePool:
         self._model_factory = model_factory or _default_model_factory
         self._route_reloader = route_reloader
         self._route_revision: object | None = None
+        self.stream_idle_timeout = max(0.0, stream_idle_timeout)
+        self.max_attempts_per_route = max(1, max_attempts_per_route)
+        self._restore_health()
 
     @property
     def route_models(self) -> tuple[str, ...]:
         return tuple(state.config.model for state in self.states.values() if state.config.enabled)
 
     def context_model(self) -> str:
-        candidates = [state.config.model for state in self.states.values() if state.config.enabled]
-        return min(candidates, key=context_window)
+        candidates = [state for state in self.states.values() if state.config.enabled]
+        return min(candidates, key=lambda state: state.context_capacity()).config.model
+
+    def context_capacity(self) -> int:
+        candidates = [state for state in self.states.values() if state.config.enabled]
+        return min(state.context_capacity() for state in candidates)
 
     def public_status(self) -> list[dict[str, Any]]:
         now = time.monotonic()
@@ -229,6 +283,8 @@ class RoutePool:
             {
                 **state.config.public_dict(),
                 "active": state.active,
+                "effective_concurrency": state.effective_concurrency,
+                "circuit_state": state.circuit_state(now),
                 "health": (
                     "disabled"
                     if not state.config.enabled or state.disabled_for_run
@@ -244,6 +300,18 @@ class RoutePool:
                 "failed_turns": state.failed_turns,
                 "input_tokens": state.input_tokens,
                 "output_tokens": state.output_tokens,
+                "attempted_input_tokens": state.attempted_input_tokens,
+                "retry_waste_tokens": state.retry_waste_tokens,
+                "last_request_input_tokens": state.last_request_input_tokens,
+                "last_reserved_output_tokens": state.last_reserved_output_tokens,
+                "context_usage_tokens": (
+                    state.last_request_input_tokens + state.last_reserved_output_tokens
+                ),
+                "context_window_tokens": state.context_capacity(),
+                "learned_context_window_tokens": state.learned_context_window,
+                "next_retry_seconds": max(0, round(state.cooldown_until - now, 1)),
+                "last_progress_at": state.last_progress_at,
+                "last_error": state.last_error,
             }
             for state in sorted(
                 self.states.values(),
@@ -283,6 +351,10 @@ class RoutePool:
                 existing.disabled_for_run = False
                 existing.cooldown_until = 0.0
                 existing.consecutive_failures = 0
+                existing.probe_in_flight = False
+                existing.effective_concurrency = min(
+                    max(1, existing.effective_concurrency), route.max_concurrency
+                )
                 refreshed[route.name] = existing
             if any(state.config.enabled for state in refreshed.values()):
                 self.states = refreshed
@@ -297,6 +369,7 @@ class RoutePool:
         *,
         input_tokens: int,
         output_tokens: int,
+        request_text: str | None = None,
         requires_tools: bool = False,
         exclude: set[str] | None = None,
         deadline: float | None = None,
@@ -333,8 +406,13 @@ class RoutePool:
                     for state in self.states.values()
                     if state.config.name not in excluded
                     and state.available(now)
-                    and context_window(state.config.model) > input_tokens + output_tokens
-                    and self._within_rate_limits(state, now, input_tokens=input_tokens)
+                    and state.context_capacity()
+                    > self._route_input_tokens(state, input_tokens, request_text) + output_tokens
+                    and self._within_rate_limits(
+                        state,
+                        now,
+                        input_tokens=self._route_input_tokens(state, input_tokens, request_text),
+                    )
                 ]
                 if candidates:
                     priority = min(state.config.priority for state in candidates)
@@ -347,7 +425,17 @@ class RoutePool:
                         ),
                     )
                     selected.active += 1
+                    if selected.consecutive_failures:
+                        selected.probe_in_flight = True
                     selected.calls.append(now)
+                    selected.attempted_input_tokens += self._route_input_tokens(
+                        selected, input_tokens, request_text
+                    )
+                    selected.last_request_input_tokens = self._route_input_tokens(
+                        selected, input_tokens, request_text
+                    )
+                    selected.last_reserved_output_tokens = output_tokens
+                    selected.last_progress_at = time.time()
                     return selected
 
                 configured = [
@@ -360,7 +448,8 @@ class RoutePool:
                 capacity_viable = [
                     state
                     for state in configured
-                    if context_window(state.config.model) > input_tokens + output_tokens
+                    if state.context_capacity()
+                    > self._route_input_tokens(state, input_tokens, request_text) + output_tokens
                 ]
                 if configured and not capacity_viable:
                     raise RouteContextOverflowError(
@@ -377,8 +466,14 @@ class RoutePool:
                     merely_busy = any(
                         state.blocked_reason is None
                         and state.cooldown_until <= now
-                        and self._within_rate_limits(state, now, input_tokens=input_tokens)
-                        and state.active >= state.config.max_concurrency
+                        and self._within_rate_limits(
+                            state,
+                            now,
+                            input_tokens=self._route_input_tokens(
+                                state, input_tokens, request_text
+                            ),
+                        )
+                        and state.active >= state.effective_concurrency
                         for state in capacity_viable
                     )
                     if not merely_busy:
@@ -423,7 +518,7 @@ class RoutePool:
                 now = time.monotonic()
                 if any(
                     state.available(now)
-                    and context_window(state.config.model) > input_tokens + output_tokens
+                    and state.context_capacity() > input_tokens + output_tokens
                     and (
                         not requires_tools or not _explicitly_lacks_tool_support(state.config.model)
                     )
@@ -457,16 +552,24 @@ class RoutePool:
                 return False
         return True
 
+    @staticmethod
+    def _route_input_tokens(state: RouteState, fallback: int, request_text: str | None) -> int:
+        if request_text is None:
+            return fallback
+        return max(1, count_tokens(state.config.model, request_text))
+
     async def _release(
         self,
         state: RouteState,
         *,
         response: ModelResponse | None = None,
         error: BaseException | None = None,
+        attempted_input_tokens: int = 0,
     ) -> RouteFailureKind | None:
         failure_kind = classify_route_failure(error) if error is not None else None
         async with self._condition:
             state.active = max(0, state.active - 1)
+            state.last_progress_at = time.time()
             if response is not None:
                 usage = getattr(response, "usage", None)
                 input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -477,6 +580,11 @@ class RoutePool:
                 recovered = state.consecutive_failures > 0 or state.cooldown_until > 0
                 state.consecutive_failures = 0
                 state.cooldown_until = 0.0
+                state.probe_in_flight = False
+                if recovered:
+                    state.effective_concurrency = min(
+                        state.config.max_concurrency, state.effective_concurrency + 1
+                    )
                 state.successful_turns += 1
                 if recovered:
                     notify(
@@ -489,17 +597,35 @@ class RoutePool:
                     )
             elif error is not None:
                 state.failed_turns += 1
-                await self._apply_failure(state, error, cast("RouteFailureKind", failure_kind))
+                state.retry_waste_tokens += max(0, attempted_input_tokens)
+                state.last_error = error_envelope(
+                    error,
+                    attempt=state.consecutive_failures + 1,
+                    retry_after=retry_after_seconds(error),
+                ).to_dict()
+                await self._apply_failure(
+                    state,
+                    error,
+                    cast("RouteFailureKind", failure_kind),
+                    attempted_input_tokens=attempted_input_tokens,
+                )
             self._persist_health()
             self._condition.notify_all()
         return failure_kind
 
     async def _apply_failure(
-        self, state: RouteState, error: BaseException, kind: RouteFailureKind
+        self,
+        state: RouteState,
+        error: BaseException,
+        kind: RouteFailureKind,
+        *,
+        attempted_input_tokens: int = 0,
     ) -> None:
         safe_error = redact_secrets(error)
         if kind == "transient":
             state.consecutive_failures += 1
+            state.probe_in_flight = False
+            state.effective_concurrency = max(1, state.effective_concurrency // 2)
             delay = full_jitter_delay(
                 state.consecutive_failures,
                 base_delay=2.0,
@@ -518,6 +644,7 @@ class RoutePool:
                 actions=(NotificationAction("retry_route_test", "Test route", state.config.name),),
             )
         elif kind == "authentication":
+            state.probe_in_flight = False
             state.blocked_reason = "credential, quota, or billing failure"
             notify(
                 "security.credential_required",
@@ -530,6 +657,7 @@ class RoutePool:
                 actions=(NotificationAction("open_routes", "Open routes", state.config.name),),
             )
         elif kind == "incompatible":
+            state.probe_in_flight = False
             state.disabled_for_run = True
             notify(
                 "runtime.route.incompatible",
@@ -541,6 +669,12 @@ class RoutePool:
                 run_id=self.run_id,
                 actions=(NotificationAction("open_routes", "Open routes", state.config.name),),
             )
+        elif kind == "context" and attempted_input_tokens:
+            state.probe_in_flight = False
+            observed_ceiling = max(4_096, attempted_input_tokens - 1)
+            state.learned_context_window = min(state.context_capacity(), observed_ceiling)
+        else:
+            state.probe_in_flight = False
 
     def _persist_health(self) -> None:
         if self.health_path is None:
@@ -554,6 +688,51 @@ class RoutePool:
         except OSError:
             logger.exception("failed to persist sanitized route health")
 
+    def _restore_health(self) -> None:
+        """Restore durable counters and learned limits, never transient leases."""
+        if self.health_path is None:
+            return
+        try:
+            payload = json.loads(self.health_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        routes = payload.get("routes") if isinstance(payload, dict) else None
+        if not isinstance(routes, list):
+            return
+        for raw in routes:
+            if not isinstance(raw, dict):
+                continue
+            state = self.states.get(str(raw.get("name") or ""))
+            if state is None or raw.get("model") != state.config.model:
+                continue
+            learned = raw.get("learned_context_window_tokens")
+            if isinstance(learned, int) and learned >= 4_096:
+                state.learned_context_window = min(
+                    learned, state.config.context_window_tokens or learned
+                )
+            for name in (
+                "successful_turns",
+                "failed_turns",
+                "input_tokens",
+                "output_tokens",
+                "attempted_input_tokens",
+                "retry_waste_tokens",
+                "last_request_input_tokens",
+                "last_reserved_output_tokens",
+            ):
+                value = raw.get(name)
+                if isinstance(value, int) and value >= 0:
+                    setattr(state, name, value)
+            effective = raw.get("effective_concurrency")
+            if isinstance(effective, int) and effective > 0:
+                state.effective_concurrency = min(effective, state.config.max_concurrency)
+            last_error = raw.get("last_error")
+            if isinstance(last_error, dict):
+                state.last_error = last_error
+            last_progress = raw.get("last_progress_at")
+            if isinstance(last_progress, int | float) and last_progress > 0:
+                state.last_progress_at = float(last_progress)
+
     def _model(self, route: RouteConfig) -> Model:
         existing = self._models.get(route.name)
         if existing is not None:
@@ -565,12 +744,19 @@ class RoutePool:
 
     async def get_response(self, **kwargs: Any) -> ModelResponse:
         attempted: set[str] = set()
+        request_text = _request_payload_text(kwargs)
         input_tokens = _request_token_estimate(kwargs)
         output_tokens = _request_output_limit(kwargs)
         requires_tools = bool(kwargs.get("tools"))
         request_kwargs = _without_nested_retry(kwargs)
         deadline = time.monotonic() + self.wait_timeout if self.wait_timeout is not None else None
+        attempts = 0
+        max_attempts = max(1, len(self.states) * self.max_attempts_per_route)
         while True:
+            if attempts >= max_attempts:
+                raise AllRoutesUnavailableError(
+                    f"model route retry budget exhausted after {attempts} attempts"
+                )
             if attempted and not any(
                 state.config.enabled
                 and not state.disabled_for_run
@@ -583,15 +769,29 @@ class RoutePool:
             state = await self._acquire(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                request_text=request_text,
                 requires_tools=requires_tools,
                 exclude=attempted,
                 deadline=deadline,
             )
             attempted.add(state.config.name)
+            attempts += 1
+            route_input_tokens = self._route_input_tokens(state, input_tokens, request_text)
             try:
                 response = await self._model(state.config).get_response(**request_kwargs)
             except Exception as exc:
-                kind = await self._release(state, error=exc)
+                kind = await self._release(
+                    state, error=exc, attempted_input_tokens=route_input_tokens
+                )
+                if kind == "context":
+                    if any(
+                        candidate.config.enabled
+                        and not candidate.disabled_for_run
+                        and candidate.config.name not in attempted
+                        for candidate in self.states.values()
+                    ):
+                        continue
+                    raise
                 if kind in {"transient", "authentication", "incompatible"}:
                     continue
                 raise
@@ -601,12 +801,19 @@ class RoutePool:
 
     async def stream_response(self, **kwargs: Any) -> AsyncIterator[TResponseStreamEvent]:
         attempted: set[str] = set()
+        request_text = _request_payload_text(kwargs)
         input_tokens = _request_token_estimate(kwargs)
         output_tokens = _request_output_limit(kwargs)
         requires_tools = bool(kwargs.get("tools"))
         request_kwargs = _without_nested_retry(kwargs)
         deadline = time.monotonic() + self.wait_timeout if self.wait_timeout is not None else None
+        attempts = 0
+        max_attempts = max(1, len(self.states) * self.max_attempts_per_route)
         while True:
+            if attempts >= max_attempts:
+                raise AllRoutesUnavailableError(
+                    f"model route retry budget exhausted after {attempts} attempts"
+                )
             if attempted and not any(
                 state.config.enabled
                 and not state.disabled_for_run
@@ -619,16 +826,19 @@ class RoutePool:
             state = await self._acquire(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                request_text=request_text,
                 requires_tools=requires_tools,
                 exclude=attempted,
                 deadline=deadline,
             )
             attempted.add(state.config.name)
+            attempts += 1
+            route_input_tokens = self._route_input_tokens(state, input_tokens, request_text)
             emitted = False
             final_response = None
             stream = self._model(state.config).stream_response(**request_kwargs)
             try:
-                async for event in stream:
+                async for event in _with_idle_watchdog(stream, self.stream_idle_timeout):
                     emitted = True
                     response = getattr(event, "response", None)
                     if response is not None:
@@ -636,8 +846,23 @@ class RoutePool:
                         _tag_response_route(response, state.config)
                     yield event
             except Exception as exc:
-                kind = await self._release(state, error=exc)
-                if not emitted and kind in {"transient", "authentication", "incompatible"}:
+                kind = await self._release(
+                    state, error=exc, attempted_input_tokens=route_input_tokens
+                )
+                if not emitted and kind == "context":
+                    if any(
+                        candidate.config.enabled
+                        and not candidate.disabled_for_run
+                        and candidate.config.name not in attempted
+                        for candidate in self.states.values()
+                    ):
+                        continue
+                    raise
+                if not emitted and kind in {
+                    "transient",
+                    "authentication",
+                    "incompatible",
+                }:
                     continue
                 raise
             await self._release(state, response=final_response)
@@ -846,18 +1071,77 @@ class _HeaderModel(Model):
             yield event
 
 
-def _request_token_estimate(kwargs: dict[str, Any]) -> int:
-    input_value = kwargs.get("input", "")
-    system = kwargs.get("system_instructions") or ""
+def _request_payload_text(kwargs: dict[str, Any]) -> str:
+    """Render every provider-visible request surface for route-aware metering."""
+
+    def normalize(value: Any) -> Any:
+        if value is None or isinstance(value, str | int | float | bool):
+            return value
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, list | tuple):
+            return [normalize(item) for item in value]
+        if hasattr(value, "model_dump"):
+            with contextlib.suppress(Exception):
+                return normalize(value.model_dump(exclude_none=True))
+        public: dict[str, Any] = {}
+        for name in (
+            "name",
+            "description",
+            "params_json_schema",
+            "input_json_schema",
+            "strict_json_schema",
+        ):
+            attribute = getattr(value, name, None)
+            if attribute is not None:
+                public[name] = normalize(attribute)
+        return public or type(value).__name__
+
+    provider_visible = {
+        key: normalize(value)
+        for key, value in kwargs.items()
+        if key
+        in {
+            "system_instructions",
+            "input",
+            "tools",
+            "output_schema",
+            "handoffs",
+            "prompt",
+            "previous_response_id",
+            "conversation_id",
+        }
+    }
     try:
-        rendered = (
-            input_value if isinstance(input_value, str) else json.dumps(input_value, default=str)
+        return json.dumps(
+            provider_visible, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
     except (TypeError, ValueError):
-        rendered = str(input_value)
-    # A model-neutral four-bytes-per-token estimate is appropriate for
-    # admission control; exact provider usage replaces it after the response.
-    return max(1, len(f"{system}\n{rendered}".encode()) // 4)
+        return str(provider_visible)
+
+
+def _request_token_estimate(kwargs: dict[str, Any]) -> int:
+    # This model-neutral number is used only as a fallback by tests and direct
+    # callers. Route admission meters the complete rendered payload with the
+    # selected model's tokenizer (or a conservative UTF-8 upper bound).
+    return max(1, len(_request_payload_text(kwargs).encode("utf-8")))
+
+
+async def _with_idle_watchdog(
+    stream: AsyncIterator[TResponseStreamEvent], timeout: float
+) -> AsyncIterator[TResponseStreamEvent]:
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            if timeout > 0:
+                event = await asyncio.wait_for(anext(iterator), timeout=timeout)
+            else:
+                event = await anext(iterator)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as exc:
+            raise TimeoutError(f"model stream made no progress for {timeout:g}s") from exc
+        yield event
 
 
 def _without_nested_retry(kwargs: dict[str, Any]) -> dict[str, Any]:

@@ -8,8 +8,8 @@ is injected by the runner via :func:`configure_spill_writer`.
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import uuid
 from typing import TYPE_CHECKING
 
 
@@ -156,7 +156,11 @@ async def bound_and_store(text: str, *, max_lines: int, max_bytes: int) -> str:
 
     writer = _spill.get("writer")
     if writer is not None:
-        path = await writer(uuid.uuid4().hex, text)
+        # Content-addressed names make retries idempotent: replaying a safe
+        # read-only tool result points at the same artifact instead of creating
+        # duplicate evidence files.
+        output_id = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        path = await writer(output_id, text)
         if path is not None:
             notice = _WORKSPACE_SPILL_NOTICE.format(
                 lines=dropped_lines, bytes=dropped_bytes, path=path

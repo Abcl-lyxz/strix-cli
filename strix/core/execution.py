@@ -30,12 +30,14 @@ from strix.core.inputs import child_initial_input
 from strix.core.sessions import (
     enforce_image_budget,
     open_agent_session,
+    record_session_event,
     replace_session_items,
     seed_initial_input,
     strip_all_images_from_session,
     transform_session_items,
 )
 from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.llm.error_envelope import error_envelope
 from strix.llm.errors import classify_model_failure
 from strix.llm.tool_arguments import quarantine_history
 from strix.notifications import NotificationAction, notify
@@ -103,6 +105,13 @@ def _run_config_model(run_config: RunConfig) -> str | None:
     return run_config.model if isinstance(run_config.model, str) else None
 
 
+def _run_config_context_capacity(run_config: RunConfig) -> int | None:
+    provider = getattr(run_config, "model_provider", None)
+    pool = getattr(provider, "pool", None)
+    capacity = getattr(pool, "context_capacity", None)
+    return cast("int", capacity()) if callable(capacity) else None
+
+
 def _agent_instructions(agent: Any) -> str:
     instructions = getattr(agent, "instructions", None)
     return instructions if isinstance(instructions, str) else ""
@@ -131,6 +140,7 @@ async def _compact_session(
         tools_text=_agent_tools_text(agent),
         force=force,
         model_provider=getattr(run_config, "model_provider", None),
+        context_window_tokens=_run_config_context_capacity(run_config),
     )
 
 
@@ -369,7 +379,7 @@ async def _wait_for_resume(
         wait_kind = coordinator.wait_kinds.get(agent_id)
     route_pool = context.get("route_pool")
     wait_for_route = getattr(route_pool, "wait_until_available", None)
-    if wait_kind != "provider" or not callable(wait_for_route):
+    if wait_kind not in {"provider", "blocked"} or not callable(wait_for_route):
         return await coordinator.wait_for_message(agent_id, timeout=timeout), False
 
     message_task = asyncio.create_task(coordinator.wait_for_message(agent_id))
@@ -753,12 +763,29 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     malformed_retries = 0
     model_retry_started_at: float | None = None
     crash_restarts = 0
+    routed_recoveries = 0
+    cycle_attempt = 0
     while True:
+        cycle_attempt += 1
+        turn_id = uuid.uuid4().hex
         stream: Any = None
         pre_run_items: list[Any] = []
         tool_output_committed = False
         try:
             await coordinator.mark_running(agent_id)
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await record_session_event(
+                        session,
+                        "model_turn_started",
+                        {
+                            "agent_id": agent_id,
+                            "input_from_session": not bool(input_data),
+                            "compactions": compactions,
+                        },
+                        turn_id=turn_id,
+                        attempt=cycle_attempt,
+                    )
             if session is not None:
                 max_images = context.get("max_context_images")
                 if isinstance(max_images, int):
@@ -767,9 +794,16 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     except Exception:
                         logger.exception("image-budget enforcement failed for %s", agent_id)
                 try:
-                    await _compact_session(agent, session, run_config, force=False)
+                    await coordinator.set_operation(agent_id, "compacting")
+                    proactively_compacted = await _compact_session(
+                        agent, session, run_config, force=False
+                    )
+                    if proactively_compacted:
+                        await coordinator.record_compaction(agent_id)
                 except Exception:
                     logger.exception("proactive compaction failed for %s", agent_id)
+                finally:
+                    await coordinator.set_operation(agent_id, "running")
                 with contextlib.suppress(Exception):
                     pre_run_items = list(await session.get_items())
             stream = Runner.run_streamed(
@@ -794,6 +828,16 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                             model_retries = 0
                             malformed_retries = 0
                             model_retry_started_at = None
+                            routed_recoveries = 0
+                            if session is not None:
+                                with contextlib.suppress(Exception):
+                                    await record_session_event(
+                                        session,
+                                        "model_turn_completed",
+                                        {"agent_id": agent_id},
+                                        turn_id=turn_id,
+                                        attempt=cycle_attempt,
+                                    )
                         tool_output_committed = tool_output_committed or tool_completed
                         if event_sink is not None:
                             try:
@@ -840,12 +884,46 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             await coordinator.trigger_budget_stop()
             raise
         except Exception as exc:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await record_session_event(
+                        session,
+                        "model_turn_failed",
+                        error_envelope(exc).to_dict(),
+                        turn_id=turn_id,
+                        attempt=cycle_attempt,
+                    )
             if isinstance(exc, AllRoutesUnavailableError):
-                await coordinator.park_waiting(agent_id, wait_kind="provider")
+                route_pool = context.get("route_pool")
+                route_status = (
+                    route_pool.public_status()
+                    if route_pool is not None and hasattr(route_pool, "public_status")
+                    else []
+                )
+                permanently_blocked = bool(route_status) and all(
+                    route.get("health") in {"blocked", "disabled"} for route in route_status
+                )
+                if permanently_blocked:
+                    await coordinator.park_waiting(agent_id, wait_kind="blocked")
+                else:
+                    await coordinator.park_waiting(agent_id, wait_kind="provider")
+                action = next(
+                    (
+                        route.get("last_error", {}).get("action")
+                        for route in route_status
+                        if isinstance(route.get("last_error"), dict)
+                        and route.get("last_error", {}).get("action")
+                    ),
+                    None,
+                )
                 notify(
                     "agent.waiting",
-                    title=f"Agent {agent_id} is waiting for a model route",
-                    detail=str(exc),
+                    title=(
+                        f"Agent {agent_id} is blocked on model configuration"
+                        if permanently_blocked
+                        else f"Agent {agent_id} is waiting for a model route"
+                    ),
+                    detail=str(action or exc),
                     severity="warning",
                     agent_id=agent_id,
                     route_id=None,
@@ -879,12 +957,16 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 and is_context_overflow(exc)
             ):
                 try:
+                    await coordinator.set_operation(agent_id, "compacting")
                     compacted = await _compact_session(agent, session, run_config, force=True)
                 except Exception:
                     logger.exception("overflow compaction recovery failed for %s", agent_id)
                     compacted = False
+                finally:
+                    await coordinator.set_operation(agent_id, "running")
                 if compacted:
                     compactions += 1
+                    await coordinator.record_compaction(agent_id)
                     logger.info(
                         "Compacted %s session after context overflow; retrying (%d)",
                         agent_id,
@@ -930,8 +1012,37 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 safe_tool_state = await _salvage_stream_to_session(
                     session, pre_run_items, stream, agent_id
                 )
+            route_pool = context.get("route_pool")
+            if safe_tool_state and route_pool is not None and _is_transient_model_error(exc):
+                routed_recoveries += 1
+                await coordinator.park_waiting(agent_id, wait_kind="provider")
+                notify(
+                    "agent.waiting",
+                    title=f"Agent {agent_id} is waiting for provider recovery",
+                    detail=(
+                        "The partial turn was checkpointed and will resume without replaying tools."
+                    ),
+                    severity="warning",
+                    agent_id=agent_id,
+                    dedupe_key=f"agent-route-wait:{agent_id}",
+                )
+                if interactive:
+                    raise AllRoutesUnavailableError(
+                        "model stream interrupted; waiting for a healthy route"
+                    ) from exc
+                if routed_recoveries > 2:
+                    raise AllRoutesUnavailableError(
+                        "model stream recovery budget exhausted after two resumptions"
+                    ) from exc
+                wait_for_route = getattr(route_pool, "wait_until_available", None)
+                if callable(wait_for_route):
+                    timeout = float(getattr(route_pool, "wait_timeout", None) or 600)
+                    await asyncio.wait_for(wait_for_route(), timeout=timeout)
+                    input_data = [] if session is not None else input_data
+                    continue
             if (
                 safe_tool_state
+                and route_pool is None
                 and model_retries < _MAX_TRANSIENT_MODEL_RETRIES
                 and _is_transient_model_error(exc)
             ):
@@ -966,6 +1077,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         agent_id=agent_id,
                         dedupe_key=f"model-retry:{context.get('scan_id', '')}:{agent_id}",
                     )
+                    await coordinator.set_operation(agent_id, "retrying")
                     await asyncio.sleep(delay)
                     if session is not None:
                         input_data = []

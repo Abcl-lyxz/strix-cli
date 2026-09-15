@@ -17,7 +17,7 @@ from strix.core.paths import (
     run_record_path,
     runs_base_dir,
 )
-from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
+from strix.interface.viewer.server import bundle_is_built, serve
 
 
 if TYPE_CHECKING:
@@ -79,12 +79,17 @@ def run_view(argv: list[str]) -> None:
         bridge = BrowserWorkspace(
             runtime.controller, asyncio.get_running_loop(), initial_run=args.run
         )
-        httpd, url, token = serve(
+        httpd, url, _bootstrap_nonce = serve(
             run_dir, host=args.host, port=args.port, open_browser=not args.no_open, workspace=bridge
         )
         sync = asyncio.create_task(runtime.sync_state())
         console.print("Local Strix workspace:")
-        console.print(authorized_url(url, token), soft_wrap=True, markup=False)
+        console.print(url, soft_wrap=True, markup=False)
+        if args.no_open:
+            console.print(
+                "Browser authorization was not opened. For security, bootstrap nonces are "
+                "never printed; re-run without --no-open when you want to authorize a browser."
+            )
         console.print("Press Ctrl-C to stop the workspace.")
         loop = asyncio.get_running_loop()
         output = WorkspaceOutput(

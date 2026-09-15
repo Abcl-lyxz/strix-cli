@@ -340,6 +340,70 @@
 .finding .prose-markdown {
   margin-top: 22px;
 }
+.overview-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.overview-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+.overview-findings {
+  display: grid;
+  gap: 8px;
+}
+.finding-row {
+  display: grid !important;
+  grid-template-columns: auto minmax(180px, 1fr) auto auto auto;
+  align-items: center !important;
+  gap: 12px;
+  width: 100%;
+  padding: 14px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 9px !important;
+  text-align: left;
+}
+.finding-row > span:not(.severity),
+.finding-row code {
+  color: var(--muted);
+  font-size: 12px;
+}
+.finding-row em {
+  color: #f8ada7;
+  font-size: 11px;
+  font-style: normal;
+}
+.finding-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  overflow: auto;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.8);
+}
+.finding-modal-card {
+  position: relative;
+  width: min(1180px, 100%);
+  min-height: 60vh;
+  margin: 0 auto;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #111416;
+}
+.finding-modal-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 2;
+}
+.route-health {
+  color: #9ecbbd;
+  font-size: 11px;
+  white-space: nowrap;
+}
 .artifact {
   display: flex;
   gap: 10px;

@@ -90,10 +90,13 @@ Complex findings warrant specialized subagents:
 
 **Resource Efficiency**
 
+- Treat route health, effective concurrency, budget, and scanner-job capacity as hard backpressure.
+- Create an agent only for a distinct, testable hypothesis with a named evidence owner.
 - Avoid duplicate coverage across agents
 - Terminate agents when objectives are met or no longer relevant
 - Use message passing only when essential (requests/answers, critical handoffs)
 - Prefer batched updates over routine status messages
+- Keep at least one healthy route slot available for context compaction, validation, and wrap-up.
 
 ## Completion
 

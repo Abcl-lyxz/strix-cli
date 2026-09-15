@@ -70,6 +70,8 @@ Additional commands:
   strix view [RUN]         View a completed or running scan
   strix completions SHELL  Generate zsh, bash, or fish tab completion
   strix routes ...         Configure health-aware model routes
+  strix providers ...      Discover providers and models without inference
+  strix intel ...          Refresh and inspect vulnerability intelligence
   strix secrets ...        Migrate and inspect credential storage
   strix notifications ...  Read the application notification inbox
 """
@@ -475,9 +477,17 @@ def main() -> None:
 
         sys.exit(run_completions(sys.argv[2:]))
 
-    if len(sys.argv) > 1 and sys.argv[1] in {"routes", "secrets", "notifications"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {
+        "routes",
+        "providers",
+        "intel",
+        "secrets",
+        "notifications",
+    }:
         from strix.interface.local_admin import (
+            run_intel,
             run_notifications,
+            run_providers,
             run_routes,
             run_secrets,
         )
@@ -485,6 +495,8 @@ def main() -> None:
         command = sys.argv[1]
         handler = {
             "routes": run_routes,
+            "providers": run_providers,
+            "intel": run_intel,
             "secrets": run_secrets,
             "notifications": run_notifications,
         }[command]

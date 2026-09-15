@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import math
 import os
 import webbrowser
@@ -314,6 +315,15 @@ class ApplicationController:
             model_warning = (
                 f"{model} is not a recommended frontier model. Pentest quality could be degraded."
             )
+        route_health: list[dict[str, Any]] = []
+        if self.report_state is not None:
+            get_run_dir = getattr(self.report_state, "get_run_dir", None)
+            if callable(get_run_dir):
+                path = runtime_state_dir(get_run_dir()) / "routes.json"
+                with contextlib.suppress(OSError, ValueError, TypeError):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict) and isinstance(payload.get("routes"), list):
+                        route_health = payload["routes"][:32]
         state = {
             "setup_mode": self.setup_mode,
             "scan_started": self.scan_started,
@@ -359,6 +369,7 @@ class ApplicationController:
                 for message in self.messages[-10:]
             ],
             "usage": terminal_projection(usage, max_string=256, max_items=20),
+            "route_health": terminal_projection(route_health, max_string=512, max_items=32),
             "subscription": subscription,
             "connections": [
                 {
@@ -1015,14 +1026,19 @@ class ApplicationController:
 
         if self.viewer_url:
             with contextlib.suppress(Exception):
-                webbrowser.open(self.viewer_url)
+                from strix.interface.viewer.server import fresh_authorized_url
+
+                webbrowser.open(
+                    fresh_authorized_url(self._viewer_httpd, self.viewer_url)
+                    if self._viewer_httpd is not None
+                    else self.viewer_url
+                )
             return {"status": "running", "url": self.viewer_url}
         try:
             from strix.interface.tui.backend.messages import (
                 send_user_message_to_agent,
             )
             from strix.interface.viewer.server import (
-                authorized_url,
                 bundle_is_built,
                 serve,
             )
@@ -1043,7 +1059,7 @@ class ApplicationController:
                 )
 
             self._viewer_bridge = BrowserWorkspace(self, asyncio.get_running_loop())
-            httpd, url, token = serve(
+            httpd, url, _bootstrap_nonce = serve(
                 self.report_state.get_run_dir()
                 if self.report_state
                 else runs_base_dir() / "workspace",
@@ -1052,7 +1068,7 @@ class ApplicationController:
                 workspace=self._viewer_bridge,
             )
             self._viewer_httpd = httpd
-            self.viewer_url = authorized_url(url, token)
+            self.viewer_url = url
             self.viewer_status = "running"
         except Exception:  # noqa: BLE001 - viewer startup failures must not crash the TUI
             self.viewer_status = "failed"

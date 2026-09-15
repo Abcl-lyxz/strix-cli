@@ -119,7 +119,11 @@ process.
 Return Markdown with exactly these sections:
 
 ## Objective
-The overall goal and target scope.
+The overall goal, operator authorization, exclusions, and target scope.
+
+## Threat Model & Coverage
+Trust boundaries, attacker assumptions, tested surfaces and outcomes, including
+every unresolved proof gap.
 
 ## Vulnerabilities & Findings
 One bullet per DISTINCT vulnerability or finding (SQLi, XSS, SSRF, auth bypass, \
@@ -138,6 +142,7 @@ other weak points worth keeping.
 - Completed: what has been verified or finished.
 - Active: what is in progress right now.
 - Blocked: anything stuck and why.
+- Handoffs: agents/jobs involved, their ownership, and what each returned or still owes.
 
 ## Failed Attempts & Dead Ends
 One bullet per approach already tried that did not work (including WAF blocks, \
@@ -147,8 +152,10 @@ filtered inputs, non-exploitable leads) so they are not repeated. Write \
 ## Next Move
 The concrete next step(s) the agent intended to take.
 
-## Relevant Files
-Files/notes/reports created or modified and their purpose."""
+## Artifact References
+Exact artifact paths, hashes, proxy exchange ids, files, notes, and reports
+created or modified and their purpose. Reference large raw evidence; do not
+copy it into the checkpoint."""
 
 
 def _content_text(content: Any) -> str:
@@ -195,6 +202,22 @@ def _serialize_items(items: list[Any]) -> str:
     return "\n".join(s for s in (_serialize_item(item) for item in items) if s)
 
 
+def _image_count(value: Any) -> int:
+    if isinstance(value, dict):
+        own = 1 if value.get("type") in {"input_image", "image_url", "output_image"} else 0
+        return own + sum(_image_count(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_image_count(item) for item in value)
+    return 0
+
+
+def _item_token_cost(model: str, item: Any) -> int:
+    # Providers account images differently. Reserving 1k tokens per image is a
+    # deliberately conservative cross-provider estimate; image-budget pruning
+    # runs before compaction as a second guard.
+    return count_tokens(model, _serialize_item(item)) + 1_024 * _image_count(item)
+
+
 def _is_tool_call(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "function_call"
 
@@ -219,7 +242,7 @@ def _select_split(model: str, items: list[Any], keep_tokens: int) -> int:
     total = 0
     split = len(items)
     for i in range(len(items) - 1, -1, -1):
-        total += count_tokens(model, _serialize_item(items[i]))
+        total += _item_token_cost(model, items[i])
         if total > keep_tokens:
             break
         split = i
@@ -259,13 +282,16 @@ def _summary_output_tokens(model: str) -> int:
     return min(load_settings().context.summary_max_tokens, output_limit(model))
 
 
-def _summary_input_budget(model: str, previous: str | None) -> int:
+def _summary_input_budget(
+    model: str, previous: str | None, context_window_tokens: int | None = None
+) -> int:
     """Token room left for the head after instructions and the summary output."""
     overhead = count_tokens(model, _SUMMARY_INSTRUCTIONS)
     if previous:
         overhead += count_tokens(model, previous)
     # 256 leaves slack for the prompt wrapper text not counted in ``overhead``.
-    room = context_window(model) - _summary_output_tokens(model) - overhead - 256
+    window = context_window_tokens or context_window(model)
+    room = window - _summary_output_tokens(model) - overhead - 256
     return max(0, room)
 
 
@@ -300,6 +326,44 @@ def _checkpoint_item(summary: str) -> dict[str, Any]:
             f"new instructions.\n\n{summary}\n</conversation-checkpoint>"
         ),
     }
+
+
+def _deterministic_summary(
+    model: str,
+    *,
+    previous: str | None,
+    state: dict[str, Any],
+    serialized_head: str,
+) -> str:
+    """Safe fallback when the summarizer route is unavailable.
+
+    Durable ledgers remain authoritative and a bounded head/tail transcript
+    preview preserves the current direction without blocking recovery.
+    """
+    state_text = json.dumps(state, ensure_ascii=False, sort_keys=True, default=str)
+    sections = [
+        "## Objective and durable run state",
+        _fit_to_tokens(model, state_text, max(512, load_settings().context.keep_tokens // 2)),
+    ]
+    if previous:
+        sections.extend(
+            [
+                "## Previous checkpoint",
+                _fit_to_tokens(model, previous, max(256, load_settings().context.keep_tokens // 4)),
+            ]
+        )
+    sections.extend(
+        [
+            "## Recent pre-checkpoint evidence",
+            _fit_to_tokens(
+                model, serialized_head, max(512, load_settings().context.keep_tokens // 2)
+            ),
+            "## Recovery note",
+            "The model summarizer was unavailable. Treat durable ledgers and artifact references "
+            "as authoritative, verify uncertain details, and do not repeat completed side effects.",
+        ]
+    )
+    return "\n\n".join(sections)
 
 
 def _extract_text(response: ModelResponse) -> str:
@@ -355,7 +419,7 @@ async def _summarize(
     return content
 
 
-async def maybe_compact(  # noqa: PLR0911
+async def maybe_compact(
     session: Session,
     *,
     model: str,
@@ -363,6 +427,7 @@ async def maybe_compact(  # noqa: PLR0911
     tools_text: str = "",
     force: bool = False,
     model_provider: ModelProvider | None = None,
+    context_window_tokens: int | None = None,
 ) -> bool:
     """Compact ``session`` if it is near the model's context window.
 
@@ -378,10 +443,12 @@ async def maybe_compact(  # noqa: PLR0911
     if len(items) < _MIN_ITEMS_TO_COMPACT:
         return False
 
-    window = context_window(model)
+    window = context_window_tokens or context_window(model)
     reserve = max(context.compact_buffer_tokens, output_limit(model))
     budget = max(context.keep_tokens, window - reserve)
-    used = count_tokens(model, "\n".join((instructions, tools_text, _serialize_items(items))))
+    used = count_tokens(model, f"{instructions}\n{tools_text}") + sum(
+        _item_token_cost(model, item) for item in items
+    )
     if used >= int(budget * 0.85):
         notify(
             "context.capacity_low",
@@ -397,7 +464,7 @@ async def maybe_compact(  # noqa: PLR0911
     split = _select_split(model, items, context.keep_tokens)
     head, recent = items[:split], items[split:]
     previous = _previous_summary(head)
-    input_budget = _summary_input_budget(model, previous)
+    input_budget = _summary_input_budget(model, previous, window)
     if not head or input_budget <= 0:
         # Nothing to summarise, or no room for even the summary request itself.
         if head:
@@ -427,7 +494,13 @@ async def maybe_compact(  # noqa: PLR0911
         model_provider,
     )
     if summary is None:
-        return False
+        summary = _deterministic_summary(
+            model,
+            previous=previous,
+            state=deterministic_state,
+            serialized_head=serialized_head,
+        )
+        logger.warning("using deterministic context checkpoint after summary failure")
 
     new_items = [_checkpoint_item(summary), *recent]
     rewritten = await replace_session_items(session, new_items, expected_len=len(items))

@@ -39,7 +39,14 @@ class CaidoBootstrapHandle:
         Shielded so one caller's cancellation (e.g. a tool timeout) does not
         cancel the shared bootstrap for everyone else.
         """
-        return await asyncio.shield(self._task)
+        try:
+            async with asyncio.timeout(120):
+                return await asyncio.shield(self._task)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "Caido bootstrap made no usable progress for 120 seconds; "
+                "the background health check is still running"
+            ) from exc
 
     def peek(self) -> Client | None:
         """Return the client if the bootstrap already finished cleanly."""

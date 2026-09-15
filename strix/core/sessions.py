@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import sqlite3
-from contextlib import contextmanager
+import uuid
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakKeyDictionary
@@ -73,14 +74,44 @@ class _PooledConnectionSession(SQLiteSession):
                     recent_items integer not null,
                     created_at timestamp default current_timestamp
                 );
+                create table if not exists session_events (
+                    seq integer primary key autoincrement,
+                    session_id text not null,
+                    event_id text not null unique,
+                    event_type text not null,
+                    turn_id text,
+                    step_id text,
+                    payload_json text not null,
+                    route_name text,
+                    model text,
+                    attempt integer,
+                    input_tokens integer,
+                    output_tokens integer,
+                    created_at timestamp default current_timestamp
+                );
+                create index if not exists idx_session_events_order
+                    on session_events(session_id, seq);
                 """
             )
+            event_columns = {
+                str(row[1]) for row in connection.execute("pragma table_info(session_events)")
+            }
+            if "attempt" not in event_columns:
+                connection.execute("alter table session_events add column attempt integer")
             # Backfill the history still available in pre-v1.7 databases once.
             connection.execute(
                 """
                 insert or ignore into transcript_entries(
                     session_id,message_data,source_message_id,created_at
                 ) select session_id,message_data,id,created_at from agent_messages
+                """
+            )
+            connection.execute(
+                """
+                insert or ignore into session_events(
+                    session_id,event_id,event_type,payload_json,created_at
+                ) select session_id,'legacy-transcript-' || id,'message',message_data,created_at
+                  from transcript_entries
                 """
             )
             connection.commit()
@@ -101,9 +132,21 @@ class _PooledConnectionSession(SQLiteSession):
             with self._locked_connection() as connection:
                 self._insert_items(connection, items)
                 if not self._journal_suspended:
+                    serialized = [json.dumps(redact_value(item)) for item in items]
                     connection.executemany(
                         "insert into transcript_entries(session_id,message_data) values (?,?)",
-                        [(self.session_id, json.dumps(redact_value(item))) for item in items],
+                        [(self.session_id, value) for value in serialized],
+                    )
+                    connection.executemany(
+                        """
+                        insert into session_events(
+                            session_id,event_id,event_type,payload_json
+                        ) values (?,?,?,?)
+                        """,
+                        [
+                            (self.session_id, uuid.uuid4().hex, "message", value)
+                            for value in serialized
+                        ],
                     )
                 connection.commit()
 
@@ -300,9 +343,81 @@ async def record_context_checkpoint(
                     recent_items,
                 ),
             )
+            connection.execute(
+                """
+                insert into session_events(
+                    session_id,event_id,event_type,payload_json,model
+                ) values (?,?,?,?,?)
+                """,
+                (
+                    session.session_id,
+                    uuid.uuid4().hex,
+                    "context_compacted",
+                    redact_secrets(
+                        json.dumps(
+                            {
+                                "summary": summary,
+                                "state": state,
+                                "compacted_items": compacted_items,
+                                "recent_items": recent_items,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    ),
+                    model,
+                ),
+            )
             connection.commit()
 
     await asyncio.to_thread(_record)
+
+
+async def record_session_event(
+    session: Session,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    turn_id: str | None = None,
+    step_id: str | None = None,
+    route_name: str | None = None,
+    model: str | None = None,
+    attempt: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> str | None:
+    """Append one durable typed event when the session uses Strix SQLite."""
+    if not isinstance(session, _PooledConnectionSession):
+        return None
+    event_id = uuid.uuid4().hex
+
+    def _record() -> None:
+        with session._locked_connection() as connection:
+            connection.execute(
+                """
+                insert into session_events(
+                    session_id,event_id,event_type,turn_id,step_id,payload_json,
+                    route_name,model,attempt,input_tokens,output_tokens
+                ) values (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    session.session_id,
+                    event_id,
+                    event_type,
+                    turn_id,
+                    step_id,
+                    redact_secrets(json.dumps(payload, ensure_ascii=False, default=str)),
+                    route_name,
+                    model,
+                    attempt,
+                    input_tokens,
+                    output_tokens,
+                ),
+            )
+            connection.commit()
+
+    await asyncio.to_thread(_record)
+    return event_id
 
 
 def _read_checkpoint_json(path: Path) -> Any | None:
@@ -351,7 +466,9 @@ def _finding_files(findings: Any) -> list[str]:
     return sorted(relevant_files)
 
 
-def deterministic_context_state(session: Session) -> dict[str, Any]:
+def deterministic_context_state(  # noqa: PLR0912 - joins bounded durable ledgers.
+    session: Session,
+) -> dict[str, Any]:
     """Read durable run ledgers used to anchor an LLM compaction summary."""
     path = getattr(session, "db_path", None)
     session_id = str(getattr(session, "session_id", ""))
@@ -377,6 +494,25 @@ def deterministic_context_state(session: Session) -> dict[str, Any]:
     relevant_files = _finding_files(result.get("findings"))
     if relevant_files:
         result["relevant_files"] = relevant_files
+    run_dir = state_dir.parent
+    artifact_refs: list[dict[str, Any]] = []
+    for folder in ("vulnerabilities", "browser", "artifacts"):
+        root = run_dir / folder
+        if not root.is_dir():
+            continue
+        for artifact in root.rglob("*"):
+            if len(artifact_refs) >= 500:
+                break
+            if artifact.is_file() and not artifact.is_symlink():
+                with suppress(OSError):
+                    artifact_refs.append(
+                        {
+                            "path": artifact.relative_to(run_dir).as_posix(),
+                            "size": artifact.stat().st_size,
+                        }
+                    )
+    if artifact_refs:
+        result["artifact_references"] = artifact_refs
     return result
 
 

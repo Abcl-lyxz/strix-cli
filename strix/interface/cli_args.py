@@ -51,6 +51,10 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _environment_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def _agent_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed < 2:
@@ -175,6 +179,46 @@ Examples:
         "for more files. DEST is the path inside /workspace and defaults to the file name "
         "(for example '--workspace-file ./wordlist.txt:lists/wordlist.txt'). The file is "
         "read-only inside the sandbox and lands outside every target directory.",
+    )
+    parser.add_argument(
+        "--sandbox-profile",
+        choices=["web", "network", "lan", "remediation"],
+        default=os.environ.get("STRIX_SANDBOX_PROFILE", "web"),
+        help="Sandbox privilege profile (default: web).",
+    )
+    parser.add_argument(
+        "--tool-pack",
+        default=os.environ.get("STRIX_TOOL_PACK", "auto"),
+        help="Comma-separated scanner packs, or auto (default).",
+    )
+    parser.add_argument(
+        "--scope-cidr",
+        default=os.environ.get("STRIX_SCOPE_CIDR"),
+        help="Comma-separated authorized network CIDRs enforced by network workflows.",
+    )
+    parser.add_argument(
+        "--network-interface",
+        default=os.environ.get("STRIX_NETWORK_INTERFACE"),
+        help="Explicit wired interface for the Linux-only lan profile.",
+    )
+    parser.add_argument(
+        "--packet-rate-limit",
+        type=_positive_int,
+        default=os.environ.get("STRIX_PACKET_RATE_LIMIT"),
+        metavar="PPS",
+        help="Authorized new-packet rate ceiling required by the lan profile.",
+    )
+    parser.add_argument(
+        "--workspace-mode",
+        choices=["read-only", "read-write"],
+        default=os.environ.get("STRIX_WORKSPACE_MODE", "read-only"),
+        help="Host workspace mount access (default: read-only).",
+    )
+    parser.add_argument(
+        "--acknowledge-lan-scope",
+        action="store_true",
+        default=_environment_flag("STRIX_LAN_ACKNOWLEDGED"),
+        help="Confirm that the wired L2 interface and CIDR are authorized for testing.",
     )
 
     parser.add_argument(
@@ -320,6 +364,19 @@ Examples:
 
     if args.config:
         apply_config_override(validate_config_file(args.config))
+
+    from strix.config.loader import set_session_field
+
+    for name, value in (
+        ("sandbox_profile", args.sandbox_profile),
+        ("tool_pack", args.tool_pack),
+        ("workspace_mode", args.workspace_mode),
+        ("scope_cidr", args.scope_cidr),
+        ("network_interface", args.network_interface),
+        ("packet_rate_limit", args.packet_rate_limit),
+        ("lan_acknowledged", args.acknowledge_lan_scope),
+    ):
+        set_session_field("runtime", name, value)
 
     if args.mcp_config:
         mcp_config_path = Path(args.mcp_config).expanduser()
@@ -482,6 +539,19 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
         attach_workspace_mount(args)
     if state.get("diff_scope"):
         args.diff_scope = state.get("diff_scope")
+    from strix.config.loader import set_session_field
+
+    for field in (
+        "sandbox_profile",
+        "tool_pack",
+        "scope_cidr",
+        "network_interface",
+        "packet_rate_limit",
+        "workspace_mode",
+    ):
+        if state.get(field) not in {None, ""}:
+            setattr(args, field, state[field])
+            set_session_field("runtime", field, state[field])
     persisted_scan_mode = state.get("scan_mode")
     if persisted_scan_mode and args.scan_mode == "deep":
         args.scan_mode = persisted_scan_mode

@@ -13,6 +13,7 @@ from strix.core.sessions import (
     deterministic_context_state,
     open_agent_session,
     record_context_checkpoint,
+    record_session_event,
     replace_session_items,
 )
 
@@ -148,3 +149,41 @@ def test_deterministic_state_includes_task_findings_failures_and_files(tmp_path:
     assert state["coverage"] == {"tested": ["/login"]}
     assert state["findings"][0]["id"] == "vuln-0001"
     assert state["relevant_files"] == ["src/auth.py"]
+
+
+@pytest.mark.asyncio
+async def test_session_events_are_ordered_and_keep_attempt_metadata(tmp_path: Path) -> None:
+    path = tmp_path / ".state" / "agents.db"
+    session = open_agent_session("root", path)
+    try:
+        first_id = await record_session_event(
+            session,
+            "model_turn_started",
+            {"objective": "verify auth"},
+            turn_id="turn-1",
+            route_name="primary",
+            model="provider/opaque-model",
+            attempt=1,
+            input_tokens=120,
+        )
+        second_id = await record_session_event(
+            session,
+            "model_turn_failed",
+            {"category": "provider_throttled"},
+            turn_id="turn-1",
+            route_name="primary",
+            model="provider/opaque-model",
+            attempt=1,
+            input_tokens=120,
+        )
+    finally:
+        session.close()
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "select event_id,event_type,attempt,input_tokens from session_events order by seq"
+        ).fetchall()
+    assert rows == [
+        (first_id, "model_turn_started", 1, 120),
+        (second_id, "model_turn_failed", 1, 120),
+    ]

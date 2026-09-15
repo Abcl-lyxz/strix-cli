@@ -186,6 +186,12 @@ class WorkspaceRuntime:
             "max_agents": getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
             "routes": getattr(self.args, "route", None) or [],
             "workspace_mount": getattr(self.args, "workspace_mount", None) or "",
+            "sandbox_profile": getattr(self.args, "sandbox_profile", "web"),
+            "tool_pack": getattr(self.args, "tool_pack", "auto"),
+            "scope_cidr": getattr(self.args, "scope_cidr", None),
+            "network_interface": getattr(self.args, "network_interface", None),
+            "packet_rate_limit": getattr(self.args, "packet_rate_limit", None),
+            "workspace_mode": getattr(self.args, "workspace_mode", "read-only"),
             "workspace_subdir": getattr(self.args, "workspace_subdir", None) or "",
         }
         self.report_state = ReportState(self.scan_config["run_name"])
@@ -419,22 +425,43 @@ class WorkspaceRuntime:
         safe. The controller renders it as the sidebar MCP connections panel."""
         self.controller.set_mcp_connections(roster)
 
-    async def _sync_agent_state(self) -> bool:  # noqa: PLR0912 - explicit lifecycle transitions
+    async def _sync_agent_state(  # noqa: PLR0912,PLR0915 - explicit lifecycle transitions
+        self,
+    ) -> bool:
         parent_of, statuses, names, errors = await self.coordinator.graph_snapshot()
         changed = False
         for agent_id, status in statuses.items():
             error = errors.get(agent_id)
+            wait_kind = self.coordinator.wait_kinds.get(agent_id, "")
+            display_status = str(status)
+            operation = self.coordinator.metadata.get(agent_id, {}).get("operation")
+            if status == "running" and operation in {"queued", "retrying", "compacting"}:
+                display_status = str(operation)
+            if status == "waiting":
+                display_status = {
+                    "provider": "waiting_provider",
+                    "blocked": "blocked",
+                    "user": "waiting_user",
+                    "agents": "waiting_agents",
+                    "stalled": "blocked",
+                }.get(wait_kind, "queued")
             changed = (
                 self.live_view.upsert_agent(
                     agent_id,
                     name=names.get(agent_id, agent_id),
                     parent_id=parent_of.get(agent_id),
-                    status=str(status),
+                    status=display_status,
                     error_message=error,
                 )
                 or changed
             )
-            wait_kind = self.coordinator.wait_kinds.get(agent_id, "")
+            public_metadata = self.coordinator.metadata.get(agent_id, {})
+            public_agent = self.live_view.agents[agent_id]
+            for key in ("operation", "compaction_count", "last_progress_at"):
+                value = public_metadata.get(key)
+                if value is not None and public_agent.get(key) != value:
+                    public_agent[key] = value
+                    changed = True
             if self.live_view.agents[agent_id].get("wait_kind", "") != wait_kind:
                 self.live_view.agents[agent_id]["wait_kind"] = wait_kind
                 changed = True
@@ -453,6 +480,7 @@ class WorkspaceRuntime:
         roots = [agent_id for agent_id, parent_id in parent_of.items() if parent_id is None]
         root_id = roots[0] if roots else None
         root_status = statuses.get(root_id) if root_id is not None else None
+        root_wait_kind = self.coordinator.wait_kinds.get(root_id, "") if root_id else ""
         report_status = (
             self.report_state.run_record.get("status") if self.report_state is not None else None
         )
@@ -464,6 +492,8 @@ class WorkspaceRuntime:
         elif scan_state == "failed" and root_status in {"running", "waiting", "budget_paused"}:
             scan_state = "running"
             self.controller.error = None
+        elif scan_state == "stopped":
+            pass
         elif scan_state != "failed":
             if report_status == "completed":
                 scan_state = "completed"
@@ -472,6 +502,25 @@ class WorkspaceRuntime:
             elif root_status == "completed":
                 scan_state = "failed"
                 self.controller.error = "Scan ended without a completed report"
+            elif root_status == "budget_paused":
+                scan_state = "budget_paused"
+            elif root_status == "waiting":
+                scan_state = {
+                    "provider": "waiting_provider",
+                    "blocked": "blocked",
+                    "user": "waiting_user",
+                    "agents": "waiting_agents",
+                    "stalled": "blocked",
+                }.get(root_wait_kind, "queued")
+            elif root_status == "running":
+                root_operation = (
+                    self.coordinator.metadata.get(root_id, {}).get("operation") if root_id else None
+                )
+                scan_state = (
+                    str(root_operation)
+                    if root_operation in {"queued", "retrying", "compacting"}
+                    else "running"
+                )
         if scan_state != self.controller.scan_state:
             self.controller.scan_state = scan_state
             changed = True

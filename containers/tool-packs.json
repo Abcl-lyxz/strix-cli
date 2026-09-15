@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "packs": {
+    "core": ["httpx", "katana", "ffuf", "nuclei", "sqlmap", "semgrep", "bandit", "trivy", "gitleaks", "trufflehog", "agent-browser", "caido-cli"],
+    "network": ["nmap", "naabu", "masscan", "arp-scan", "netdiscover", "tcpdump", "tshark", "scapy", "dig", "dnsrecon", "snmpwalk", "onesixtyone", "ike-scan", "sslscan", "testssl", "socat"],
+    "identity": ["netexec", "enum4linux-ng", "smbclient", "ldapsearch", "kerbrute", "impacket-GetUserSPNs", "bloodhound-python"],
+    "cloud": ["trivy", "prowler", "scout", "kubectl", "kube-bench", "kube-hunter"],
+    "mobile": ["jadx", "apktool", "apksigner", "adb", "frida-ps"],
+    "firmware": ["binwalk", "unsquashfs", "yara", "qemu-aarch64-static"]
+  },
+  "excluded_by_default": ["wireless", "denial-of-service", "credential-spraying", "lateral-movement", "destructive-exploitation"]
+}

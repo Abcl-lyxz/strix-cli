@@ -1,6 +1,4 @@
-"""Model-aware token budgets, resolved from LiteLLM model metadata with a
-large configurable fallback for models LiteLLM doesn't map.
-"""
+"""Model-aware token budgets with a conservative unknown-model fallback."""
 
 from __future__ import annotations
 

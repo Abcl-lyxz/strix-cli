@@ -11,19 +11,24 @@ Enter inserts a newline. **Ctrl+S sends**; both interfaces show a Send action. P
 
 In the terminal, **Ctrl+K** opens the searchable command palette, **Ctrl+E** expands the composer, `/editor` opens an external editor, and Alt+Up/Down recalls drafts. `/settings` includes an external-editor setting; `VISUAL` and `EDITOR` remain fallbacks. Slash commands without arguments open forms; argument shortcuts still work.
 
-Use `/connect` or **Connect provider** to choose a provider, enter a masked key, discover models, and select an exact model ID. Custom gateways use an explicit endpoint. Discovery identifies cached or configured results when offline and allows manual entry. **Test model and tool support** verifies the same transport used by scans. `/routes` selects an existing connection; `/routing` or **Advanced routing** edits priorities, concurrency, and request limits. Settings show their source and when changes apply. Explicit edits override this session; **Save as default** persists them. Provider changes apply at the next call; sandbox, integration, and MCP changes apply to the next scan.
+Use `/connect` or **Connect provider** to choose a provider, enter a masked key, discover models, and select an exact model ID. Providers come from the packaged catalog and installed runtime adapters rather than a UI hardcoded list. Custom gateways use an explicit endpoint. Discovery identifies cached or configured results when offline and allows manual entry. **Test model and tool support** verifies the same transport used by scans. `/routes` selects an existing connection; `/routing` or **Advanced routing** edits priorities, concurrency, and request limits. Settings show their source and when changes apply. Explicit edits override this session; **Save as default** persists them. Provider changes apply at the next call; sandbox, integration, and MCP changes apply to the next scan.
 
 ## Targets and attachments
 
-Use **Add target** or `/target` for explicit scan scope. A standalone URL or path can also start a scan. URLs in ordinary prose do not silently expand scope. `/attach`, **Attach path**, or **Upload files** adds supporting context. `@path` followed by Tab opens path completion in the terminal. Attachments accept files, folders, spaces, quoted Windows paths, Unicode names, and binaries; binary bytes are never inserted into model text. The limit is 250 MiB or 2,000 files per attachment. Explicit attachments are copied into `/workspace/attachments/...` and the agent receives that actual sandbox path. APK-specific analysis is not provided.
+Use **Add target** or `/target` for explicit scan scope. A standalone URL or path can also start a scan. URLs in ordinary prose do not silently expand scope. `/attach`, **Attach path**, or **Upload files** adds supporting context. `@path` followed by Tab opens path completion in the terminal. Attachments accept files, folders, spaces, quoted Windows paths, Unicode names, and binaries; binary bytes are never inserted into model text. The limit is 250 MiB or 2,000 files per attachment. Explicit attachments are copied into `/workspace/attachments/...` and the agent receives that actual sandbox path. Android APK analysis is available through the `mobile` pack.
 
 ## Live work and reports
 
-The browser provides scan creation, resume, stop, prompts, settings, a selectable notification inbox, searchable transcripts, agent graphs, findings, browser evidence, and local downloads. One process owns one active scan; historical runs remain browsable. Abandoned runs are marked interrupted and can be resumed. The event stream reconnects with a fresh snapshot and bounds rendered history.
+The browser provides scan creation, resume, stop, prompts, settings, a selectable notification inbox, searchable transcripts, agent graphs, overview/severity summaries, run details, rich findings with CVSS vectors and CVE/CWE/evidence, intelligence confidence/EPSS/KEV state, browser evidence, and local downloads. One process owns one active scan; historical runs remain browsable. Abandoned runs are marked interrupted and can be resumed. Monotonic event IDs make the event stream resumable; a stale heartbeat reconnects and performs a full-state resynchronization.
 
 All local history is unlocked. Reports download locally as Markdown, JSON, SARIF, or PDF. There are no managed-cloud commands, promotions, email gates, hosted report delivery, or outbound usage analytics. Provider credentials remain in the local credential store.
 
-The browser requires the per-process authorization link printed at startup. It exchanges the link token for an HttpOnly, SameSite cookie, enforces origin checks on commands, and confines artifact downloads to the selected run. Treat the startup link as access to your local workspace.
+When Strix opens the browser it mints a one-time bootstrap nonce valid for 60
+seconds. The server exchanges it for an HttpOnly, SameSite cookie and responds
+with a `303` redirect to `/`, so the browser address/history contains only the
+bare viewer URL. The TUI also displays only that bare URL and mints a new nonce
+for every open action. Origin checks protect commands and artifact downloads
+remain confined to the selected run.
 
 ## Recovery and diagnostics
 

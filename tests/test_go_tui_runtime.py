@@ -996,7 +996,7 @@ async def test_agent_state_sync_clears_root_failure_after_user_resume() -> None:
     assert runtime.controller.scan_state == "running"
     assert runtime.controller.error is None
     root = runtime.live_view.agents["root"]
-    assert root["status"] == "waiting"
+    assert root["status"] == "queued"
     assert "error_message" not in root
 
 

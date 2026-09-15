@@ -5,6 +5,19 @@ description: "Multi-route failover, durable chat history, secure credentials, no
 
 ## Model route pools
 
+Provider choices come from a versioned Models.dev-compatible snapshot bundled
+with each release, installed LiteLLM adapters, and `strix.providers` entry
+points. `strix providers refresh` updates the catalog with ETags and atomic
+last-known-good replacement; the bundled snapshot remains available offline.
+`strix providers detect` performs only a bounded `/models` request. It never
+sends a paid inference canary; `strix routes test` is the explicit connection
+and tool-support canary.
+
+Unknown model IDs are preserved verbatim and start with a conservative 32,768
+token context limit. Endpoint metadata and explicit route overrides can raise
+that limit. A provider context rejection teaches the route a lower ceiling,
+which is persisted and applied before the next request.
+
 A route names one model connection. Each saved route has a model, optional base
 URL, priority, concurrency limit, optional requests-per-minute and
 tokens-per-minute limits, enabled state, and credential references. Strix picks
@@ -69,9 +82,11 @@ changes. Unsupported tool schemas disable a route for the run. Content-policy
 refusals are reported and are never sent to another provider as a bypass.
 
 The route pool owns request retries, avoiding multiplied SDK/provider retry
-loops. A partially streamed model turn can be replayed at most twice. Tool
-outputs are checkpointed before replay, so an already-executed tool is not run
-again.
+loops. Its circuit has closed, open, and single-probe half-open states;
+concurrency drops after throttling/transport failures and recovers one slot at
+a time. A partially streamed model turn is not replayed to another provider.
+Tool outputs are checkpointed before continuation, so an already-executed tool
+is not run again.
 
 When all routes are unavailable, agents park without becoming failed. An
 interactive run waits for recovery indefinitely. A headless run waits up to
@@ -87,7 +102,7 @@ Chat history and scan evidence stay in the project that launched Strix:
 ```text
 strix_runs/<run-name>/
 ├── .state/
-│   ├── agents.db       # sessions, working messages, append-only transcripts, checkpoints
+│   ├── agents.db       # working projection, typed events, transcript, checkpoints
 │   └── agents.json     # agent graph snapshot
 ├── strix.log
 ├── run.json
@@ -96,8 +111,12 @@ strix_runs/<run-name>/
 └── penetration_test_report.md
 ```
 
-Working SDK messages may be compacted, but `transcript_entries` in `agents.db`
-is append-only and context summaries are recorded in `context_checkpoints`.
+Working SDK messages may be compacted, but `session_events` and
+`transcript_entries` in `agents.db` are append-only and context summaries are
+recorded in `context_checkpoints`. Large outputs are content-addressed under
+`artifacts/`; working history receives a bounded preview and hash. If the
+summary model fails, Strix creates a deterministic checkpoint from the durable
+task, scope, evidence, findings, coverage, handoff, and artifact ledgers.
 Existing runs are backfilled once from messages still present in their old
 database. Content removed by a compaction before this upgrade cannot be
 reconstructed.

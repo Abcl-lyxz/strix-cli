@@ -19,6 +19,11 @@ import {
   buildGraphAgents,
 } from "@/components/live/AgentTranscript";
 import Markdown from "@/components/live/tool-renderers/Markdown";
+import { IssueSeveritySummary } from "@/components/IssueSeveritySummary";
+import { RunDetails } from "@/components/RunDetails";
+import VulnerabilityDetail from "@/components/vulnerability/VulnerabilityDetail";
+import { normalizeVulnerability } from "@/lib/local-run-parser";
+import type { Vulnerability } from "@/types/issues";
 import "./workspace.css";
 
 type Row = Record<string, any>;
@@ -61,6 +66,7 @@ export function mergeEvents(previous: Row[], incoming: Row[], reset = false) {
 }
 export default function App() {
   const [state, setState] = useState<Row>({ setup_mode: true });
+  const [runRecord, setRunRecord] = useState<Row>({});
   const [events, setEvents] = useState<Row[]>([]),
     [agents, setAgents] = useState<Row[]>([]),
     [findings, setFindings] = useState<Row[]>([]);
@@ -71,6 +77,7 @@ export default function App() {
     [search, setSearch] = useState(""),
     [error, setError] = useState("");
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [selectedFinding, setSelectedFinding] = useState<string | null>(null);
   const [showGraph, setShowGraph] = useState(false);
   const [expanded, setExpanded] = useState(false),
     [streamEpoch, setStreamEpoch] = useState(0);
@@ -94,6 +101,7 @@ export default function App() {
     ),
     editor = useRef<HTMLTextAreaElement>(null);
   const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastStreamEvent = useRef(Date.now());
   const runQuery = historical
     ? `?run=${encodeURIComponent(historical.name)}`
     : "";
@@ -215,9 +223,13 @@ export default function App() {
     url.searchParams.delete("token");
     history.replaceState(null, "", url);
     const stream = new EventSource("/api/app/events");
-    stream.onopen = () => setOnline(true);
+    stream.onopen = () => {
+      lastStreamEvent.current = Date.now();
+      setOnline(true);
+    };
     stream.onerror = () => setOnline(false);
     stream.onmessage = (event) => {
+      lastStreamEvent.current = Date.now();
       let data: Row;
       try {
         data = JSON.parse(event.data);
@@ -237,7 +249,22 @@ export default function App() {
       if (data.findings) setFindings(data.findings);
       if (data.attachments) setAttachments(data.attachments);
     };
-    return () => stream.close();
+    const heartbeat = () => {
+      lastStreamEvent.current = Date.now();
+    };
+    stream.addEventListener?.("heartbeat", heartbeat);
+    const staleWatchdog = window.setInterval(() => {
+      if (Date.now() - lastStreamEvent.current <= 15_000) return;
+      stream.close();
+      setOnline(false);
+      setError("Live updates stalled; reconnecting and resynchronizing state.");
+      setStreamEpoch((epoch) => epoch + 1);
+    }, 5_000);
+    return () => {
+      window.clearInterval(staleWatchdog);
+      stream.removeEventListener?.("heartbeat", heartbeat);
+      stream.close();
+    };
   }, [streamEpoch]);
   useEffect(() => {
     api("/api/capabilities")
@@ -270,6 +297,12 @@ export default function App() {
         .then((data) => setArtifacts(data.artifacts))
         .catch((e) => setError(e.message));
   }, [view, runQuery, state.scan_state]);
+  useEffect(() => {
+    if (!historical && state.run_name)
+      api("/api/run")
+        .then((data) => setRunRecord(data))
+        .catch(() => {});
+  }, [historical, state.run_name, state.scan_state]);
   const send = async () => {
     if (!draft.trim() || delivery === "pending") return;
     if (new TextEncoder().encode(draft).length > 262144) {
@@ -296,12 +329,13 @@ export default function App() {
   const browse = async (run: Row) => {
     try {
       const query = `?run=${encodeURIComponent(run.name)}`;
-      const [transcript, reports] = await Promise.all([
+      const [transcript, reports, runRecord] = await Promise.all([
         api("/api/transcript" + query),
         api("/api/vulnerabilities" + query),
+        api("/api/run" + query),
       ]);
-      setHistorical({ ...run, ...transcript, findings: reports });
-      setView("workspace");
+      setHistorical({ ...run, ...transcript, findings: reports, runRecord });
+      setView("overview");
     } catch (e) {
       setError((e as Error).message);
     }
@@ -476,6 +510,38 @@ export default function App() {
     }
   };
   const displayedFindings = historical?.findings || findings;
+  const normalizedFindings = useMemo<Vulnerability[]>(
+    () =>
+      displayedFindings.map((finding: Row, index: number) =>
+        normalizeVulnerability(
+          finding,
+          index,
+          String(historical?.name || state.run_name || "") || null,
+        ),
+      ),
+    [displayedFindings, historical?.name, state.run_name],
+  );
+  const findingSummary = useMemo(
+    () => ({
+      total: normalizedFindings.length,
+      critical: normalizedFindings.filter((item) => item.severity === "critical").length,
+      high: normalizedFindings.filter((item) => item.severity === "high").length,
+      medium: normalizedFindings.filter((item) => item.severity === "medium").length,
+      low: normalizedFindings.filter((item) => item.severity === "low").length,
+    }),
+    [normalizedFindings],
+  );
+  const displayedRun = historical?.runRecord || runRecord;
+  const activeFinding = normalizedFindings.find((item) => item.id === selectedFinding) || null;
+  const runDuration = useMemo(() => {
+    const start = Date.parse(String(displayedRun.start_time || ""));
+    const endValue = displayedRun.end_time
+      ? Date.parse(String(displayedRun.end_time))
+      : Date.now();
+    return Number.isFinite(start) && Number.isFinite(endValue) && endValue >= start
+      ? Math.round((endValue - start) / 1000)
+      : null;
+  }, [displayedRun]);
   const visibleEvents = displayedEvents
     .filter(
       (event: Row) =>
@@ -612,6 +678,7 @@ export default function App() {
           New scan
         </button>
         {[
+          ["overview", "Overview", Sliders],
           ["workspace", "Workspace", Activity],
           ["findings", "Findings", FolderOpen],
           ["evidence", "Evidence & reports", Paperclip],
@@ -655,6 +722,22 @@ export default function App() {
           <button onClick={openProviders}>
             {state.selected_route || state.model || "Connect provider"}
           </button>
+          {state.route_health?.[0] && (
+            <span className="route-health" title={state.route_health[0].last_error?.detail || ""}>
+              {state.route_health[0].circuit_state || state.route_health[0].health}
+              {" · "}
+              {state.route_health[0].active}/{state.route_health[0].effective_concurrency}
+              {" · ctx "}
+              {Math.round((state.route_health[0].context_usage_tokens || 0) / 1000)}k/
+              {Math.round((state.route_health[0].context_window_tokens || 0) / 1000)}k
+              {state.route_health[0].next_retry_seconds
+                ? ` · retry in ${state.route_health[0].next_retry_seconds}s`
+                : ""}
+              {state.route_health[0].retry_waste_tokens
+                ? ` · retry waste ${state.route_health[0].retry_waste_tokens}`
+                : ""}
+            </span>
+          )}
         </header>
         {error && (
           <div role="alert" className="error-banner">
@@ -683,6 +766,53 @@ export default function App() {
               Return to active workspace
             </button>
           </div>
+        )}
+        {view === "overview" && (
+          <section className="page overview-page">
+            <div className="overview-heading">
+              <div>
+                <h1>Security overview</h1>
+                <p className="muted">
+                  {displayedRun.status || state.scan_state || "Ready"} ·{" "}
+                  {historical?.name || state.run_name || "Current workspace"}
+                </p>
+              </div>
+            </div>
+            <IssueSeveritySummary findings={findingSummary} />
+            {!normalizedFindings.length && <p>No verified findings recorded.</p>}
+            <div className="overview-findings">
+              {normalizedFindings.map((finding: Vulnerability) => (
+                <button
+                  key={finding.id}
+                  className="finding-row"
+                  onClick={() => setSelectedFinding(finding.id)}
+                >
+                  <span className={`severity ${finding.severity}`}>{finding.severity}</span>
+                  <strong>{finding.title}</strong>
+                  <span>{finding.cvss != null ? `CVSS ${finding.cvss}` : "CVSS pending"}</span>
+                  {finding.cve && <code>{finding.cve}</code>}
+                  {finding.known_exploited && <em>CISA KEV</em>}
+                </button>
+              ))}
+            </div>
+            <RunDetails raw={displayedRun} durationSeconds={runDuration} />
+            {activeFinding && (
+              <div className="finding-modal" role="dialog" aria-modal="true">
+                <div className="finding-modal-card">
+                  <button
+                    className="finding-modal-close"
+                    aria-label="Close finding"
+                    onClick={() => setSelectedFinding(null)}
+                  >
+                    <X size={18} />
+                  </button>
+                  <VulnerabilityDetail
+                    vulnerability={activeFinding}
+                  />
+                </div>
+              </div>
+            )}
+          </section>
         )}
         {view === "workspace" && (
           <>
@@ -1031,28 +1161,23 @@ export default function App() {
         {view === "findings" && (
           <section className="page">
             <h1>
-              Findings <span className="muted">{displayedFindings.length}</span>
+              Findings <span className="muted">{normalizedFindings.length}</span>
             </h1>
-            {!displayedFindings.length && <p>No findings recorded.</p>}
-            {displayedFindings.map((finding: Row, i: number) => (
-              <details className="finding" key={finding.id || i}>
-                <summary>
-                  <span className={`severity ${finding.severity}`}>
-                    {finding.severity}
-                  </span>
-                  {finding.title || finding.name}
-                </summary>
-                <Markdown
-                  text={Object.entries(finding)
-                    .filter(
-                      ([k, v]) =>
-                        typeof v === "string" &&
-                        !["id", "title", "severity"].includes(k),
-                    )
-                    .map(([k, v]) => `### ${k.replaceAll("_", " ")}\n${v}`)
-                    .join("\n\n")}
-                />
-              </details>
+            <IssueSeveritySummary findings={findingSummary} />
+            {!normalizedFindings.length && <p>No findings recorded.</p>}
+            {normalizedFindings.map((finding: Vulnerability) => (
+              <button
+                className="finding-row"
+                key={finding.id}
+                onClick={() => {
+                  setSelectedFinding(finding.id);
+                  setView("overview");
+                }}
+              >
+                <span className={`severity ${finding.severity}`}>{finding.severity}</span>
+                <strong>{finding.title}</strong>
+                <span>{finding.cve || (finding.cwe || []).join(", ") || "Verified finding"}</span>
+              </button>
             ))}
           </section>
         )}

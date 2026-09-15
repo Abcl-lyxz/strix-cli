@@ -10,6 +10,7 @@ import logging
 import os
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +60,7 @@ from strix.tools.output_store import (
     WORKSPACE_SPILL_DIR,
     configure_spill_writer,
 )
+from strix.utils.secret_files import write_secret_text
 
 
 if TYPE_CHECKING:
@@ -337,6 +339,10 @@ async def run_strix_scan(
         ),
         health_path=state_dir / "routes.json",
         route_reloader=_route_reloader(scan_config.get("routes")),
+        stream_idle_timeout=float(getattr(settings.llm, "stream_idle_timeout", 300)),
+        max_attempts_per_route=int(
+            getattr(getattr(settings, "routing", None), "max_attempts_per_route", 2)
+        ),
     )
 
     if coordinator is None:
@@ -415,6 +421,8 @@ async def run_strix_scan(
         """Write an oversized tool result into the sandbox; return its path or None."""
         path = f"{WORKSPACE_SPILL_DIR}/{output_id}.txt"
         try:
+            host_artifact = run_dir / "artifacts" / "tool-output" / f"{output_id}.txt"
+            await asyncio.to_thread(write_secret_text, host_artifact, text)
             await sandbox_session.write(Path(path), io.BytesIO(text.encode("utf-8")))
         except Exception:
             logger.exception("failed to spill tool output to sandbox workspace")
@@ -442,6 +450,10 @@ async def run_strix_scan(
             prompt_cache=settings.llm.prompt_cache,
             extra_headers=settings.llm.extra_headers,
         )
+        # The shared route pool owns request retries and circuit breaking.  If
+        # the SDK also retries the RoutedModel, a single route failure expands
+        # multiplicatively across every agent waiting on that route.
+        model_settings = replace(model_settings, retry=None)
         run_config = RunConfig(
             model=resolved_model,
             model_provider=SmartRouteProvider(route_pool),
@@ -601,6 +613,7 @@ async def run_strix_scan(
                 **kwargs,
             )
 
+        runtime_settings = getattr(settings, "runtime", None)
         context: dict[str, Any] = {
             "coordinator": coordinator,
             "sandbox_session": bundle["session"],
@@ -611,8 +624,13 @@ async def run_strix_scan(
             "interactive": interactive,
             "spawn_child_agent": spawn_child_agent,
             "scan_targets": build_scan_targets(scan_config),
-            "max_context_images": settings.runtime.max_context_images,
+            "max_context_images": getattr(runtime_settings, "max_context_images", 3),
             "route_pool": route_pool,
+            "sandbox_profile": getattr(runtime_settings, "sandbox_profile", "web"),
+            "tool_pack": getattr(runtime_settings, "tool_pack", "auto"),
+            "scope_cidr": getattr(runtime_settings, "scope_cidr", None),
+            "network_interface": getattr(runtime_settings, "network_interface", None),
+            "packet_rate_limit": getattr(runtime_settings, "packet_rate_limit", None),
         }
 
         root_session = open_agent_session(root_id, agents_db)

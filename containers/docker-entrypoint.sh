@@ -1,7 +1,61 @@
 #!/bin/bash
 set -e
 
-if [ -n "${STRIX_HOST_UID:-}" ] && [ "${STRIX_HOST_UID}" != "0" ] && [ "${STRIX_HOST_UID}" != "$(id -u)" ]; then
+configure_network_scope() {
+  case "${STRIX_SANDBOX_PROFILE:-web}" in
+    network|lan) ;;
+    *) return 0 ;;
+  esac
+
+  if [ -z "${STRIX_SCOPE_CIDR:-}" ]; then
+    echo "ERROR: network and lan profiles require STRIX_SCOPE_CIDR." >&2
+    exit 1
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "ERROR: iptables is required to enforce the network scope." >&2
+    exit 1
+  fi
+
+  iptables -F OUTPUT
+  iptables -P OUTPUT DROP
+  iptables -A OUTPUT -o lo -j ACCEPT
+  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -F OUTPUT
+    ip6tables -P OUTPUT DROP
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  fi
+
+  IFS=',' read -ra _scope_cidrs <<< "${STRIX_SCOPE_CIDR}"
+  for _cidr in "${_scope_cidrs[@]}"; do
+    _cidr="${_cidr//[[:space:]]/}"
+    [ -n "${_cidr}" ] || continue
+    if [[ "${_cidr}" == *:* ]]; then
+      if ! command -v ip6tables >/dev/null 2>&1; then
+        echo "ERROR: IPv6 CIDR supplied but ip6tables is unavailable." >&2
+        exit 1
+      fi
+      _firewall=ip6tables
+    else
+      _firewall=iptables
+    fi
+    if [ -n "${STRIX_PACKET_RATE_LIMIT:-}" ]; then
+      "${_firewall}" -A OUTPUT -d "${_cidr}" -m conntrack --ctstate NEW \
+        -m limit --limit "${STRIX_PACKET_RATE_LIMIT}/second" \
+        --limit-burst "${STRIX_PACKET_RATE_LIMIT}" -j ACCEPT
+    else
+      "${_firewall}" -A OUTPUT -d "${_cidr}" -j ACCEPT
+    fi
+  done
+  iptables -A OUTPUT -j REJECT
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -A OUTPUT -j REJECT
+  fi
+  echo "Applied CIDR egress allowlist: ${STRIX_SCOPE_CIDR}"
+}
+
+if [ "${STRIX_HARDENED_SANDBOX:-0}" != "1" ] && [ -n "${STRIX_HOST_UID:-}" ] && [ "${STRIX_HOST_UID}" != "0" ] && [ "${STRIX_HOST_UID}" != "$(id -u)" ]; then
   exec sudo -E -- bash -c '
     set -e
     gid="${STRIX_HOST_GID:-$STRIX_HOST_UID}"
@@ -16,6 +70,8 @@ if [ -n "${STRIX_HOST_UID:-}" ] && [ "${STRIX_HOST_UID}" != "0" ] && [ "${STRIX_
     exec setpriv --reuid "${STRIX_HOST_UID}" --regid "${gid}" --init-groups "$0" "$@"
   ' "$0" "$(id -u)" "$(id -g)" "$PATH" "$@"
 fi
+
+configure_network_scope
 
 CAIDO_PORT=48080
 CAIDO_LOG="/tmp/caido_startup.log"
@@ -81,6 +137,7 @@ echo "Caido is up — host bootstraps the guest token + project via the Python S
 
 echo "Configuring system-wide proxy settings..."
 
+if [ "${STRIX_HARDENED_SANDBOX:-0}" != "1" ]; then
 cat << EOF | sudo tee /etc/profile.d/proxy.sh
 export http_proxy=http://127.0.0.1:${CAIDO_PORT}
 export https_proxy=http://127.0.0.1:${CAIDO_PORT}
@@ -114,13 +171,18 @@ echo ". /etc/profile.d/proxy.sh" >> ~/.bashrc
 echo ". /etc/profile.d/proxy.sh" >> ~/.zshrc
 
 . /etc/profile.d/proxy.sh
+else
+export HTTP_PROXY="${http_proxy:-http://127.0.0.1:${CAIDO_PORT}}"
+export HTTPS_PROXY="${https_proxy:-http://127.0.0.1:${CAIDO_PORT}}"
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}"
+fi
 
 echo "✅ System-wide proxy configuration complete"
 
 echo "Adding CA to browser trust store..."
-sudo -u pentester mkdir -p /home/pentester/.pki/nssdb
-sudo -u pentester certutil -N -d sql:/home/pentester/.pki/nssdb --empty-password
-sudo -u pentester certutil -A -n "Testing Root CA" -t "C,," -i /app/certs/ca.crt -d sql:/home/pentester/.pki/nssdb
+mkdir -p /home/pentester/.pki/nssdb
+certutil -N -d sql:/home/pentester/.pki/nssdb --empty-password
+certutil -A -n "Testing Root CA" -t "C,," -i /app/certs/ca.crt -d sql:/home/pentester/.pki/nssdb
 echo "✅ CA added to browser trust store"
 
 mkdir -p /workspace/.agent-browser-screenshots

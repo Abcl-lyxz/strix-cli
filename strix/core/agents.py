@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -31,7 +32,8 @@ ACTIVE_STATUSES: frozenset[str] = frozenset({"running", "waiting", "budget_pause
 # Why an agent parked. The user can message any agent, so this - not the agent's
 # position in the tree - decides whether waiting is bounded: only an agent waiting
 # on other agents is re-checked on a timer.
-WaitKind = Literal["user", "agents", "provider", "stalled"]
+WaitKind = Literal["user", "agents", "provider", "blocked", "stalled"]
+OperationState = Literal["queued", "running", "retrying", "compacting"]
 
 
 @dataclass(slots=True)
@@ -221,7 +223,27 @@ class AgentCoordinator:
                 self.wait_kinds.pop(agent_id, None)
                 self.runtimes.setdefault(agent_id, AgentRuntime()).user_wake_required = False
                 self._parent_notified.discard(agent_id)
+                self.metadata.setdefault(agent_id, {})["operation"] = "running"
         await self._maybe_snapshot()
+
+    async def set_operation(self, agent_id: str, operation: OperationState) -> None:
+        """Publish non-terminal work state without changing lifecycle semantics."""
+        async with self._lock:
+            if agent_id not in self.statuses:
+                return
+            self.metadata.setdefault(agent_id, {})["operation"] = operation
+            self.metadata[agent_id]["last_progress_at"] = time.time()
+        await self._maybe_snapshot()
+
+    async def record_compaction(self, agent_id: str) -> int:
+        """Increment the durable per-agent compaction counter."""
+        async with self._lock:
+            metadata = self.metadata.setdefault(agent_id, {})
+            count = int(metadata.get("compaction_count", 0)) + 1
+            metadata["compaction_count"] = count
+            metadata["last_progress_at"] = time.time()
+        await self._maybe_snapshot()
+        return count
 
     async def park_waiting(self, agent_id: str, *, wait_kind: WaitKind) -> None:
         """Park an agent, recording what it is waiting on so the driver can time it."""
@@ -285,6 +307,7 @@ class AgentCoordinator:
             if status == "running":
                 # Running again means a fresh stint that owes its parent its own notice.
                 self._parent_notified.discard(agent_id)
+                self.metadata.setdefault(agent_id, {})["operation"] = "running"
             runtime = self.runtimes.setdefault(agent_id, AgentRuntime())
             runtime.user_wake_required = status in {"failed", "crashed"}
             runtime.wake.set()

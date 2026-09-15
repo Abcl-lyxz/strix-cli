@@ -101,10 +101,12 @@ def _pool(
     models: dict[str, FakeModel],
     *,
     wait_timeout: float | None = None,
+    stream_idle_timeout: float = 300.0,
 ) -> RoutePool:
     return RoutePool(
         routes,
         wait_timeout=wait_timeout,
+        stream_idle_timeout=stream_idle_timeout,
         model_factory=lambda route, _key, _headers: models[route.name],
     )
 
@@ -321,6 +323,35 @@ async def test_partially_streamed_turn_is_never_replayed_to_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_idle_stream_is_recovered_before_any_side_effect_is_emitted() -> None:
+    event = SimpleNamespace(response=None)
+
+    class IdleModel(FakeModel):
+        async def stream_response(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            await asyncio.sleep(0.2)
+            yield event
+
+    primary = IdleModel()
+    backup = FakeModel([[event]])
+    routes = [
+        RouteConfig(name="primary", model="model-a", priority=1),
+        RouteConfig(name="backup", model="model-b", priority=2),
+    ]
+    pool = _pool(
+        routes,
+        {"primary": primary, "backup": backup},
+        stream_idle_timeout=0.01,
+    )
+
+    seen = [item async for item in pool.stream_response(input="hello")]
+
+    assert seen == [event]
+    assert primary.calls == backup.calls == 1
+    assert pool.states["primary"].failed_turns == 1
+
+
+@pytest.mark.asyncio
 async def test_twelve_agents_respect_per_route_concurrency() -> None:
     active: dict[str, int] = defaultdict(int)
     maximum: dict[str, int] = defaultdict(int)
@@ -382,3 +413,61 @@ async def test_route_known_not_to_support_tools_is_skipped(
     assert response._strix_route_name == "tools"
     assert text_only.calls == 0
     assert pool.states["text"].disabled_for_run is True
+
+
+@pytest.mark.asyncio
+async def test_half_open_circuit_allows_exactly_one_probe() -> None:
+    active: dict[str, int] = defaultdict(int)
+    maximum: dict[str, int] = defaultdict(int)
+    model = FakeModel(delay=0.04, active=active, maximum=maximum, name="only")
+    pool = _pool(
+        [RouteConfig(name="only", model="model-a", max_concurrency=4)],
+        {"only": model},
+        wait_timeout=0.5,
+    )
+    state = pool.states["only"]
+    state.consecutive_failures = 1
+    state.effective_concurrency = 1
+
+    calls = [asyncio.create_task(pool.get_response(input=str(index))) for index in range(3)]
+    await asyncio.sleep(0.01)
+
+    assert state.circuit_state(time.monotonic()) == "half_open"
+    assert state.probe_in_flight is True
+    assert model.calls == 1
+
+    await asyncio.gather(*calls)
+    assert maximum["only"] <= 2
+    assert state.circuit_state(time.monotonic()) == "closed"
+
+
+@pytest.mark.asyncio
+async def test_context_ceiling_and_attempted_usage_survive_restart(tmp_path: Any) -> None:
+    health_path = tmp_path / ".state" / "routes.json"
+    route = RouteConfig(name="only", model="model-a", context_window_tokens=100_000)
+    pool = RoutePool(
+        [route],
+        wait_timeout=None,
+        health_path=health_path,
+        model_factory=lambda _route, _key, _headers: FakeModel(
+            [ProviderError("maximum context length exceeded", status_code=400)]
+        ),
+    )
+
+    with pytest.raises(ProviderError, match="context"):
+        await pool.get_response(input="x" * 20_000)
+
+    original = pool.states["only"]
+    assert original.learned_context_window is not None
+    assert original.attempted_input_tokens > 0
+    assert original.retry_waste_tokens == original.attempted_input_tokens
+
+    restored = RoutePool(
+        [route],
+        wait_timeout=None,
+        health_path=health_path,
+        model_factory=lambda _route, _key, _headers: FakeModel(),
+    ).states["only"]
+    assert restored.learned_context_window == original.learned_context_window
+    assert restored.attempted_input_tokens == original.attempted_input_tokens
+    assert restored.retry_waste_tokens == original.retry_waste_tokens

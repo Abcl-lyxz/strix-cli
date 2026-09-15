@@ -123,18 +123,35 @@ class _ViewerState:
         # launcher), which can deliver a message to a running agent. Absent for
         # standalone ``strix view`` / finished runs, so steering is unavailable.
         self.steer_handler = steer_handler
-        # Unguessable per-process capability. It is minted here, printed/opened
-        # for the operator who started the server (see ``authorized_url``), and
-        # exchanged for a session cookie only when presented on the initial page
+        # Unguessable per-process capability. A short-lived nonce is opened
+        # directly for the operator and exchanged for this session cookie.
         # load. It is the request-level authorization the review asked for:
         # reachability of the port (e.g. when bound with ``--host``) is not
         # enough to read run data, steer a live scan, trigger a report, or
         # browse history -- the token is never handed to a caller who merely
         # reaches ``/``.
         self.session_token = secrets.token_urlsafe(32)
+        self.bootstrap_nonces: dict[str, float] = {}
+        self.bootstrap_lock = threading.Lock()
         # Finalized in ``serve()`` once the port is known (the server binds
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
         self.cookie_name = SESSION_COOKIE_PREFIX
+
+    def mint_bootstrap(self) -> str:
+        nonce = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        with self.bootstrap_lock:
+            self.bootstrap_nonces = {
+                value: expiry for value, expiry in self.bootstrap_nonces.items() if expiry > now
+            }
+            self.bootstrap_nonces[nonce] = now + 60.0
+        return nonce
+
+    def consume_bootstrap(self, supplied: str) -> bool:
+        now = time.monotonic()
+        with self.bootstrap_lock:
+            expiry = self.bootstrap_nonces.pop(supplied, None)
+        return expiry is not None and expiry > now
 
 
 def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
@@ -347,7 +364,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 run_dir / name
                 for name in ("penetration_test_report.md", "vulnerabilities.json", "findings.sarif")
             ]
-            for folder in ("vulnerabilities", "browser"):
+            for folder in ("vulnerabilities", "browser", "artifacts"):
                 directory = run_dir / folder
                 if directory.is_dir():
                     files.extend(directory.rglob("*"))
@@ -362,9 +379,14 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             previous: dict[str, Any] = {}
-            cursor: int | None = None
+            last_heartbeat = 0.0
+            try:
+                cursor: int | None = int(self.headers.get("Last-Event-ID", ""))
+            except ValueError:
+                cursor = None
             try:
                 while not state.workspace.closed:
                     payload = state.workspace.snapshot(cursor)
@@ -380,11 +402,19 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     if delta:
                         event = "snapshot" if payload.get("reset") else "update"
                         self.wfile.write(
-                            ("data: " + json.dumps({"type": event, **delta}) + "\n\n").encode()
+                            (
+                                f"id: {cursor}\ndata: {json.dumps({'type': event, **delta})}\n\n"
+                            ).encode()
                         )
-                    else:
-                        self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
+                        self.wfile.flush()
+                    elif time.monotonic() - last_heartbeat >= 5.0:
+                        self.wfile.write(
+                            (
+                                f'id: {cursor}\nevent: heartbeat\ndata: {{"cursor":{cursor}}}\n\n'
+                            ).encode()
+                        )
+                        self.wfile.flush()
+                        last_heartbeat = time.monotonic()
                     time.sleep(0.5)
             except (BrokenPipeError, ConnectionResetError, TimeoutError, RuntimeError):
                 return
@@ -415,15 +445,38 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             arbitrary network caller on an exposed port cannot observe.
             """
             supplied = (query.get("token") or [""])[0]
-            return bool(supplied) and secrets.compare_digest(supplied, state.session_token)
+            return bool(supplied) and state.consume_bootstrap(supplied)
 
         def _handle_static(self, path: str, query: dict[str, list[str]]) -> None:
+            if path in {"", "/"} and "token" in query:
+                if not self._token_presented(query):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "error": (
+                                "Viewer link is invalid, expired, or already used. "
+                                "Open it again from Strix."
+                            )
+                        },
+                    )
+                    return
+                # Exchange the one-time nonce and redirect immediately.  The
+                # browser's visible address never retains the capability.
+                self.send_response(HTTPStatus.SEE_OTHER)
+                self.send_header("Location", "/")
+                self.send_header(
+                    "Set-Cookie",
+                    f"{state.cookie_name}={state.session_token}; Path=/; HttpOnly; SameSite=Strict",
+                )
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             target = self._resolve_asset(path)
             if target is None:
                 # SPA fallback: unknown non-asset routes render index.html so
                 # client-side deep links work.
                 target = state.assets_dir / "index.html"
-            is_index = target.name == "index.html"
             if not target.is_file():
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -432,16 +485,6 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type or "application/octet-stream")
             self.send_header("Content-Length", str(len(content)))
-            if is_index and self._token_presented(query):
-                # Exchange the bootstrap token for the per-process session
-                # capability. Issued only when the correct token is presented,
-                # so a caller who merely reaches ``/`` never obtains it.
-                # HttpOnly (JS never needs it; fetch sends it automatically) and
-                # SameSite=Strict (never sent from a cross-site context).
-                self.send_header(
-                    "Set-Cookie",
-                    f"{state.cookie_name}={state.session_token}; Path=/; HttpOnly; SameSite=Strict",
-                )
             self.end_headers()
             self.wfile.write(content)
 
@@ -483,12 +526,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 def authorized_url(base_url: str, token: str) -> str:
     """URL that bootstraps the viewer session for the operator.
 
-    Presenting ``token`` on the initial page load is what mints the session
-    cookie, so this URL is printed / opened only for the operator who started
-    the server. Sharing it (rather than the bare ``base_url``) is what lets a
-    trusted remote user authorize when the viewer is exposed with ``--host``.
+    This URL is handed directly to the browser and never displayed by Strix.
+    The server consumes the nonce once and redirects to the bare URL.
     """
     return f"{base_url}/?{urlencode({'token': token})}"
+
+
+def fresh_authorized_url(httpd: ThreadingHTTPServer, base_url: str) -> str:
+    """Mint a new 60-second, one-use browser bootstrap for a running viewer."""
+    state = getattr(httpd, "_strix_viewer_state", None)
+    if not isinstance(state, _ViewerState):
+        return base_url
+    return authorized_url(base_url, state.mint_bootstrap())
 
 
 def serve(
@@ -502,8 +551,8 @@ def serve(
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
-    ``url`` is the bare base; pass it through ``authorized_url(url, token)`` to
-    build the operator link that authorizes the browser.
+    ``url`` is always the bare base. The returned nonce is for embedders and is
+    never printed by the bundled clients.
 
     Binds an ephemeral port by default. If a fixed ``port`` is requested but in
     use, falls back to an ephemeral port. Reused by both the ``strix view``
@@ -531,14 +580,16 @@ def serve(
     bound_port = int(httpd.server_address[1])
     state.cookie_name = f"{SESSION_COOKIE_PREFIX}_{bound_port}"
     url = f"http://{host}:{bound_port}"
+    cast("Any", httpd)._strix_viewer_state = state
+    bootstrap_nonce = state.mint_bootstrap()
 
     thread = threading.Thread(target=httpd.serve_forever, name="strix-viewer", daemon=True)
     thread.start()
 
     if open_browser:
-        _open_browser(authorized_url(url, state.session_token))
+        _open_browser(authorized_url(url, bootstrap_nonce))
 
-    return httpd, url, state.session_token
+    return httpd, url, bootstrap_nonce
 
 
 def _open_browser(url: str) -> None:
@@ -548,4 +599,10 @@ def _open_browser(url: str) -> None:
         logger.debug("could not open local browser", exc_info=True)
 
 
-__all__ = ["authorized_url", "bundle_dir", "bundle_is_built", "serve"]
+__all__ = [
+    "authorized_url",
+    "bundle_dir",
+    "bundle_is_built",
+    "fresh_authorized_url",
+    "serve",
+]

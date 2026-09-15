@@ -55,6 +55,7 @@ _SECRET_ALIASES = frozenset(
         "PERPLEXITY_API_KEY",
         "EXA_API_KEY",
         "POSTMAN_API_KEY",
+        "NVD_API_KEY",
     }
 )
 _SECRET_CANONICAL = {

@@ -86,6 +86,14 @@ async def preflight_model_connection(
         route_pool = RoutePool(
             matching,
             wait_timeout=min(float(resolved_settings.llm.timeout), 45.0),
+            stream_idle_timeout=float(getattr(resolved_settings.llm, "stream_idle_timeout", 300)),
+            max_attempts_per_route=int(
+                getattr(
+                    getattr(resolved_settings, "routing", None),
+                    "max_attempts_per_route",
+                    2,
+                )
+            ),
         )
     model = (
         RoutedModel(route_pool) if route_pool is not None else StrixProvider().get_model(model_name)
@@ -246,6 +254,10 @@ def prepare_run(args: argparse.Namespace) -> None:
     user has supplied a target via ``/target``). Mutates *args* in place and
     raises :class:`ValueError` on any preparation failure.
     """
+    from strix.runtime.profiles import preflight_profile
+
+    args.sandbox_preflight = preflight_profile()
+    logger.info("Sandbox preflight: %s", args.sandbox_preflight)
     args.run_name = args.resume or generate_run_name(args.targets_info)
 
     if args.resume:
@@ -323,6 +335,13 @@ def _persist_run_record(args: argparse.Namespace) -> None:
         "auth_mode": codex.auth_mode(load_settings().llm.model),
         "targets_info": args.targets_info,
         "scan_mode": args.scan_mode,
+        "sandbox_profile": args.sandbox_profile,
+        "tool_pack": args.tool_pack,
+        "scope_cidr": args.scope_cidr,
+        "network_interface": args.network_interface,
+        "packet_rate_limit": args.packet_rate_limit,
+        "workspace_mode": args.workspace_mode,
+        "sandbox_preflight": getattr(args, "sandbox_preflight", None),
         "instruction": args.instruction,
         # Kept apart from instruction, which carries the diff-scope preamble: the
         # transcript replays this as the user's opening message.

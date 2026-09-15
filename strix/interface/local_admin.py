@@ -14,6 +14,8 @@ from rich.console import Console
 from rich.table import Table
 
 from strix.config import codex, config_path, migrate_legacy_config_secrets
+from strix.config.provider_catalog import provider_descriptors, refresh_provider_catalog
+from strix.config.providers import connect_provider, discover_models
 from strix.config.routes import (
     delete_route_key,
     list_saved_routes,
@@ -23,6 +25,8 @@ from strix.config.routes import (
     set_route_enabled,
     set_route_key,
 )
+from strix.intel import refresh_intelligence
+from strix.intel import status as intelligence_status
 from strix.notifications import Notification, get_notification_service, notify
 from strix.routing import RouteConfig, RoutedModel, RoutePool
 from strix.security import get_secret_store
@@ -123,6 +127,88 @@ def run_routes(argv: list[str]) -> int:  # noqa: PLR0911, PLR0912, PLR0915
     )
     save_route(route, replace=args.command == "edit")
     console.print(f"[#22c55e]Route {route.name} saved.[/]")
+    return 0
+
+
+def run_providers(argv: list[str]) -> int:
+    """Discover providers/models without sending an inference request."""
+    parser = argparse.ArgumentParser(prog="strix providers")
+    sub = parser.add_subparsers(dest="command", required=True)
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--json", action="store_true")
+    refresh_parser = sub.add_parser("refresh")
+    refresh_parser.add_argument("--force", action="store_true")
+    for command in ("detect", "models"):
+        detect = sub.add_parser(command)
+        detect.add_argument("provider", nargs="?", default="custom")
+        detect.add_argument("--base-url", default="")
+        detect.add_argument("--profile", default="")
+        detect.add_argument("--refresh", action="store_true")
+    connect = sub.add_parser("connect")
+    connect.add_argument("provider")
+    connect.add_argument("model")
+    connect.add_argument("--name")
+    connect.add_argument("--base-url", default="")
+    connect.add_argument("--no-key", action="store_true")
+    connect.add_argument("--session-only", action="store_true")
+    args = parser.parse_args(argv)
+    console = Console()
+    if args.command == "list":
+        values = provider_descriptors()
+        if args.json:
+            console.print_json(data=values)
+        else:
+            table = Table("Provider", "Adapter", "Transport", "Default endpoint")
+            for item in values:
+                table.add_row(
+                    item["name"],
+                    item["adapter_id"],
+                    item["transport"],
+                    item.get("base_url") or "operator supplied",
+                )
+            console.print(table)
+        return 0
+    if args.command == "refresh":
+        result = refresh_provider_catalog(force=args.force)
+        console.print(f"Provider catalog: {result['source']} ({result['path']})")
+        return 0
+    if args.command in {"detect", "models"}:
+        result = discover_models(
+            args.provider,
+            base_url=args.base_url,
+            profile=args.profile,
+            refresh=args.refresh,
+        )
+        console.print_json(data=result)
+        return 0 if result.get("models") else 1
+    api_key = "" if args.no_key else getpass.getpass(f"API key for {args.provider}: ")
+    result = connect_provider(
+        {
+            "provider_id": args.provider,
+            "model_id": args.model,
+            "name": args.name or args.provider,
+            "base_url": args.base_url,
+            "api_key": api_key,
+            "persist": not args.session_only,
+        }
+    )
+    console.print(f"Connected model route [#22c55e]{result['name']}[/].")
+    return 0
+
+
+def run_intel(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="strix intel")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    update = sub.add_parser("update")
+    update.add_argument("--force", action="store_true")
+    args = parser.parse_args(argv)
+    value = (
+        intelligence_status()
+        if args.command == "status"
+        else refresh_intelligence(force=args.force)
+    )
+    Console().print_json(data=value)
     return 0
 
 
@@ -306,4 +392,4 @@ def _print_notification(console: Console, item: Notification) -> None:
     console.print(json.dumps(item.to_dict(), indent=2))
 
 
-__all__ = ["run_notifications", "run_routes", "run_secrets"]
+__all__ = ["run_intel", "run_notifications", "run_providers", "run_routes", "run_secrets"]
