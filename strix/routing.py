@@ -269,6 +269,31 @@ class RoutePool:
     def route_models(self) -> tuple[str, ...]:
         return tuple(state.config.model for state in self.states.values() if state.config.enabled)
 
+    def _unavailable_error(self, fallback: str) -> AllRoutesUnavailableError:
+        """Turn durable route health into a useful operator-facing failure."""
+        for state in sorted(self.states.values(), key=lambda item: item.config.priority):
+            last_error = state.last_error or {}
+            category = last_error.get("category")
+            route = state.config.name
+            model = state.config.model
+            if category == "provider_incompatible":
+                return AllRoutesUnavailableError(
+                    f"Configured model '{model}' is unavailable on route '{route}'. "
+                    "Select a model exposed by the provider (/models in the TUI, or "
+                    "`strix providers detect` in the CLI)."
+                )
+            if category == "provider_authentication":
+                return AllRoutesUnavailableError(
+                    f"Route '{route}' needs valid provider credentials. "
+                    "Update the connection and test it again."
+                )
+            if category == "provider_billing":
+                return AllRoutesUnavailableError(
+                    f"Route '{route}' has no available provider credit. "
+                    "Add credit or select another route."
+                )
+        return AllRoutesUnavailableError(fallback)
+
     def context_model(self) -> str:
         candidates = [state for state in self.states.values() if state.config.enabled]
         return min(candidates, key=lambda state: state.context_capacity()).config.model
@@ -456,7 +481,7 @@ class RoutePool:
                         "context window capacity is too small on every healthy model route"
                     )
                 if not capacity_viable:
-                    raise AllRoutesUnavailableError("all model routes are disabled or blocked")
+                    raise self._unavailable_error("all model routes are disabled or blocked")
                 # Interactive calls yield to the execution loop when capacity is
                 # cooling down, rate-limited, or administratively blocked. That
                 # lets the agent become visibly parked and wake through
@@ -754,8 +779,8 @@ class RoutePool:
         max_attempts = max(1, len(self.states) * self.max_attempts_per_route)
         while True:
             if attempts >= max_attempts:
-                raise AllRoutesUnavailableError(
-                    f"model route retry budget exhausted after {attempts} attempts"
+                raise self._unavailable_error(
+                    f"model route connection attempts exhausted after {attempts} attempts"
                 )
             if attempted and not any(
                 state.config.enabled
@@ -764,7 +789,7 @@ class RoutePool:
                 for state in self.states.values()
             ):
                 if self.wait_timeout is None:
-                    raise AllRoutesUnavailableError("all model routes are temporarily unavailable")
+                    raise self._unavailable_error("all model routes are temporarily unavailable")
                 attempted.clear()
             state = await self._acquire(
                 input_tokens=input_tokens,
@@ -811,8 +836,8 @@ class RoutePool:
         max_attempts = max(1, len(self.states) * self.max_attempts_per_route)
         while True:
             if attempts >= max_attempts:
-                raise AllRoutesUnavailableError(
-                    f"model route retry budget exhausted after {attempts} attempts"
+                raise self._unavailable_error(
+                    f"model route connection attempts exhausted after {attempts} attempts"
                 )
             if attempted and not any(
                 state.config.enabled
@@ -821,7 +846,7 @@ class RoutePool:
                 for state in self.states.values()
             ):
                 if self.wait_timeout is None:
-                    raise AllRoutesUnavailableError("all model routes are temporarily unavailable")
+                    raise self._unavailable_error("all model routes are temporarily unavailable")
                 attempted.clear()
             state = await self._acquire(
                 input_tokens=input_tokens,

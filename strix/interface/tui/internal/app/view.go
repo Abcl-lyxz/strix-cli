@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/usestrix/strix/tui/internal/protocol"
 	"github.com/usestrix/strix/tui/internal/render"
 )
@@ -233,7 +234,7 @@ func fixedPanelBody(content string, width, height int) string {
 		padding := strings.Repeat(" ", max(0, width-ansi.StringWidth(line)))
 		// End every source style before padding; otherwise inline-code and tool
 		// backgrounds can paint the empty space through to the panel border.
-		body[row] = line + "\x1b[0m" + blackBG + padding
+		body[row] = line + frameReset() + padding
 	}
 	return strings.Join(body, "\n")
 }
@@ -353,12 +354,31 @@ func (m Model) toastOverlay(view string) string {
 }
 
 // Base frame colors are reapplied after full SGR resets so the TUI does not
-// inherit an unreadable foreground from the user's terminal profile.
-const (
-	blackBG         = "\x1b[48;2;0;0;0m"
-	textFG          = "\x1b[38;2;212;212;212m"
-	baseFrameColors = blackBG + textFG
-)
+// inherit an unreadable foreground from the user's terminal profile. Generate
+// them through Lip Gloss's detected profile: terminals with no color support
+// must receive plain text, and 16/256-color terminals must not receive raw
+// 24-bit sequences they may print literally.
+func baseFrameColors() string {
+	profile := lipgloss.ColorProfile()
+	if profile == termenv.Ascii {
+		return ""
+	}
+	background := profile.Color("#000000")
+	foreground := profile.Color("#d4d4d4")
+	if background == nil || foreground == nil {
+		return ""
+	}
+	return "\x1b[" + background.Sequence(true) + "m" +
+		"\x1b[" + foreground.Sequence(false) + "m"
+}
+
+func frameReset() string {
+	colors := baseFrameColors()
+	if colors == "" {
+		return ""
+	}
+	return "\x1b[0m" + colors
+}
 
 // fillBackground paints the whole frame black like Textual's Screen background.
 // Bubble Tea has no screen compositor, so any cell the view does not explicitly
@@ -373,7 +393,11 @@ func fillBackground(view string) string {
 	if view == "" {
 		return view
 	}
-	return baseFrameColors + strings.ReplaceAll(view, "\x1b[0m", "\x1b[0m"+baseFrameColors)
+	colors := baseFrameColors()
+	if colors == "" {
+		return view
+	}
+	return colors + strings.ReplaceAll(view, "\x1b[0m", "\x1b[0m"+colors)
 }
 
 func (m Model) splashView() string {

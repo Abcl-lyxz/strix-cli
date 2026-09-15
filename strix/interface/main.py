@@ -513,7 +513,14 @@ def main() -> None:
     # Help, version, and updates must exit without background scan imports.
     start_import_warmup()
     check_docker_installed()
-    pull_docker_image()
+    try:
+        pull_docker_image()
+    except RuntimeError as exc:
+        # check_docker_connection already rendered the actionable panel. Do not
+        # follow it with an implementation traceback on ordinary startup.
+        if str(exc) == "Docker not available":
+            raise SystemExit(1) from None
+        raise
 
     if args.non_interactive:
         # Headless runs still fail fast with the traditional environment/config

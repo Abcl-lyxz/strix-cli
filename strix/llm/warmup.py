@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 
 
@@ -46,6 +47,11 @@ def start_import_warmup(modules: tuple[str, ...] = WARMUP_MODULES) -> threading.
     runtime that has no local Docker) warm a narrower set.
     """
     global _thread  # noqa: PLW0603
+    # LiteLLM otherwise fetches its pricing map during import, including
+    # retries and warning output before the full-screen TUI owns the terminal.
+    # Strix ships and explicitly refreshes its own provider catalog, so startup
+    # must stay offline and deterministic.
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     if _thread is None:
         _thread = threading.Thread(
             target=_warm, args=(modules,), name="strix-import-warmup", daemon=True

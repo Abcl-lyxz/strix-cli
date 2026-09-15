@@ -91,3 +91,36 @@ def test_startup_update_exits_before_starting_scan_import_threads(
     with pytest.raises(SystemExit) as result:
         interface_main.main()
     assert result.value.code == 0
+
+
+def test_docker_unavailable_exits_without_an_unhandled_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_started = False
+
+    async def run_tui(_args: argparse.Namespace) -> None:
+        nonlocal runtime_started
+        runtime_started = True
+
+    monkeypatch.setattr(interface_main.sys, "argv", ["strix"])
+    monkeypatch.setattr(
+        interface_main,
+        "parse_arguments",
+        lambda: argparse.Namespace(non_interactive=False),
+    )
+    monkeypatch.setattr(interface_main, "start_background_check", lambda: None)
+    monkeypatch.setattr(interface_main, "prompt_update_if_available", lambda _console: False)
+    monkeypatch.setattr(interface_main, "start_import_warmup", lambda: None)
+    monkeypatch.setattr(interface_main, "check_docker_installed", lambda: None)
+    monkeypatch.setattr(
+        interface_main,
+        "pull_docker_image",
+        lambda: (_ for _ in ()).throw(RuntimeError("Docker not available")),
+    )
+    monkeypatch.setattr(interface_main, "run_tui", run_tui)
+
+    with pytest.raises(SystemExit) as result:
+        interface_main.main()
+
+    assert result.value.code == 1
+    assert runtime_started is False

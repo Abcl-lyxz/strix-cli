@@ -47,6 +47,20 @@ def test_strix_report_does_not_import_the_agents_graph() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_interface_import_disables_litellm_remote_cost_fetch_before_main() -> None:
+    result = _run(
+        """
+        import os
+
+        os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+        import strix.interface  # noqa: F401
+
+        assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_check_duplicate_resolves_lazily() -> None:
     result = _run(
         """
@@ -98,6 +112,23 @@ def test_wait_for_import_warmup_blocks_until_the_thread_finishes(
     release.set()
     waiter.join(5)
     assert not waiter.is_alive()
+
+
+def test_import_warmup_disables_litellm_remote_cost_fetch_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str | None] = []
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.setattr(warmup, "_thread", None)
+    monkeypatch.setattr(
+        warmup,
+        "_warm",
+        lambda _modules: observed.append(warmup.os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")),
+    )
+
+    warmup.start_import_warmup(()).join(5)
+
+    assert observed == ["True"]
 
 
 def test_failed_warm_import_does_not_raise() -> None:

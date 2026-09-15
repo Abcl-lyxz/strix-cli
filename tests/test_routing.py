@@ -122,6 +122,10 @@ def _pool(
         (ProviderError("payment", status_code=402), "authentication"),
         (ProviderError("maximum context length exceeded", status_code=400), "context"),
         (ProviderError("unsupported tool schema", status_code=400), "incompatible"),
+        (
+            ProviderError("model_not_found: no available channel for model", status_code=503),
+            "incompatible",
+        ),
         (ProviderError("content policy refusal", status_code=400), "policy"),
         (ProviderError("bad input", status_code=400), "fatal"),
     ],
@@ -227,6 +231,23 @@ async def test_authentication_failure_blocks_only_affected_route() -> None:
 
     assert pool.states["primary"].blocked_reason is not None
     assert pool.states["backup"].successful_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_removed_model_is_not_retried_and_has_selection_guidance() -> None:
+    model = FakeModel(
+        [ProviderError("model_not_found: no available channel for model", status_code=503)]
+    )
+    pool = _pool(
+        [RouteConfig(name="primary", model="openai/removed-model")],
+        {"primary": model},
+    )
+
+    with pytest.raises(AllRoutesUnavailableError, match=r"/models"):
+        await pool.get_response(input="hello")
+
+    assert model.calls == 1
+    assert pool.states["primary"].disabled_for_run is True
 
 
 @pytest.mark.asyncio

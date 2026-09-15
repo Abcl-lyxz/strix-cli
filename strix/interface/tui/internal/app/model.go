@@ -303,13 +303,32 @@ func (m *Model) syncInputHeight() {
 // wrapped height the textarea does report covers just the line the cursor is
 // on, so a scratch copy measures each line with the composer's own wrapping.
 func composerHeight(input textarea.Model) int {
-	probe, rows := input, 0
+	rows := 0
+	var probe *textarea.Model
 	for _, line := range strings.Split(input.Value(), "\n") {
 		// A line narrower than the text column cannot wrap, which is the case
 		// for nearly every keystroke; only measure the ones that might.
 		if ansi.StringWidth(line) < input.Width() {
 			rows++
 		} else {
+			if probe == nil {
+				// textarea.Model owns its scrolling viewport through a pointer.
+				// Copying the model and calling SetValue on the copy therefore
+				// resets the live composer's viewport to the top. On a long paste,
+				// the next cursor event scrolls it back down, producing the visible
+				// top/bottom jump. Measure with a completely independent textarea.
+				measurement := textarea.New()
+				measurement.ShowLineNumbers = false
+				measurement.MaxHeight = 0
+				measurement.SetPromptFunc(2, func(lineIdx int) string {
+					if lineIdx == 0 {
+						return "> "
+					}
+					return "  "
+				})
+				measurement.SetWidth(input.Width() + 2)
+				probe = &measurement
+			}
 			probe.SetValue(line)
 			rows += probe.LineInfo().Height
 		}

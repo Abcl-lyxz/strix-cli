@@ -202,13 +202,20 @@ class ApplicationController:
         self._on_change = callback
 
     def record_output(self, text: str) -> None:
+        """Persist incidental stdout/stderr without painting it into the TUI.
+
+        Python tracebacks and dependency diagnostics are useful in the local
+        event log, but each physical line used to become a setup notification.
+        That made expected provider failures look like Python source code and
+        repeatedly reflowed the full-screen interface. User-facing failures
+        already travel through typed controller messages and state errors.
+        """
         try:
             self.notification_service.record_output(
                 text, run_id=getattr(self.args, "run_name", None)
             )
         except Exception:  # noqa: BLE001 - a diagnostic failure must not recurse through stderr
             self.add_message("Cannot save local output diagnostics", "error")
-        self.add_message(text)
 
     def notify_changed(self) -> None:
         if self._on_change is not None:

@@ -68,6 +68,19 @@ def classify_model_failure(error: BaseException) -> FailureKind:  # noqa: PLR091
         )
     ):
         return "context"
+    # Some OpenAI-compatible gateways return a 5xx wrapper when a requested
+    # model ID has no backing channel. The response body is still definitive:
+    # retrying the same removed model cannot recover.
+    if any(
+        marker in text
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "no available channel for model",
+            "is unavailable on route",
+        )
+    ):
+        return "incompatible"
     if status in {400, 404, 422} and any(
         marker in text
         for marker in (
@@ -76,7 +89,6 @@ def classify_model_failure(error: BaseException) -> FailureKind:  # noqa: PLR091
             "unsupported tool",
             "does not support tools",
             "function calling is not supported",
-            "model not found",
             "unsupported parameter",
         )
     ):

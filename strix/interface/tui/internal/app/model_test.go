@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/usestrix/strix/tui/internal/protocol"
 )
 
@@ -937,9 +938,12 @@ func TestVerticalScrollbarOccupiesOneColumn(t *testing.T) {
 }
 
 func TestPanelPaddingResetsLeakingLineBackground(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
 	leaky := "\x1b[48;2;82;82;82mstyled"
 	body := fixedPanelBody(leaky, 12, 1)
-	want := "styled\x1b[0m" + blackBG
+	want := "styled" + frameReset()
 	if !strings.Contains(body, want) {
 		t.Fatalf("panel padding did not reset the source background: %q", body)
 	}
@@ -949,16 +953,33 @@ func TestPanelPaddingResetsLeakingLineBackground(t *testing.T) {
 }
 
 func TestFillBackgroundRestoresBaseForegroundAfterReset(t *testing.T) {
-	const textFG = "\x1b[38;2;212;212;212m"
+	previous := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
 	view := "\x1b[38;2;167;139;250m◈ \x1b[0m\x1b[2mspawning\x1b[0m"
 	filled := fillBackground(view)
-	baseStyle := blackBG + textFG
+	baseStyle := baseFrameColors()
 
 	if !strings.HasPrefix(filled, baseStyle) {
 		t.Fatalf("frame does not set its base colors: %q", filled)
 	}
 	if got, want := strings.Count(filled, "\x1b[0m"+baseStyle), 2; got != want {
 		t.Fatalf("base colors restored after %d resets, want %d: %q", got, want, filled)
+	}
+}
+
+func TestFrameEmitsNoColorEscapesForPlainTerminal(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	lipgloss.SetColorProfile(termenv.Ascii)
+
+	view := fillBackground("plain text")
+	if strings.Contains(view, "\x1b") {
+		t.Fatalf("plain terminal received an ANSI escape: %q", view)
+	}
+	body := fixedPanelBody("plain text", 16, 1)
+	if strings.Contains(body, "\x1b") {
+		t.Fatalf("plain panel padding received an ANSI escape: %q", body)
 	}
 }
 

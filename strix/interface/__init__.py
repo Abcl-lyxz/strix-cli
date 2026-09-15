@@ -9,6 +9,7 @@ third-party imports until the handoff status reaches a terminal state.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -67,6 +68,13 @@ def _wait_for_package_update(
 
 
 _wait_for_package_update()
+
+# This must be set before importing ``interface.main``: its dependency graph
+# can reach LiteLLM before the background warm-up starts. Without the local
+# default, LiteLLM performs a network fetch and prints colored retry warnings
+# before the TUI has taken ownership of the terminal. An explicit operator
+# setting still wins.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 from .main import main  # noqa: E402
 

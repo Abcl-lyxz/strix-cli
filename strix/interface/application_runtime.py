@@ -9,6 +9,7 @@ import json
 import logging
 import shutil
 import sys
+import time
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +41,7 @@ from strix.interface.tui.sidecar import (
     wait_process,
 )
 from strix.interface.utils import read_workspace_files
+from strix.llm.errors import classify_model_failure
 from strix.report.state import ReportState, set_global_report_state
 from strix.routing import resolve_route_secrets
 from strix.telemetry import report_error, set_scan_phase
@@ -54,6 +56,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _COMPILE_NOTICE = "Compiling the TUI from source (cached after the first run)..."
+_TRANSIENT_PREFLIGHT_RETRY_DELAY = 10.0
 
 
 def _print_compile_notice(stream: Any) -> None:
@@ -87,6 +90,9 @@ class WorkspaceRuntime:
         self.model_verified = False
         self.verified_connection: tuple[str, str, str] | None = None
         self._setup_preflight: asyncio.Task[None] | None = None
+        self._preflight_failure: str | None = None
+        self._preflight_failure_connection: tuple[str, str, str] | None = None
+        self._preflight_retry_at = 0.0
         self.controller = TuiController(
             args,
             live_view=self.live_view,
@@ -116,6 +122,9 @@ class WorkspaceRuntime:
         self.scan_error = None
         self.model_verified = False
         self.verified_connection = None
+        self._preflight_failure = None
+        self._preflight_failure_connection = None
+        self._preflight_retry_at = 0.0
         self.coordinator = AgentCoordinator(max_active_agents=self.controller.max_agents)
         self.live_view = TuiLiveView()
         self.controller.coordinator = self.coordinator
@@ -225,9 +234,12 @@ class WorkspaceRuntime:
             return
         try:
             await self._preflight_model()
-        except Exception as exc:
-            logger.exception("Go TUI setup model preflight failed")
-            self.controller.add_message(f"Model connection failed: {exc}", "error")
+        except Exception as exc:  # noqa: BLE001 - provider SDKs raise heterogeneous errors
+            self._remember_preflight_failure(exc)
+            logger.warning("Go TUI setup model preflight failed: %s", exc)
+            self.controller.add_message(
+                f"Model connection failed: {self._preflight_failure}", "error"
+            )
             return
         self.controller.add_message("Model connection verified")
 
@@ -239,12 +251,19 @@ class WorkspaceRuntime:
         current_connection = self._connection_signature()
         if self.model_verified and self.verified_connection == current_connection:
             return
+        if (
+            self._preflight_failure
+            and self._preflight_failure_connection == current_connection
+            and time.monotonic() < self._preflight_retry_at
+        ):
+            raise RuntimeError(self._preflight_failure)
         try:
             await self._preflight_model()
         except Exception as exc:
-            logger.exception("Go TUI setup model preflight failed")
+            self._remember_preflight_failure(exc)
+            logger.warning("Go TUI setup model preflight failed: %s", exc)
             report_error("model_connection_failed", exc)
-            raise RuntimeError(f"Model connection failed: {exc}") from exc
+            raise RuntimeError(f"Model connection failed: {self._preflight_failure}") from exc
 
     async def _preflight_model(self) -> None:
         model = self._configured_model()
@@ -258,6 +277,22 @@ class WorkspaceRuntime:
         )
         self.model_verified = True
         self.verified_connection = self._connection_signature()
+        self._preflight_failure = None
+        self._preflight_failure_connection = None
+        self._preflight_retry_at = 0.0
+
+    def _remember_preflight_failure(self, exc: BaseException) -> None:
+        """Cache permanent setup failures and briefly debounce transient ones."""
+        self.model_verified = False
+        self.verified_connection = None
+        self._preflight_failure = str(exc) or type(exc).__name__
+        self._preflight_failure_connection = self._connection_signature()
+        kind = classify_model_failure(exc)
+        self._preflight_retry_at = (
+            float("inf")
+            if kind in {"authentication", "billing", "incompatible", "policy"}
+            else time.monotonic() + _TRANSIENT_PREFLIGHT_RETRY_DELAY
+        )
 
     def _connection_signature(self) -> tuple[str, str, str]:
         routes = load_routes(

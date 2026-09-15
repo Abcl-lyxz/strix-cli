@@ -715,6 +715,21 @@ def test_messages_are_sanitized_and_agents_are_collection_only() -> None:
     assert len(controller.collection("agents")) == 40
 
 
+def test_incidental_python_output_is_diagnostic_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = TuiController(args())
+    recorded: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        controller.notification_service,
+        "record_output",
+        lambda text, *, run_id=None: recorded.append((text, run_id)),
+    )
+
+    controller.record_output('  File "hooks.py", line 154, in on_llm_start')
+
+    assert recorded == [('  File "hooks.py", line 154, in on_llm_start', None)]
+    assert controller.messages == []
+
+
 @pytest.mark.asyncio
 async def test_existing_viewer_is_reopened_and_closed(
     monkeypatch: pytest.MonkeyPatch,

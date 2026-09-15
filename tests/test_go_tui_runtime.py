@@ -476,7 +476,31 @@ async def test_ensure_model_verified_reuses_the_startup_check(
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_verified_retries_after_a_failed_startup_check(
+async def test_ensure_model_verified_debounces_a_failed_startup_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(args())
+    calls: list[str] = []
+
+    async def preflight(_model: str, **_options: Any) -> None:
+        calls.append("preflight")
+        raise TimeoutError("connection timed out")
+
+    _setup_model(monkeypatch)
+    monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
+
+    await runtime.check_setup_model()
+    assert runtime.model_verified is False
+
+    with pytest.raises(RuntimeError, match="connection timed out"):
+        await runtime.ensure_model_verified()
+
+    assert calls == ["preflight"]
+    assert runtime.model_verified is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_model_verified_retries_after_transient_debounce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = GoTuiRuntime(args())
@@ -493,8 +517,7 @@ async def test_ensure_model_verified_retries_after_a_failed_startup_check(
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
 
     await runtime.check_setup_model()
-    assert runtime.model_verified is False
-
+    runtime._preflight_retry_at = 0.0
     await runtime.ensure_model_verified()
 
     assert calls == ["preflight", "preflight"]

@@ -89,6 +89,37 @@ func TestInputGrowsWithSoftWrappedLine(t *testing.T) {
 	}
 }
 
+func TestComposerMeasurementDoesNotResetLongInputScroll(t *testing.T) {
+	input := newChatInput()
+	input.Focus()
+	input.SetWidth(30)
+	input.SetHeight(3)
+	value := strings.Join([]string{
+		"first line is deliberately wide",
+		"second line is deliberately wide",
+		"third line is deliberately wide",
+		"fourth line is deliberately wide",
+		"last line remains visible at cursor",
+	}, "\n")
+	updated, _ := input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(value), Paste: true})
+	input = updated
+	// Bubbles computes the scroll range from the rendered content. Render once,
+	// then let a normal non-key event place the viewport at the cursor.
+	_ = input.View()
+	updated, _ = input.Update(struct{}{})
+	input = updated
+	before := ansi.Strip(input.View())
+	if !strings.Contains(before, "last line") {
+		t.Fatalf("test setup did not scroll to the cursor: %q", before)
+	}
+
+	_ = composerHeight(input)
+	after := ansi.Strip(input.View())
+	if after != before {
+		t.Fatalf("measuring composer height moved its viewport:\n before %q\n  after %q", before, after)
+	}
+}
+
 // The composer never takes more than a third of a short terminal.
 func TestInputHeightCappedOnShortTerminal(t *testing.T) {
 	model := inputModel(t)
