@@ -11,6 +11,7 @@ import pytest
 from packaging.utils import parse_wheel_filename
 from rich.console import Console
 
+from strix import interface
 from strix.interface import update_check, update_worker
 
 
@@ -592,13 +593,22 @@ def test_windows_handoff_retains_verified_wheel_until_process_exit(
     assert update_check.run_package_upgrade(Console(file=io.StringIO()), "uv", version="1.8.1")
     assert wheel.exists() and len(spawned) == 1
     payload = json.loads((directory / "install.json").read_text())
-    assert payload["command"] == ["uv", "tool", "install", "--force", str(wheel)]
+    assert payload["command"] == [
+        "uv",
+        "tool",
+        "install",
+        "--upgrade-package",
+        "strix-agent",
+        "--reinstall-package",
+        "strix-agent",
+        str(wheel),
+    ]
     assert payload["sha256"] == hashlib.sha256(b"wheel").hexdigest()
     assert "import strix" not in (directory / "install.py").read_text()
     assert update_check._package_install_pending(Console(file=io.StringIO()))
 
 
-@pytest.mark.parametrize("failure", [None, "checksum", "installer", "parent"])
+@pytest.mark.parametrize("failure", [None, "checksum", "installer", "parent", "smoke"])
 def test_windows_worker_waits_verifies_and_records_honest_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
@@ -608,7 +618,8 @@ def test_windows_worker_waits_verifies_and_records_honest_outcome(
     wheel.write_bytes(b"tampered" if failure == "checksum" else b"wheel")
     payload = directory / "install.json"
     status = tmp_path / "status.json"
-    calls = []
+    calls: list[str] = []
+    statuses: list[str] = []
     payload.write_text(
         json.dumps(
             {
@@ -633,8 +644,21 @@ def test_windows_worker_waits_verifies_and_records_honest_outcome(
         calls.append("install")
         return SimpleNamespace(returncode=2 if failure == "installer" else 0)
 
+    def smoke(_data: dict[str, object]) -> None:
+        calls.append("smoke")
+        if failure == "smoke":
+            raise RuntimeError("import failed")
+
+    original_write_status = update_worker.write_status
+
+    def write_status(path: Path, state: dict[str, object]) -> None:
+        statuses.append(str(state["status"]))
+        original_write_status(path, state)
+
     monkeypatch.setattr(update_worker, "wait_for_parent", wait)
     monkeypatch.setattr(update_worker.subprocess, "run", run)
+    monkeypatch.setattr(update_worker, "smoke_test", smoke)
+    monkeypatch.setattr(update_worker, "write_status", write_status)
     assert update_worker.install(payload) == (1 if failure else 0)
     state = json.loads(status.read_text())
     assert state["status"] == ("failed" if failure else "complete")
@@ -642,3 +666,81 @@ def test_windows_worker_waits_verifies_and_records_honest_outcome(
     assert not directory.exists()
     if failure in {"checksum", "parent"}:
         assert calls == ["wait"]
+    elif failure == "installer":
+        assert calls == ["wait", "install"]
+    else:
+        assert calls == ["wait", "install", "smoke"]
+    if failure in {"checksum", "parent"}:
+        assert statuses == ["failed"]
+    elif failure == "installer":
+        assert statuses == ["installing", "failed"]
+    elif failure == "smoke":
+        assert statuses == ["installing", "verifying", "failed"]
+    else:
+        assert statuses == ["installing", "verifying", "complete"]
+
+
+def test_startup_gate_waits_for_active_update(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status = tmp_path / "update-install.json"
+    status.write_text(json.dumps({"status": "installing", "started_at": time.time()}))
+    sleeps: list[float] = []
+
+    def finish_update(delay: float) -> None:
+        sleeps.append(delay)
+        status.write_text(json.dumps({"status": "complete", "version": "1.9.1"}))
+
+    interface._wait_for_package_update(status, poll_interval=0.01, sleep=finish_update)
+
+    assert sleeps == [0.01]
+    assert "waiting for it to finish" in capsys.readouterr().out
+
+
+def test_startup_gate_ignores_stale_update(tmp_path: Path) -> None:
+    status = tmp_path / "update-install.json"
+    status.write_text(json.dumps({"status": "installing", "started_at": time.time() - 1_201}))
+
+    interface._wait_for_package_update(
+        status,
+        sleep=lambda _delay: pytest.fail("stale updater status must not block startup"),
+    )
+
+
+def test_startup_gate_never_imports_during_active_update(tmp_path: Path) -> None:
+    status = tmp_path / "update-install.json"
+    status.write_text(json.dumps({"status": "verifying", "started_at": time.time()}))
+
+    with pytest.raises(SystemExit, match="1"):
+        interface._wait_for_package_update(status, timeout=0)
+
+
+def test_worker_smoke_tests_the_installed_uv_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools = tmp_path / "tools"
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        if command == ["uv", "tool", "dir"]:
+            return SimpleNamespace(returncode=0, stdout=str(tools), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(update_worker.subprocess, "run", run)
+    update_worker.smoke_test(
+        {"method": "uv", "command": ["uv", "tool", "install"], "version": "1.9.1"}
+    )
+
+    python_name = "python.exe" if platform.system() == "Windows" else "python"
+    assert calls[1][:2] == [
+        str(
+            tools
+            / "strix-agent"
+            / ("Scripts" if platform.system() == "Windows" else "bin")
+            / python_name
+        ),
+        "-I",
+    ]
+    assert "rich._extension" in calls[1][-1]
+    assert "1.9.1" in calls[1][-1]

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 def wait_for_parent(pid: int) -> None:
@@ -44,6 +44,67 @@ def write_status(path: Path, state: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _installed_python(data: dict[str, Any]) -> Path:
+    method = str(data.get("method") or "")
+    raw_command = data.get("command")
+    command = cast("list[object]", raw_command) if isinstance(raw_command, list) else []
+    executable = str(command[0]) if command else method
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    if Path(executable).name.lower().startswith("uv"):
+        located = subprocess.run(  # noqa: S603
+            [executable, "tool", "dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if located.returncode:
+            raise RuntimeError("Could not locate the updated uv tool environment")
+        return (
+            Path(located.stdout.strip())
+            / "strix-agent"
+            / scripts
+            / ("python.exe" if sys.platform == "win32" else "python")
+        )
+    if Path(executable).name.lower().startswith("pipx"):
+        located = subprocess.run(  # noqa: S603
+            [executable, "environment", "--value", "PIPX_LOCAL_VENVS"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if located.returncode:
+            raise RuntimeError("Could not locate the updated pipx environment")
+        return (
+            Path(located.stdout.strip())
+            / "strix-agent"
+            / scripts
+            / ("python.exe" if sys.platform == "win32" else "python")
+        )
+    return Path(executable)
+
+
+def smoke_test(data: dict[str, Any]) -> None:
+    """Verify the installed distribution and the dependency that exposed the race."""
+    python = _installed_python(data)
+    expected = str(data["version"])
+    code = (
+        "import importlib.metadata as m; import rich._extension; "
+        f"assert m.version('strix-agent') == {expected!r}"
+    )
+    result = subprocess.run(  # noqa: S603
+        [str(python), "-I", "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[-1_000:]
+        raise RuntimeError(f"Installed Strix failed its import check: {detail}")
+
+
 def install(payload: Path) -> int:
     data = json.loads(payload.read_text(encoding="utf-8"))
     wheel, status = Path(data["wheel"]), Path(data["status"])
@@ -51,9 +112,17 @@ def install(payload: Path) -> int:
         wait_for_parent(data["parent_pid"])
         if hashlib.sha256(wheel.read_bytes()).hexdigest() != data["sha256"]:
             raise RuntimeError("The staged wheel changed; installation was not started")  # noqa: TRY301
+        active = {
+            "status": "installing",
+            "version": data["version"],
+            "started_at": data.get("started_at", time.time()),
+        }
+        write_status(status, active)
         result = subprocess.run(data["command"], check=False)  # noqa: S603
         if result.returncode:
             raise RuntimeError(f"Package installer exited with code {result.returncode}")  # noqa: TRY301
+        write_status(status, {**active, "status": "verifying"})
+        smoke_test(data)
         write_status(status, {"status": "complete", "version": data["version"]})
         sys.stdout.write(f"Strix {data['version']} installed. Run strix --version to confirm.\n")
     except Exception as exc:  # noqa: BLE001

@@ -341,8 +341,20 @@ def run_package_upgrade(  # noqa: PLR0911
         return False
     commands = {
         "pip": [sys.executable, "-m", "pip", "install", "--upgrade", str(wheel)],
-        "pipx": ["pipx", "install", "--force", str(wheel)],
-        "uv": ["uv", "tool", "install", "--force", str(wheel)],
+        "pipx": ["pipx", "runpip", "strix-agent", "install", "--upgrade", str(wheel)],
+        # ``--force`` reconstructs the complete uv tool environment and leaves
+        # a visible partial-install window on Windows. Upgrade only the direct
+        # Strix package so already-valid dependencies remain importable.
+        "uv": [
+            "uv",
+            "tool",
+            "install",
+            "--upgrade-package",
+            "strix-agent",
+            "--reinstall-package",
+            "strix-agent",
+            str(wheel),
+        ],
     }
     command = commands[method]
     if _needs_package_handoff():
@@ -394,6 +406,7 @@ def _handoff_package_upgrade(
     log = status.with_suffix(".log")
     worker = wheel.parent / "install.py"
     payload = wheel.parent / "install.json"
+    started_at = time.time()
     worker.write_bytes(Path(__file__).with_name("update_worker.py").read_bytes())
     payload.write_text(
         json.dumps(
@@ -404,6 +417,8 @@ def _handoff_package_upgrade(
                 "sha256": _sha256_file(wheel),
                 "version": version,
                 "status": str(status),
+                "method": command[0],
+                "started_at": started_at,
             }
         ),
         encoding="utf-8",
@@ -411,7 +426,7 @@ def _handoff_package_upgrade(
     status.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         status,
-        json.dumps({"status": "pending", "version": version, "started_at": time.time()}),
+        json.dumps({"status": "pending", "version": version, "started_at": started_at}),
     )
     try:
         with log.open("w", encoding="utf-8") as output:
@@ -430,24 +445,29 @@ def _handoff_package_upgrade(
         f"[yellow]Strix {version} is verified and ready to install. "
         "Installation will start when this process exits.[/]"
     )
-    console.print("[dim]Wait a few seconds, then run strix --version.[/]")
+    console.print(
+        "[dim]You can run Strix again now; it will wait for the verified installer if needed.[/]"
+    )
     console.print(f"[dim]Installer status: {status}\nInstaller log: {log}[/]", markup=True)
 
 
 def _package_install_pending(console: Console) -> bool:
     status = _CACHE_PATH.with_name("update-install.json")
     try:
-        state = json.loads(status.read_text(encoding="utf-8"))
-        if not isinstance(state, dict):
-            return False
-        if state.get("status") == "pending" and time.time() - state["started_at"] < 1200:
+        state = _object_dict(cast("object", json.loads(status.read_text(encoding="utf-8"))))
+        started_at = state.get("started_at")
+        if (
+            state.get("status") in {"pending", "installing", "verifying"}
+            and isinstance(started_at, int | float)
+            and time.time() - started_at < 1200
+        ):
             console.print("[yellow]A verified update is already being installed.[/]")
             console.print(str(status), markup=False)
             return True
         if state.get("status") == "failed":
             console.print("[yellow]The previous installer failed; retrying the update.[/]")
             console.print(str(status.with_suffix(".log")), markup=False)
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError):
         pass
     return False
 

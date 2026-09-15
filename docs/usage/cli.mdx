@@ -262,10 +262,10 @@ Run `strix --update` to install the latest release from this distribution's GitH
 
 On Windows, package updates are staged first. Strix exits so an independent installer can replace libraries without file-lock errors. Wait for installation to finish, then run `strix --version`. Completion or failure is recorded in `~/.strix/update-install.json`, with installer output in `~/.strix/update-install.log`.
 
-Versions 1.7.0 and 1.8.0 can incorrectly look up an upstream PyPI version and then report a missing GitHub manifest. For a Windows uv installation, bootstrap the fixed updater once with:
+Versions 1.7.0 and 1.8.0 can incorrectly look up an upstream PyPI version and then report a missing GitHub manifest. Version 1.9.0 can briefly expose a partially rebuilt uv environment if Strix is relaunched while its background installer is still running. For a Windows uv installation on any of those versions, bootstrap the fixed updater once with:
 
 ```powershell
-uv tool install --force https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.9.0/strix_agent-1.9.0-py3-none-win_amd64.whl
+uv tool install --upgrade-package strix-agent --reinstall-package strix-agent https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.9.1/strix_agent-1.9.1-py3-none-win_amd64.whl
 strix --version
 ```
 
