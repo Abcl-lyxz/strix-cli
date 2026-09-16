@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import platform
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -579,7 +580,7 @@ def test_package_install_uses_verified_wheel_and_cleans_staging(
     assert update_check._read_cache()["latest_version"] == "1.8.1"
 
 
-def test_windows_handoff_retains_verified_wheel_until_process_exit(
+def test_windows_handoff_updates_uv_environment_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     directory = tmp_path / "strix-update-fixture"
@@ -598,8 +599,10 @@ def test_windows_handoff_retains_verified_wheel_until_process_exit(
     payload = json.loads((directory / "install.json").read_text())
     assert payload["command"] == [
         "uv",
-        "tool",
+        "pip",
         "install",
+        "--python",
+        sys.executable,
         "--upgrade-package",
         "strix-agent",
         "--reinstall-package",

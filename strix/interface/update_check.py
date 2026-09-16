@@ -334,13 +334,19 @@ def run_package_upgrade(  # noqa: PLR0911
     commands = {
         "pip": [sys.executable, "-m", "pip", "install", "--upgrade", str(wheel)],
         "pipx": ["pipx", "runpip", "strix-agent", "install", "--upgrade", str(wheel)],
-        # ``--force`` reconstructs the complete uv tool environment and leaves
-        # a visible partial-install window on Windows. Upgrade only the direct
-        # Strix package so already-valid dependencies remain importable.
+        # Updating through ``uv tool install`` can remove the whole Scripts
+        # directory after changing site-packages.  On Windows, any other live
+        # Strix process keeps Scripts/python.exe locked; uv then leaves the tool
+        # environment without the Strix package.  Install into the existing
+        # interpreter instead.  This preserves the stable launcher and remains
+        # safe while older Strix processes finish with their already-imported
+        # modules.
         "uv": [
             "uv",
-            "tool",
+            "pip",
             "install",
+            "--python",
+            sys.executable,
             "--upgrade-package",
             "strix-agent",
             "--reinstall-package",
