@@ -28,13 +28,14 @@ from strix.core.sessions import (
     session_write_lock,
 )
 from strix.llm.context_budget import context_window, count_tokens, output_limit
-from strix.notifications import notify
 
 
 if TYPE_CHECKING:
     from agents.items import ModelResponse
     from agents.memory import Session
     from agents.models.interface import ModelProvider
+
+    from strix.ports.notifications import NotificationPublisher
 
 
 logger = logging.getLogger(__name__)
@@ -428,6 +429,7 @@ async def maybe_compact(
     force: bool = False,
     model_provider: ModelProvider | None = None,
     context_window_tokens: int | None = None,
+    notifications: NotificationPublisher | None = None,
 ) -> bool:
     """Compact ``session`` if it is near the model's context window.
 
@@ -449,8 +451,8 @@ async def maybe_compact(
     used = count_tokens(model, f"{instructions}\n{tools_text}") + sum(
         _item_token_cost(model, item) for item in items
     )
-    if used >= int(budget * 0.85):
-        notify(
+    if used >= int(budget * 0.85) and notifications is not None:
+        notifications.publish(
             "context.capacity_low",
             title="Agent context capacity is running low",
             detail=f"Working context is using approximately {used} of {budget} input tokens.",
@@ -513,14 +515,18 @@ async def maybe_compact(
             compacted_items=len(head),
             recent_items=len(recent),
         )
-        notify(
-            "context.compacted",
-            title="Agent context was compacted",
-            detail=f"Preserved {len(recent)} recent items and journaled {len(head)} older items.",
-            severity="info",
-            agent_id=str(getattr(session, "session_id", "")) or None,
-            dedupe_key=f"context-compacted:{getattr(session, 'session_id', '')}",
-        )
+        if notifications is not None:
+            notifications.publish(
+                "context.compacted",
+                title="Agent context was compacted",
+                detail=(
+                    f"Preserved {len(recent)} recent items and journaled "
+                    f"{len(head)} older items."
+                ),
+                severity="info",
+                agent_id=str(getattr(session, "session_id", "")) or None,
+                dedupe_key=f"context-compacted:{getattr(session, 'session_id', '')}",
+            )
         logger.info(
             "compacted %s: %d items (~%d tok) -> %d items (summary + %d recent)",
             model,

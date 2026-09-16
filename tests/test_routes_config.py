@@ -17,7 +17,8 @@ from strix.config.routes import (
     set_route_enabled,
     set_route_key,
 )
-from strix.routing import RouteConfig, RoutePool, _resolve_route_secrets
+from strix.domain.routes import RouteConfig
+from strix.routing import RoutePool, _resolve_route_secrets
 from strix.security import get_secret_store
 
 

@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -26,6 +27,9 @@ from strix.interface.interactive import (
     InteractiveSetupUnavailableError,
     run_tui,
 )
+from strix.interface.presentation import (
+    build_final_stats_text,
+)
 from strix.interface.scan_setup import (
     ModelConnectionError,
     preflight_model_connection,
@@ -37,9 +41,6 @@ from strix.interface.update_check import (
     prompt_update_if_available,
     restart_after_update,
     start_background_check,
-)
-from strix.interface.utils import (
-    build_final_stats_text,
 )
 from strix.llm.warmup import start_import_warmup, wait_for_import_warmup
 from strix.telemetry import report_error, set_scan_phase
@@ -267,12 +268,12 @@ async def warm_up_llm(
         raise ModelConnectionError(raw_model, exc) from exc
 
 
-def display_completion_message(args: argparse.Namespace, results_path: Path) -> None:
-    from strix.report.state import get_global_report_state
-
+def display_completion_message(
+    args: argparse.Namespace,
+    results_path: Path,
+    report_state: Any | None,
+) -> None:
     console = Console()
-    report_state = get_global_report_state()
-
     scan_completed = False
     if report_state:
         scan_completed = report_state.run_record.get("status") == "completed"
@@ -536,19 +537,18 @@ def main() -> None:
     if args.non_interactive:
         _bootstrap_scan(args)
 
-    from strix.report.state import get_global_report_state
-
     exit_reason = "user_exit"
+    report_state = None
     try:
         if args.non_interactive:
             from strix.interface.cli import run_cli
 
-            asyncio.run(run_cli(args))
+            report_state = asyncio.run(run_cli(args))
             # Headless runs have no user to quit: the agent either finished
             # (already beaconed as finished_by_tool) or stopped on its own.
             exit_reason = "agent_stopped"
         else:
-            asyncio.run(run_tui(args))
+            report_state = asyncio.run(run_tui(args))
     except InteractiveSetupUnavailableError as exc:
         exit_reason = "error"
         report_error("interactive_setup_unavailable", exc)
@@ -561,7 +561,6 @@ def main() -> None:
         report_error("unhandled_exception", exc)
         raise
     finally:
-        report_state = get_global_report_state()
         if report_state:
             status = {"interrupted": "interrupted", "error": "failed"}.get(
                 exit_reason,
@@ -583,12 +582,10 @@ def main() -> None:
 
     results_path = run_dir_for(args.run_name)
 
-    display_completion_message(args, results_path)
+    display_completion_message(args, results_path, report_state)
 
-    if args.non_interactive:
-        report_state = get_global_report_state()
-        if report_state and report_state.vulnerability_reports:
-            sys.exit(2)
+    if args.non_interactive and report_state and report_state.vulnerability_reports:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

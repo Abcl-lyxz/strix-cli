@@ -18,9 +18,12 @@ from agents import RunConfig
 from agents.sandbox import SandboxRunConfig
 from openai import RateLimitError
 
+from strix.adapters.artifacts import JsonArtifactStore
 from strix.agents.factory import build_strix_agent, make_child_factory
 from strix.agents.prompt import render_system_prompt
+from strix.bootstrap import create_scan_context
 from strix.config import config_path, load_settings
+from strix.config import routes as route_config
 from strix.config.models import (
     configure_sdk_model_defaults,
     supports_strict_tool_schemas,
@@ -46,20 +49,25 @@ from strix.core.inputs import (
 from strix.core.ownership import owned_run
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.core.sessions import open_agent_session
-from strix.report.state import get_global_report_state
+from strix.domain.routes import RouteConfig
+from strix.report.state import ReportState
 from strix.routing import (
     AllRoutesUnavailableError,
-    RouteConfig,
     RoutePool,
     SmartRouteProvider,
 )
 from strix.runtime import session_manager
 from strix.telemetry import set_scan_phase
 from strix.telemetry.logging import set_scan_id, setup_scan_logging
-from strix.tools.output_store import (
-    WORKSPACE_SPILL_DIR,
-    configure_spill_writer,
+from strix.tools.mcp import (
+    ConnectedMcpServer,
+    McpConnectionRequest,
+    McpRegistry,
+    SupervisedMcpSession,
+    attach_mcp_requests,
+    load_user_mcp_configs,
 )
+from strix.tools.output_store import WORKSPACE_SPILL_DIR
 from strix.utils.secret_files import write_secret_text
 
 
@@ -67,13 +75,8 @@ if TYPE_CHECKING:
     from agents.memory import SQLiteSession
     from agents.result import RunResultBase
 
+    from strix.application.context import ScanContext
     from strix.runtime.status import StatusSink
-    from strix.tools.mcp import (
-        ConnectedMcpServer,
-        McpConnectionRequest,
-        McpRegistry,
-        SupervisedMcpSession,
-    )
 
 
 logger = logging.getLogger(__name__)
@@ -100,8 +103,6 @@ def _route_reloader(
     )
 
     def reload() -> tuple[object, list[RouteConfig]]:
-        from strix.config import routes as route_config
-
         route_file = os.environ.get("STRIX_ROUTES_FILE", "").strip()
         source = Path(route_file) if route_file else config_path()
         try:
@@ -144,7 +145,9 @@ def _mcp_startup_summary(connections: list[ConnectedMcpServer]) -> str:
     return f"MCP: connected {server_count} {servers_word} ({tool_count} {tools_word}): {names}"
 
 
-def _record_mcp_connections(connections: list[ConnectedMcpServer]) -> None:
+def _record_mcp_connections(
+    report_state: ReportState, connections: list[ConnectedMcpServer]
+) -> None:
     """Record which MCP servers this run connected, for the interfaces.
 
     A server's tools are offered to the model under a name built from the
@@ -153,20 +156,16 @@ def _record_mcp_connections(connections: list[ConnectedMcpServer]) -> None:
     they can show which server it went out to. Kept on the run record because the
     viewer reads a finished run from disk.
     """
-    report_state = get_global_report_state()
-    if report_state is None:
-        return
     report_state.record_mcp_connections([connection.name for connection in connections])
 
 
-def _note_exit_reason(reason: str) -> None:
+def _note_exit_reason(report_state: ReportState, reason: str) -> None:
     """Record why the scan stopped so the end-of-scan beacon reports it."""
-    report_state = get_global_report_state()
-    if report_state is not None and report_state.scan_ended_exit_reason is None:
+    if report_state.scan_ended_exit_reason is None:
         report_state.scan_ended_exit_reason = reason
 
 
-def _persist_mcp_status(roster: list[dict[str, Any]]) -> None:
+def _persist_mcp_status(report_state: ReportState, roster: list[dict[str, Any]]) -> None:
     """Write the run's non-secret MCP connection status roster to run.json.
 
     The viewer rebuilds its display by re-reading the run's files from disk, so
@@ -175,9 +174,6 @@ def _persist_mcp_status(roster: list[dict[str, Any]]) -> None:
     viewer a source it can poll. Runs regardless of whether an interface sink is
     attached, so the standalone / non-TUI CLI path records health too.
     """
-    report_state = get_global_report_state()
-    if report_state is None:
-        return
     report_state.record_mcp_connection_status(roster)
 
 
@@ -250,6 +246,7 @@ async def run_strix_scan(
     status_sink: StatusSink | None = None,
     mcp_connection_requests: list[McpConnectionRequest] | None = None,
     mcp_status_sink: McpStatusSink | None = None,
+    scan_context: ScanContext | None = None,
 ) -> RunResultBase | None:
     """Run or resume one Strix scan against a sandbox.
 
@@ -257,7 +254,7 @@ async def run_strix_scan(
     root prompt without replacing the system-verified scope block.
     ``extra_files`` entries (``{"workspace_path", "content"}``) are placed into
     the sandbox workspace at session bring-up; see
-    :func:`strix.runtime.session_manager.create_or_reuse`.
+    :func:`strix.runtime.session_manager.create_session`.
     ``extra_system_prompt_context`` is merged into the root agent's scan
     context before prompt rendering. Child agents keep the standard scan prompt
     and context.
@@ -282,6 +279,20 @@ async def run_strix_scan(
     run_dir.mkdir(parents=True, exist_ok=True)
     state_dir = runtime_state_dir(run_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
+    if scan_context is None:
+        report_state = ReportState(scan_id)
+        report_state.hydrate_from_run_dir()
+        report_state.set_scan_config(scan_config)
+        report_state.save_run_data()
+        scan_context = create_scan_context(
+            scan_id=scan_id,
+            run_dir=run_dir,
+            state_dir=state_dir,
+            report_state=report_state,
+        )
+    elif scan_context.scan_id != scan_id:
+        raise ValueError("scan_context.scan_id must match scan_id")
+    report_state = scan_context.report_state
     teardown_logging = setup_scan_logging(run_dir)
     set_scan_id(scan_id)
 
@@ -343,23 +354,33 @@ async def run_strix_scan(
         max_attempts_per_route=int(
             getattr(getattr(settings, "routing", None), "max_attempts_per_route", 2)
         ),
+        notifications=scan_context.services.notifications,
     )
+    scan_context.route_pool = route_pool
 
     if coordinator is None:
         coordinator = AgentCoordinator(max_active_agents=max_agents)
     else:
         coordinator.max_active_agents = max_agents
+    coordinator.set_notification_publisher(scan_context.services.notifications)
     coordinator.set_snapshot_path(agents_path)
+    scan_context.coordinator = coordinator
 
-    from strix.tools.coverage.tools import hydrate_coverage_from_disk
-    from strix.tools.notes.tools import hydrate_notes_from_disk
-    from strix.tools.threat_model.tools import hydrate_threat_models_from_disk
-    from strix.tools.todo.tools import hydrate_todos_from_disk
-
-    hydrate_todos_from_disk(state_dir)
-    hydrate_notes_from_disk(state_dir)
-    hydrate_coverage_from_disk(state_dir)
-    hydrate_threat_models_from_disk(state_dir)
+    scan_context.artifact_stores.update(
+        {
+            name: JsonArtifactStore.hydrate(state_dir / filename)
+            for name, filename in {
+                "todos": "todos.json",
+                "notes": "notes.json",
+                "coverage": "coverage.json",
+                "threat_models": "threat_models.json",
+            }.items()
+        }
+    )
+    coverage_store = scan_context.artifact_store("coverage")
+    report_state.set_coverage_entries_provider(
+        lambda: coverage_store.snapshot_entries("entry_id")
+    )
 
     root_id: str | None = None
     if is_resume:
@@ -374,18 +395,16 @@ async def run_strix_scan(
                 f"Cannot resume scan {scan_id}: missing SDK session database at {agents_db}",
             )
         await coordinator.restore(snap)
-        report_state = get_global_report_state()
-        if report_state is not None:
-            budget_stopped, reserve_stopped = recomputed_budget_flags(
-                report_state.get_total_llm_cost(),
-                max_budget_usd,
-                interactive=interactive,
-            )
-            await coordinator.reset_budget_stops(
-                budget_stopped=budget_stopped,
-                reserve_stopped=reserve_stopped,
-                budget_paused=interactive and coordinator.budget_paused,
-            )
+        budget_stopped, reserve_stopped = recomputed_budget_flags(
+            report_state.get_total_llm_cost(),
+            max_budget_usd,
+            interactive=interactive,
+        )
+        await coordinator.reset_budget_stops(
+            budget_stopped=budget_stopped,
+            reserve_stopped=reserve_stopped,
+            budget_paused=interactive and coordinator.budget_paused,
+        )
         for aid, parent in coordinator.parent_of.items():
             if parent is None:
                 root_id = aid
@@ -404,8 +423,9 @@ async def run_strix_scan(
 
     logger.info("Bringing up sandbox session for scan %s", scan_id)
     set_scan_phase("sandbox_init")
-    bundle = await session_manager.create_or_reuse(
+    bundle = await session_manager.create_session(
         scan_id,
+        scan_context=scan_context,
         image=image,
         local_sources=local_sources or [],
         extra_files=extra_files,
@@ -416,6 +436,8 @@ async def run_strix_scan(
     set_scan_phase("agent_setup")
 
     sandbox_session = bundle["session"]
+    scan_context.sandbox_session = sandbox_session
+    scan_context.caido_client = bundle["caido_client"]
 
     async def _spill_to_workspace(output_id: str, text: str) -> str | None:
         """Write an oversized tool result into the sandbox; return its path or None."""
@@ -429,7 +451,7 @@ async def run_strix_scan(
             return None
         return path
 
-    configure_spill_writer(_spill_to_workspace)
+    scan_context.runtime_resources["spill_writer"] = _spill_to_workspace
 
     sessions_to_close: list[SQLiteSession] = []
     mcp_sessions: list[SupervisedMcpSession] = []
@@ -469,6 +491,7 @@ async def run_strix_scan(
             max_budget_usd=max_budget_usd,
             max_turns=max_turns,
             interactive=interactive,
+            usage_repository=report_state,
         )
         if interactive:
             coordinator.set_budget_extender(hooks.extend_budget)
@@ -485,13 +508,6 @@ async def run_strix_scan(
         # list_mcps / describe_mcp / call_mcp tools, guided by brief static prompt
         # guidance when any connection exists. Fail-open: a missing config, or a
         # server that will not connect, must never break a run.
-        from strix.tools.mcp import (
-            McpConnectionRequest,
-            McpRegistry,
-            attach_mcp_requests,
-            load_user_mcp_configs,
-        )
-
         mcp_registry = McpRegistry()
         try:
             if mcp_connection_requests is None:
@@ -508,7 +524,7 @@ async def run_strix_scan(
                 mcp_sessions = [c.session for c in connections]
                 # Recorded even when nothing connected, so a resumed run does not
                 # keep attributing tool calls to servers it no longer has.
-                _record_mcp_connections(connections)
+                _record_mcp_connections(report_state, connections)
                 if connections:
                     report(_mcp_startup_summary(connections))
                     # Name the connected servers in the prompt so every agent
@@ -540,7 +556,7 @@ async def run_strix_scan(
                     # so it is not carried here.
                     def _emit_mcp_status() -> None:
                         roster = _mcp_roster_payload(mcp_registry)
-                        _persist_mcp_status(roster)
+                        _persist_mcp_status(report_state, roster)
                         if mcp_status_sink is not None:
                             try:
                                 mcp_status_sink(roster)
@@ -614,24 +630,26 @@ async def run_strix_scan(
             )
 
         runtime_settings = getattr(settings, "runtime", None)
-        context: dict[str, Any] = {
-            "coordinator": coordinator,
-            "sandbox_session": bundle["session"],
-            "caido_client": bundle["caido_client"],
-            "mcp_registry": mcp_registry,
-            "agent_id": root_id,
-            "parent_id": None,
-            "interactive": interactive,
-            "spawn_child_agent": spawn_child_agent,
-            "scan_targets": build_scan_targets(scan_config),
-            "max_context_images": getattr(runtime_settings, "max_context_images", 3),
-            "route_pool": route_pool,
-            "sandbox_profile": getattr(runtime_settings, "sandbox_profile", "web"),
-            "tool_pack": getattr(runtime_settings, "tool_pack", "auto"),
-            "scope_cidr": getattr(runtime_settings, "scope_cidr", None),
-            "network_interface": getattr(runtime_settings, "network_interface", None),
-            "packet_rate_limit": getattr(runtime_settings, "packet_rate_limit", None),
-        }
+        scan_context.mcp_registry = mcp_registry
+        context: dict[str, Any] = scan_context.tool_context(
+            coordinator=coordinator,
+            sandbox_session=bundle["session"],
+            caido_client=bundle["caido_client"],
+            mcp_registry=mcp_registry,
+            agent_id=root_id,
+            parent_id=None,
+            interactive=interactive,
+            spawn_child_agent=spawn_child_agent,
+            scan_id=scan_id,
+            scan_targets=build_scan_targets(scan_config),
+            max_context_images=getattr(runtime_settings, "max_context_images", 3),
+            route_pool=route_pool,
+            sandbox_profile=getattr(runtime_settings, "sandbox_profile", "web"),
+            tool_pack=getattr(runtime_settings, "tool_pack", "auto"),
+            scope_cidr=getattr(runtime_settings, "scope_cidr", None),
+            network_interface=getattr(runtime_settings, "network_interface", None),
+            packet_rate_limit=getattr(runtime_settings, "packet_rate_limit", None),
+        )
 
         root_session = open_agent_session(root_id, agents_db)
         sessions_to_close.append(root_session)
@@ -716,7 +734,7 @@ async def run_strix_scan(
         return result  # noqa: TRY300
     except BudgetExceededError as exc:
         logger.info("Scan %s stopped: %s", scan_id, exc)
-        _note_exit_reason("budget_exceeded")
+        _note_exit_reason(report_state, "budget_exceeded")
         if root_id is not None:
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
@@ -729,7 +747,7 @@ async def run_strix_scan(
             exc,
             scan_id,
         )
-        _note_exit_reason("routes_unavailable")
+        _note_exit_reason(report_state, "routes_unavailable")
         if root_id is not None:
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
@@ -747,7 +765,7 @@ async def run_strix_scan(
                 await coordinator.set_status(root_id, "failed")
         raise
     finally:
-        configure_spill_writer(None)
+        scan_context.runtime_resources.pop("spill_writer", None)
         # Settle descendants before closing sessions: on a clean finish a child
         # can still be mid-turn, and closing its session underneath it crashes it.
         if root_id is not None:
@@ -765,6 +783,6 @@ async def run_strix_scan(
             await coordinator._maybe_snapshot()
         if cleanup_on_exit:
             logger.info("Tearing down sandbox session for scan %s", scan_id)
-            await session_manager.cleanup(scan_id)
+            await session_manager.cleanup(scan_id, scan_context)
         logger.info("Strix scan %s done", scan_id)
         teardown_logging()

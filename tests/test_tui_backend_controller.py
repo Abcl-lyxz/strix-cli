@@ -10,7 +10,7 @@ import pytest
 
 from strix.config import apply_config_override, loader
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
-from strix.interface.tui.backend.controller import TuiController
+from strix.interface.tui.backend.controller import ApplicationController
 
 
 class _SendingCoordinator:
@@ -70,7 +70,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_setup_state_is_serializable() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     await controller.handle("setup.add_target", {"target": "https://example.com"})
     await controller.handle("setup.set_instruction", {"instruction": "focus on auth"})
     snapshot = controller.snapshot()
@@ -89,7 +89,7 @@ async def test_setup_state_is_serializable() -> None:
 
 @pytest.mark.asyncio
 async def test_setup_instruction_preserves_multiline_whitespace() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     instruction = "  first line\nsecond line \n"
 
     result = await controller.handle("setup.set_instruction", {"instruction": instruction})
@@ -107,7 +107,7 @@ async def test_tui_find_searches_workspace_without_an_agent_turn(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "module.py").write_text("value = 'ade'\n", encoding="utf-8")
     coordinator = _SendingCoordinator()
-    controller = TuiController(args(), coordinator=coordinator)
+    controller = ApplicationController(args(), coordinator=coordinator)
 
     result = await controller.handle("workspace.find", {"query": "ade"})
 
@@ -118,7 +118,7 @@ async def test_tui_find_searches_workspace_without_an_agent_turn(
 
 @pytest.mark.asyncio
 async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     result = await controller.handle(
         "config.update",
@@ -149,7 +149,7 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
 
 @pytest.mark.asyncio
 async def test_tui_config_supports_runtime_model_controls() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     await controller.handle(
         "config.update",
@@ -173,7 +173,7 @@ async def test_tui_config_supports_runtime_model_controls() -> None:
 
 @pytest.mark.asyncio
 async def test_tui_config_rejects_credential_in_base_url() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     with pytest.raises(ValueError, match="must not contain credentials"):
         await controller.handle("config.update", {"api_base": "https://secret@example.com/v1"})
@@ -181,7 +181,7 @@ async def test_tui_config_rejects_credential_in_base_url() -> None:
 
 @pytest.mark.asyncio
 async def test_tui_config_rejects_multiline_api_keys() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     with pytest.raises(ValueError, match="single line"):
         await controller.handle("config.update", {"api_key": "first\nsecond"})
@@ -189,7 +189,7 @@ async def test_tui_config_rejects_multiline_api_keys() -> None:
 
 @pytest.mark.asyncio
 async def test_setup_configuration_updates_all_scan_controls() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     result = await controller.handle(
         "setup.configure",
@@ -216,7 +216,7 @@ async def test_setup_configuration_updates_all_scan_controls() -> None:
 
 @pytest.mark.asyncio
 async def test_setup_targets_can_be_removed_or_cleared() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     await controller.handle("setup.add_target", {"target": "https://one.example"})
     await controller.handle("setup.add_target", {"target": "https://two.example"})
 
@@ -230,7 +230,7 @@ async def test_setup_targets_can_be_removed_or_cleared() -> None:
 
 @pytest.mark.asyncio
 async def test_connections_snapshot_reflects_the_pushed_mcp_roster() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     # A run with no MCP connections carries an empty roster, so the sidebar
     # omits the panel entirely.
     assert controller.snapshot()["connections"] == []
@@ -251,7 +251,7 @@ async def test_connections_snapshot_reflects_the_pushed_mcp_roster() -> None:
 async def test_setup_instruction_starts_from_cli_and_can_be_cleared() -> None:
     setup_args = args()
     setup_args.instruction = "  CLI instruction  "
-    controller = TuiController(setup_args)
+    controller = ApplicationController(setup_args)
 
     assert controller.snapshot()["instruction"] == "CLI instruction"
 
@@ -263,7 +263,7 @@ async def test_setup_instruction_starts_from_cli_and_can_be_cleared() -> None:
 
 @pytest.mark.asyncio
 async def test_setup_controls_reject_changes_after_start() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     controller.setup_mode = False
     controller.scan_started = True
 
@@ -273,7 +273,7 @@ async def test_setup_controls_reject_changes_after_start() -> None:
 
 @pytest.mark.asyncio
 async def test_large_target_list_reports_truncated_snapshot_count() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     for index in range(20):
         await controller.handle("setup.add_target", {"target": f"https://target-{index}.example"})
@@ -290,7 +290,7 @@ def test_state_populates_model_warning_for_non_frontier_model() -> None:
     os.environ["STRIX_LLM"] = "openai/gpt-3.5-turbo"
     loader._cached = None
 
-    warning = TuiController(args()).snapshot()["model_warning"]
+    warning = ApplicationController(args()).snapshot()["model_warning"]
 
     assert "openai/gpt-3.5-turbo" in warning
     assert "not a recommended frontier model" in warning
@@ -303,7 +303,7 @@ def test_setup_restores_prepared_cli_targets() -> None:
         {"type": "local_code", "details": {}, "original": "/workspace/source"},
     ]
 
-    controller = TuiController(setup_args)
+    controller = ApplicationController(setup_args)
 
     assert controller.snapshot()["targets"] == ["https://example.com", "/workspace/source"]
 
@@ -316,7 +316,7 @@ async def test_start_validates_model_before_callback() -> None:
         nonlocal started
         started = True
 
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
     with pytest.raises(ValueError, match="No model configured"):
         await controller.handle("setup.start", {})
@@ -333,7 +333,7 @@ async def test_start_launches_with_a_configured_model() -> None:
 
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 
     result = await controller.handle("setup.start", {})
@@ -353,7 +353,7 @@ async def test_start_without_target_requires_mount_consent() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
 
     # Mounting the working directory is never silent.
     with pytest.raises(ValueError, match="No target set"):
@@ -375,7 +375,7 @@ async def test_target_less_start_enters_live_view_and_waits_for_the_mount() -> N
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
 
     result = await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -401,7 +401,7 @@ async def test_confirming_the_mount_starts_the_scan_without_a_target() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
     result = await controller.handle("setup.confirm_mount", {"approved": True})
@@ -427,7 +427,7 @@ async def test_declining_the_mount_runs_without_one() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
     result = await controller.handle("setup.confirm_mount", {"approved": False})
@@ -453,7 +453,7 @@ async def test_approving_the_mount_runs_with_it() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
     result = await controller.handle("setup.confirm_mount", {"approved": True})
@@ -466,14 +466,14 @@ async def test_approving_the_mount_runs_with_it() -> None:
 
 @pytest.mark.asyncio
 async def test_confirm_mount_requires_a_pending_request() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     with pytest.raises(RuntimeError, match="No mount confirmation is pending"):
         await controller.handle("setup.confirm_mount", {"approved": True})
 
 
 def test_snapshot_exposes_working_directory() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
 
     assert controller.snapshot()["working_dir"] == str(Path.cwd())
     assert controller.snapshot()["pending_mount"] == ""
@@ -482,7 +482,7 @@ def test_snapshot_exposes_working_directory() -> None:
 @pytest.mark.asyncio
 async def test_user_message_updates_live_agent_projection_immediately() -> None:
     coordinator = _SendingCoordinator()
-    controller = TuiController(args(), coordinator=coordinator)
+    controller = ApplicationController(args(), coordinator=coordinator)
     controller.setup_mode = False
     controller.scan_started = True
     controller.scan_loop = asyncio.get_running_loop()
@@ -510,7 +510,7 @@ async def test_user_message_updates_live_agent_projection_immediately() -> None:
 @pytest.mark.asyncio
 async def test_user_message_preserves_multiline_whitespace() -> None:
     coordinator = _SendingCoordinator()
-    controller = TuiController(args(), coordinator=coordinator)
+    controller = ApplicationController(args(), coordinator=coordinator)
     controller.setup_mode = False
     controller.scan_started = True
     controller.scan_loop = asyncio.get_running_loop()
@@ -537,7 +537,7 @@ async def test_start_verifies_the_model_before_a_targeted_launch() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start, on_verify=verify)
+    controller = ApplicationController(args(), on_start=start, on_verify=verify)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 
     await controller.handle("setup.start", {})
@@ -561,7 +561,7 @@ async def test_start_verifies_the_model_before_a_bare_prompt_leaves_setup() -> N
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start, on_verify=verify)
+    controller = ApplicationController(args(), on_start=start, on_verify=verify)
 
     await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -581,7 +581,7 @@ async def test_failed_model_check_keeps_the_start_screen() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start, on_verify=verify)
+    controller = ApplicationController(args(), on_start=start, on_verify=verify)
 
     with pytest.raises(RuntimeError, match="Model connection failed"):
         await controller.handle("setup.start", {"mount_working_dir": True})
@@ -602,7 +602,7 @@ async def test_confirmed_mount_launch_failure_is_reported_in_the_live_view() -> 
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
     with pytest.raises(ValueError, match="Scan preparation failed"):
@@ -624,7 +624,7 @@ async def test_start_rejects_concurrent_and_repeated_submissions() -> None:
     os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
     os.environ["ANTHROPIC_API_KEY"] = "test-key"
     loader._cached = None
-    controller = TuiController(args(), on_start=start)
+    controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 
     first_start = asyncio.create_task(controller.handle("setup.start", {}))
@@ -649,7 +649,7 @@ async def test_stop_rejects_terminal_agents(status: str) -> None:
             return True
 
     coordinator = Coordinator()
-    controller = TuiController(args(), coordinator=coordinator)
+    controller = ApplicationController(args(), coordinator=coordinator)
     controller.set_runtime(scan_loop=asyncio.get_running_loop())
     controller.live_view.upsert_agent("agent-1", name="Agent", status=status)
 
@@ -671,7 +671,7 @@ async def test_stop_allows_active_agents(status: str) -> None:
             return True
 
     coordinator = Coordinator()
-    controller = TuiController(args(), coordinator=coordinator)
+    controller = ApplicationController(args(), coordinator=coordinator)
     controller.set_runtime(scan_loop=asyncio.get_running_loop())
     controller.live_view.upsert_agent("agent-1", name="Agent", status=status)
 
@@ -687,7 +687,7 @@ async def test_stop_handles_coordinator_rejection_after_stale_active_projection(
         async def cancel_descendants_graceful(self, _agent_id: str) -> bool:
             return False
 
-    controller = TuiController(args(), coordinator=Coordinator())
+    controller = ApplicationController(args(), coordinator=Coordinator())
     controller.set_runtime(scan_loop=asyncio.get_running_loop())
     controller.live_view.upsert_agent("agent-1", name="Agent", status="running")
 
@@ -697,13 +697,13 @@ async def test_stop_handles_coordinator_rejection_after_stale_active_projection(
 
 @pytest.mark.asyncio
 async def test_unknown_command_is_rejected() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     with pytest.raises(ValueError, match="Unknown command"):
         await controller.handle("nope", {})
 
 
 def test_messages_are_sanitized_and_agents_are_collection_only() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     controller.add_message("replace\x1b]52;c;Y2xpcA==\x07 key\x85")
     for index in range(40):
         controller.live_view.upsert_agent(f"agent-{index}", name=f"Agent {index}")
@@ -716,7 +716,7 @@ def test_messages_are_sanitized_and_agents_are_collection_only() -> None:
 
 
 def test_incidental_python_output_is_diagnostic_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     recorded: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         controller.notification_service,
@@ -746,12 +746,12 @@ async def test_existing_viewer_is_reopened_and_closed(
         def server_close(self) -> None:
             self.close_called = True
 
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     controller.viewer_status = "running"
     controller.viewer_url = "http://127.0.0.1:1234/?token=test"
     server = ViewerServer()
     controller._viewer_httpd = server
-    monkeypatch.setattr("strix.interface.tui.backend.controller.webbrowser.open", opened.append)
+    monkeypatch.setattr("strix.interface.application.webbrowser.open", opened.append)
 
     result = await controller.handle("viewer.open", {})
     controller.close_viewer()

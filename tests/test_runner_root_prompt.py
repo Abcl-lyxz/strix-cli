@@ -14,9 +14,6 @@ import pytest
 from agents import ModelSettings
 from openai import RateLimitError
 
-import strix.tools.mcp as mcp_pkg
-import strix.tools.notes.tools as notes_tools
-import strix.tools.todo.tools as todo_tools
 from strix.core import runner
 from strix.core.agents import AgentCoordinator
 from strix.runtime import session_manager
@@ -63,16 +60,14 @@ def _patch_engine_scaffold(
         lambda _model, _settings: False,
     )
 
-    monkeypatch.setattr(todo_tools, "hydrate_todos_from_disk", lambda _state_dir: None)
-    monkeypatch.setattr(notes_tools, "hydrate_notes_from_disk", lambda _state_dir: None)
 
-    async def _create_or_reuse(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    async def _create_session(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"client": object(), "session": object(), "caido_client": None}
 
     async def _cleanup(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr(session_manager, "create_or_reuse", _create_or_reuse)
+    monkeypatch.setattr(session_manager, "create_session", _create_session)
     monkeypatch.setattr(session_manager, "cleanup", _cleanup)
 
     monkeypatch.setattr(runner, "build_root_task", lambda _scan_config: "task")
@@ -202,7 +197,7 @@ async def test_mcp_available_flag_set_when_a_connection_attaches(
         session = types.SimpleNamespace(aclose=_aclose)
         return [types.SimpleNamespace(name="fs", tool_count=2, session=session)]
 
-    monkeypatch.setattr(mcp_pkg, "attach_mcp_requests", _attach)
+    monkeypatch.setattr(runner, "attach_mcp_requests", _attach)
 
     request = McpConnectionRequest(
         config=McpConnectionConfig(
@@ -238,7 +233,7 @@ async def test_mcp_available_flag_absent_without_a_connection(
     scope_context: dict[str, Any] = {"scope": "built-in"}
     captured = _patch_engine_scaffold(monkeypatch, tmp_path, scope_context)
 
-    monkeypatch.setattr(mcp_pkg, "load_user_mcp_configs", list)
+    monkeypatch.setattr(runner, "load_user_mcp_configs", list)
 
     await runner.run_strix_scan(
         scan_config={"targets": [], "scan_mode": "deep"},

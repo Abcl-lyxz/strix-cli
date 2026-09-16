@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 
 _READS = {"snapshot", "tabs", "console", "errors", "network", "title", "url"}
-_sessions: dict[tuple[str, str], BrowserSession] = {}
 
 
 class BrowserSession:
@@ -213,8 +212,11 @@ class BrowserSession:
 
 
 async def close_browser(context: dict[str, Any]) -> None:
-    key = (str(context.get("scan_id")), str(context.get("agent_id")))
-    browser = _sessions.pop(key, None)
+    scan_context = context.get("scan_context")
+    if scan_context is None:
+        return
+    sessions = scan_context.runtime_resource("browser_sessions", dict)
+    browser = sessions.pop(str(context.get("agent_id")), None)
     if browser is not None:
         with contextlib.suppress(Exception):
             async with browser.lock:
@@ -266,10 +268,17 @@ async def browser_action(
     if not isinstance(raw_context, dict):
         return {"success": False, "error": "An agent-owned sandbox is required"}
     context = cast("dict[str, Any]", raw_context)
-    if not all(context.get(k) for k in ("scan_id", "agent_id", "sandbox_session")):
+    if not all(
+        context.get(k)
+        for k in ("scan_id", "agent_id", "sandbox_session", "scan_context")
+    ):
         return {"success": False, "error": "An agent-owned sandbox is required"}
-    key = (str(context["scan_id"]), str(context["agent_id"]))
-    browser = _sessions.setdefault(key, BrowserSession(context))
+    sessions = cast(
+        "dict[str, BrowserSession]",
+        context["scan_context"].runtime_resource("browser_sessions", dict),
+    )
+    agent_id = str(context["agent_id"])
+    browser = sessions.setdefault(agent_id, BrowserSession(context))
     try:
         return await browser.action(action, selector, value)
     except (ValueError, OSError, TimeoutError, RuntimeError) as exc:

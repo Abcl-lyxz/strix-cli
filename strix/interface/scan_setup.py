@@ -16,16 +16,16 @@ from typing import TYPE_CHECKING, Any
 
 from strix.config import Settings, codex, load_settings
 from strix.core.paths import run_dir_for
-from strix.interface.utils import (
+from strix.interface.diff_scope import resolve_diff_scope_context
+from strix.interface.presentation import generate_run_name
+from strix.interface.targets import (
     assign_workspace_subdirs,
     clone_repository,
     collect_local_sources,
     dedupe_local_targets,
     derive_local_base_name,
-    generate_run_name,
     infer_target_type,
     read_target_list_file,
-    resolve_diff_scope_context,
     rewrite_localhost_targets,
     stage_api_specs,
     write_fetched_collection,

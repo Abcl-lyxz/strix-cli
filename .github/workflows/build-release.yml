@@ -47,6 +47,11 @@ jobs:
         with:
           go-version: '1.24.x'
           cache-dependency-path: strix/interface/tui/go.sum
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: strix/interface/viewer/frontend/package-lock.json
       - name: Validate release source
         run: |
           uv sync --frozen
@@ -54,7 +59,12 @@ jobs:
           uv run mypy strix
           uv run bandit -c pyproject.toml -r strix
           uv run pytest
-          cd strix/interface/tui && go test ./...
+          cd strix/interface/tui && go test -race ./...
+          cd ../viewer/frontend
+          npm ci
+          npm run type-check
+          npm test
+          npm run build
 
   build:
     needs: validate

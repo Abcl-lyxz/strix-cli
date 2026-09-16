@@ -54,6 +54,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from strix.tools.mcp import transport as mcp_transport
 from strix.tools.mcp.config import DEFAULT_MAX_CONCURRENT_CALLS
 from strix.tools.mcp.failures import FailureInfo, HttpStatusRecorder, classify
 
@@ -64,8 +65,8 @@ if TYPE_CHECKING:
     from agents.mcp import MCPServer
     from mcp.types import Tool as MCPTool
 
-    from strix.tools.mcp.client import ResultTransform
     from strix.tools.mcp.config import McpConnectionConfig
+    from strix.tools.mcp.transport import ResultTransform, ServerBuilder
 
     # One operation to run against the live session, e.g. ``list_tools`` or a tool
     # call. Runs on the supervising task (supervised sessions) or inline (adopted
@@ -157,9 +158,15 @@ class SupervisedMcpSession:
     :attr:`name`, :attr:`server`, :attr:`config`, :attr:`is_dead`.
     """
 
-    def __init__(self, config: McpConnectionConfig) -> None:
+    def __init__(
+        self,
+        config: McpConnectionConfig,
+        *,
+        server_builder: ServerBuilder | None = None,
+    ) -> None:
         self._name = config.name
         self._config: McpConnectionConfig | None = config
+        self._server_builder = server_builder or mcp_transport.build_server
         self._server: MCPServer | None = None
         self._supervised = True
         self._task: asyncio.Task[None] | None = None
@@ -193,6 +200,7 @@ class SupervisedMcpSession:
         self = cls.__new__(cls)
         self._name = name
         self._config = config
+        self._server_builder = mcp_transport.build_server
         self._server = server
         self._supervised = False
         self._task = None
@@ -373,10 +381,8 @@ class SupervisedMcpSession:
         is unavailable. A call rejection keeps the connection usable because the
         provider rejected the request, not the session.
         """
-        from strix.tools.mcp.client import dispatch_mcp_call
-
         async def job(server: MCPServer) -> Any:
-            return await dispatch_mcp_call(
+            return await mcp_transport.dispatch_mcp_call(
                 server,
                 tool_name,
                 arguments,
@@ -386,13 +392,11 @@ class SupervisedMcpSession:
 
         outcome = await self._run_job(job, phase="call")
         if outcome.call_failure is not None:
-            from strix.tools.mcp.client import _errored_tool_output
-
-            return _errored_tool_output(self._call_rejected_message(outcome.call_failure))
+            return mcp_transport.errored_tool_output(
+                self._call_rejected_message(outcome.call_failure)
+            )
         if outcome.dead:
-            from strix.tools.mcp.client import _errored_tool_output
-
-            return _errored_tool_output(self._unavailable_message())
+            return mcp_transport.errored_tool_output(self._unavailable_message())
         return outcome.value
 
     # -- job routing ----------------------------------------------------------
@@ -695,11 +699,9 @@ class SupervisedMcpSession:
         same task before the error propagates, so a failed connect never orphans
         an MCP subprocess or half-open HTTP session.
         """
-        from strix.tools.mcp.client import _build_server
-
         if self._config is None:
             raise RuntimeError(f"MCP connection {self._name!r} has no config to connect")
-        built = _build_server(self._config)
+        built = self._server_builder(self._config)
         server = built.server
         self._recorder = built.recorder
         try:

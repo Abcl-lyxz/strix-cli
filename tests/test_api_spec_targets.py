@@ -11,7 +11,7 @@ import pytest
 
 from strix.core.inputs import build_root_task, build_scope_context
 from strix.interface.scan_setup import build_targets_info
-from strix.interface.utils import infer_target_type, stage_api_specs
+from strix.interface.targets import infer_target_type, stage_api_specs
 
 
 OPENAPI = {

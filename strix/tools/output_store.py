@@ -3,7 +3,7 @@
 Oversized results are spilled into the sandbox at
 ``/workspace/.tool-output/<id>.txt``; the agent sees a head + tail slice
 plus the path and reads the rest back with its own file tools. The spill writer
-is injected by the runner via :func:`configure_spill_writer`.
+is injected per scan by the composition root.
 """
 
 from __future__ import annotations
@@ -32,17 +32,6 @@ _SAMPLE_WORKSPACE_PATH = f"{WORKSPACE_SPILL_DIR}/{'0' * 32}.txt"
 
 if TYPE_CHECKING:
     SpillWriter = Callable[[str, str], Awaitable[str | None]]
-
-_spill: dict[str, SpillWriter] = {}
-
-
-def configure_spill_writer(writer: SpillWriter | None) -> None:
-    """Install (or clear) the sandbox-workspace spill writer."""
-    if writer is None:
-        _spill.pop("writer", None)
-    else:
-        _spill["writer"] = writer
-
 
 def _byte_len(text: str) -> int:
     return len(text.encode("utf-8"))
@@ -140,7 +129,13 @@ def bound_text(text: str, *, max_lines: int, max_bytes: int) -> str:
     return _join(head, tail, _TRUNCATION_NOTICE.format(lines=dropped_lines, bytes=dropped_bytes))
 
 
-async def bound_and_store(text: str, *, max_lines: int, max_bytes: int) -> str:
+async def bound_and_store(
+    text: str,
+    *,
+    max_lines: int,
+    max_bytes: int,
+    writer: SpillWriter | None = None,
+) -> str:
     """Like :func:`bound_text`, but spill the full output into the sandbox and
     point the agent at its path. Degrades to a plain preview if the spill fails.
     """
@@ -154,7 +149,6 @@ async def bound_and_store(text: str, *, max_lines: int, max_bytes: int) -> str:
         return text
     head, tail, dropped_lines, dropped_bytes = parts
 
-    writer = _spill.get("writer")
     if writer is not None:
         # Content-addressed names make retries idempotent: replaying a safe
         # read-only tool result points at the same artifact instead of creating

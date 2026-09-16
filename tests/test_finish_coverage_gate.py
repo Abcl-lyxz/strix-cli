@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from strix.tools.coverage.tools import _record_impl, hydrate_coverage_from_disk
+from strix.adapters.artifacts import JsonArtifactStore
+from strix.tools.coverage.tools import _record_impl, get_coverage_entries
 from strix.tools.finish.tool import _coverage_summary
 
 
@@ -21,13 +22,14 @@ _GRAPH = {
 }
 
 
-@pytest.fixture(autouse=True)
-def _empty_ledger(tmp_path: Path) -> None:
-    hydrate_coverage_from_disk(tmp_path)
+@pytest.fixture
+def coverage_store(tmp_path: Path) -> JsonArtifactStore:
+    return JsonArtifactStore(tmp_path / "coverage.json")
 
 
-def _record(risk_area: str) -> None:
+def _record(store: JsonArtifactStore, risk_area: str) -> None:
     _record_impl(
+        store=store,
         surface="POST /api/orders/{id}",
         risk_area=risk_area,
         outcome="no_issue_found",
@@ -37,10 +39,12 @@ def _record(risk_area: str) -> None:
     )
 
 
-def test_unrecorded_risk_class_is_reported_back_to_the_root_agent() -> None:
-    _record("SQL injection")
+def test_unrecorded_risk_class_is_reported_back_to_the_root_agent(
+    coverage_store: JsonArtifactStore,
+) -> None:
+    _record(coverage_store, "SQL injection")
 
-    summary = _coverage_summary(_GRAPH)
+    summary = _coverage_summary(_GRAPH, get_coverage_entries(coverage_store))
 
     assert summary["coverage_recorded"] == 1
     assert len(summary["coverage_gaps"]) == 1
@@ -48,18 +52,20 @@ def test_unrecorded_risk_class_is_reported_back_to_the_root_agent() -> None:
     assert "unexamined" in summary["coverage_gap_warning"]
 
 
-def test_fully_accounted_coverage_raises_no_gap_warning() -> None:
-    _record("SQL injection")
-    _record("cross-site scripting")
+def test_fully_accounted_coverage_raises_no_gap_warning(
+    coverage_store: JsonArtifactStore,
+) -> None:
+    _record(coverage_store, "SQL injection")
+    _record(coverage_store, "cross-site scripting")
 
-    summary = _coverage_summary(_GRAPH)
+    summary = _coverage_summary(_GRAPH, get_coverage_entries(coverage_store))
 
     assert "coverage_gaps" not in summary
     assert "coverage_gap_warning" not in summary
 
 
 def test_an_empty_ledger_still_warns_first() -> None:
-    summary = _coverage_summary(_GRAPH)
+    summary = _coverage_summary(_GRAPH, [])
 
     assert summary["coverage_recorded"] == 0
     assert "No coverage was recorded" in summary["coverage_warning"]

@@ -50,7 +50,7 @@ from strix.tools.proxy.tools import (
     view_request,
     view_sitemap_entry,
 )
-from strix.tools.reporting.tool import (
+from strix.tools.reporting import (
     create_dependency_report,
     create_vulnerability_report,
     get_report,
@@ -138,11 +138,17 @@ def _tool_output_limits() -> tuple[int, int]:
     return context.tool_output_max_lines, context.tool_output_max_bytes
 
 
-async def _bound_result(result: Any) -> Any:
+async def _bound_result(ctx: Any, result: Any) -> Any:
     if not isinstance(result, str):
         return result
     max_lines, max_bytes = _tool_output_limits()
-    return await bound_and_store(result, max_lines=max_lines, max_bytes=max_bytes)
+    inner = ctx.context if isinstance(getattr(ctx, "context", None), dict) else {}
+    scan_context = inner.get("scan_context")
+    resources = getattr(scan_context, "runtime_resources", None)
+    writer = resources.get("spill_writer") if isinstance(resources, dict) else None
+    return await bound_and_store(
+        result, max_lines=max_lines, max_bytes=max_bytes, writer=writer
+    )
 
 
 def _format_tool_error(exc: Exception) -> str:
@@ -158,7 +164,7 @@ def _with_bounded_result(tool: FunctionTool) -> FunctionTool:
     invoke_tool = tool.on_invoke_tool
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
-        return await _bound_result(await invoke_tool(ctx, raw_input))
+        return await _bound_result(ctx, await invoke_tool(ctx, raw_input))
 
     tool.on_invoke_tool = invoke
     tool._strix_bounded = True  # type: ignore[attr-defined]
@@ -299,7 +305,7 @@ def _function_tool_with_error_result(tool: FunctionTool) -> FunctionTool:
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
         try:
-            return await _bound_result(await invoke_tool(ctx, raw_input))
+            return await _bound_result(ctx, await invoke_tool(ctx, raw_input))
         except Exception as exc:  # noqa: BLE001 - tool errors should be model-visible results.
             logger.debug("Tool %s failed; returning error as result", tool.name, exc_info=True)
             return _format_tool_error(exc)
@@ -314,7 +320,7 @@ def _custom_tool_as_function_tool(tool: CustomTool) -> FunctionTool:
         if not custom_input:
             return f"`{_custom_tool_input_field(tool)}` must be a non-empty string."
         try:
-            return await _bound_result(await tool.on_invoke_tool(ctx, custom_input))
+            return await _bound_result(ctx, await tool.on_invoke_tool(ctx, custom_input))
         except Exception as exc:  # noqa: BLE001 - matches SDK CustomTool error-as-result behavior.
             logger.debug("Tool %s failed; returning error as result", tool.name, exc_info=True)
             return _format_tool_error(exc)
@@ -352,7 +358,7 @@ def _bound_custom_tool(tool: CustomTool) -> CustomTool:
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
         try:
-            return await _bound_result(await invoke_tool(ctx, raw_input))
+            return await _bound_result(ctx, await invoke_tool(ctx, raw_input))
         except (ValueError, ValidationError) as exc:
             return _format_tool_error(exc)
 

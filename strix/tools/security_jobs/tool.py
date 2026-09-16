@@ -19,6 +19,7 @@ from agents import RunContextWrapper, function_tool
 from strix.config import load_settings
 from strix.core.paths import run_dir_for
 from strix.llm.error_envelope import error_envelope
+from strix.tools.artifacts import scan_context_from_tool
 from strix.utils.secret_files import write_secret_text
 
 
@@ -117,16 +118,14 @@ class _Job:
     task: asyncio.Task[dict[str, Any]]
 
 
-_jobs: dict[tuple[str, str], _Job] = {}
-
-
-def _context(ctx: RunContextWrapper) -> tuple[dict[str, Any], Any, str]:
+def _context(ctx: RunContextWrapper) -> tuple[dict[str, Any], Any, str, dict[str, _Job]]:
     inner: dict[str, Any] = ctx.context if isinstance(ctx.context, dict) else {}
     session = inner.get("sandbox_session")
     if session is None:
         raise RuntimeError("sandbox session is unavailable")
     scan_id = str(inner.get("scan_id") or "unknown")
-    return inner, session, scan_id
+    jobs = scan_context_from_tool(ctx).runtime_resource("security_jobs", dict)
+    return inner, session, scan_id, jobs
 
 
 def _selected_packs(context: dict[str, Any] | None = None) -> set[str]:
@@ -218,7 +217,7 @@ async def start_security_job(
     for long reads/scans; destructive, denial-of-service, wireless, spraying,
     and lateral-movement operations are not capabilities.
     """
-    inner, session, scan_id = _context(ctx)
+    inner, session, scan_id, jobs = _context(ctx)
     item = _CAPABILITIES.get(capability)
     if item is None or item["pack"] not in _selected_packs(inner):
         raise ValueError("capability is unavailable in the selected tool packs")
@@ -245,7 +244,7 @@ async def start_security_job(
         _validate_network_arguments(argv, scope)
     job_id = uuid4().hex
     task = asyncio.create_task(_execute_job(session, scan_id, program, argv, timeout))
-    _jobs[(scan_id, job_id)] = _Job(
+    jobs[job_id] = _Job(
         job_id=job_id,
         capability=capability,
         program=program,
@@ -293,8 +292,8 @@ def _validate_network_arguments(arguments: list[str], raw_scope: str) -> None:
 @function_tool
 async def read_security_job(ctx: RunContextWrapper, job_id: str) -> str:
     """Read one supervised job's current status and final artifact pointer."""
-    _inner, _session, scan_id = _context(ctx)
-    job = _jobs.get((scan_id, job_id))
+    _inner, _session, _scan_id, jobs = _context(ctx)
+    job = jobs.get(job_id)
     if job is None:
         raise ValueError("unknown security job")
     if not job.task.done():
@@ -321,8 +320,8 @@ async def read_security_job(ctx: RunContextWrapper, job_id: str) -> str:
 @function_tool
 async def stop_security_job(ctx: RunContextWrapper, job_id: str) -> str:
     """Cancel a running job; active network effects already sent cannot be undone."""
-    _inner, _session, scan_id = _context(ctx)
-    job = _jobs.get((scan_id, job_id))
+    _inner, _session, _scan_id, jobs = _context(ctx)
+    job = jobs.get(job_id)
     if job is None:
         raise ValueError("unknown security job")
     if not job.task.done():
@@ -341,7 +340,7 @@ async def stop_security_job(ctx: RunContextWrapper, job_id: str) -> str:
 @function_tool(timeout=30)
 async def search_artifacts(ctx: RunContextWrapper, query: str = "") -> str:
     """List content-addressed tool/job artifacts, optionally filtered by name."""
-    _inner, session, _scan_id = _context(ctx)
+    _inner, session, _scan_id, _jobs = _context(ctx)
     result = await session.exec(
         "find",
         "/workspace/.tool-output",

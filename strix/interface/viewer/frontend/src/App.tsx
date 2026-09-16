@@ -2,13 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUp,
-  Bell,
-  FolderOpen,
-  History,
   Paperclip,
-  Plus,
   Search,
-  Settings,
   Sliders,
   Square,
   X,
@@ -21,57 +16,53 @@ import {
 import Markdown from "@/components/live/tool-renderers/Markdown";
 import { IssueSeveritySummary } from "@/components/IssueSeveritySummary";
 import { RunDetails } from "@/components/RunDetails";
+import { WorkspaceDialog as WorkspaceDialogModal } from "@/components/workspace/WorkspaceDialog";
+import { WorkspaceNavigation } from "@/components/workspace/WorkspaceNavigation";
 import VulnerabilityDetail from "@/components/vulnerability/VulnerabilityDetail";
 import { normalizeVulnerability } from "@/lib/local-run-parser";
 import type { Vulnerability } from "@/types/issues";
+import { requestJson, requestId, sendCommand } from "@/workspace/apiClient";
+import type {
+  HistoricalRun,
+  WorkspaceAgent,
+  WorkspaceDialog,
+  WorkspaceDialogRow,
+  WorkspaceEvent,
+  WorkspaceRow,
+} from "@/workspace/contracts";
+import { mergeEvents } from "@/workspace/store";
+import { useWorkspaceStream } from "@/workspace/useWorkspaceStream";
 import "./workspace.css";
 
-type Row = Record<string, any>;
-type Dialog = {
-  title: string;
-  command?: string;
-  payload?: Row;
-  fields?: Row[];
-  rows?: Row[];
-  kind?: string;
-  error?: string;
-};
-const uid = () => crypto.randomUUID();
-const label = (row: Row) =>
-  String(row.label || row.title || row.name || row.id || row.path || "Item");
-const text = (value: any) =>
+type Row = WorkspaceRow;
+type Dialog = WorkspaceDialog;
+const uid = requestId;
+const text = (value: unknown) =>
   typeof value === "string" ? value : JSON.stringify(value, null, 2);
-async function api(path: string, options?: RequestInit) {
-  const response = await fetch(path, { cache: "no-store", ...options });
-  const value = await response.json();
-  if (!response.ok)
-    throw new Error(value.error || `Request failed (${response.status})`);
-  return value;
+const formValue = (
+  value: unknown,
+): string | number | boolean | null | undefined =>
+  typeof value === "string" ||
+  typeof value === "number" ||
+  typeof value === "boolean" ||
+  value === null ||
+  value === undefined
+    ? value
+    : "";
+async function api<T = Row>(path: string, options?: RequestInit): Promise<T> {
+  return requestJson<T>(path, options);
 }
 export async function command(
   name: string,
   payload: Row = {},
   requestId: string = uid(),
 ) {
-  return api("/api/app/commands", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command: name, payload, request_id: requestId }),
-  });
+  return sendCommand<Row>(name, payload, requestId);
 }
-export function mergeEvents(previous: Row[], incoming: Row[], reset = false) {
-  const map = new Map((reset ? [] : previous).map((item) => [item.id, item]));
-  incoming.forEach((item) => map.set(item.id, item));
-  return [...map.values()].slice(-5000);
-}
+export { mergeEvents };
 export default function App() {
-  const [state, setState] = useState<Row>({ setup_mode: true });
   const [runRecord, setRunRecord] = useState<Row>({});
-  const [events, setEvents] = useState<Row[]>([]),
-    [agents, setAgents] = useState<Row[]>([]),
-    [findings, setFindings] = useState<Row[]>([]);
-  const [attachments, setAttachments] = useState<Row[]>([]),
-    [runs, setRuns] = useState<Row[]>([]),
+  const [runs, setRuns] = useState<Row[]>([]),
     [artifacts, setArtifacts] = useState<Row[]>([]);
   const [view, setView] = useState("workspace"),
     [search, setSearch] = useState(""),
@@ -79,17 +70,18 @@ export default function App() {
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [selectedFinding, setSelectedFinding] = useState<string | null>(null);
   const [showGraph, setShowGraph] = useState(false);
-  const [expanded, setExpanded] = useState(false),
-    [streamEpoch, setStreamEpoch] = useState(0);
+  const [expanded, setExpanded] = useState(false);
   const [inboxFilter, setInboxFilter] = useState("all");
-  const [online, setOnline] = useState(false),
-    [dialog, setDialog] = useState<Dialog | null>(null),
+  const [dialog, setDialog] = useState<Dialog | null>(null),
     [filter, setFilter] = useState("");
   const [draft, setDraft] = useState(
     () => sessionStorage.getItem("strix-draft") || "",
   );
   const [delivery, setDelivery] = useState(""),
-    [historical, setHistorical] = useState<Row | null>(null);
+    [historical, setHistorical] = useState<HistoricalRun | null>(null);
+  const handleStreamError = useCallback((message: string) => setError(message), []);
+  const { state, events, agents, findings, attachments, online } =
+    useWorkspaceStream(handleStreamError);
   const pending = useRef<{ id: string; message: string } | null>(
       (() => {
         try {
@@ -101,7 +93,6 @@ export default function App() {
     ),
     editor = useRef<HTMLTextAreaElement>(null);
   const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastStreamEvent = useRef(Date.now());
   const runQuery = historical
     ? `?run=${encodeURIComponent(historical.name)}`
     : "";
@@ -125,7 +116,12 @@ export default function App() {
     setDialog({ title, rows: [], kind });
     try {
       const data = await perform(name, payload);
-      setDialog({ title, rows: data[key] || [], kind });
+      const rows = data[key];
+      setDialog({
+        title,
+        rows: Array.isArray(rows) ? (rows as WorkspaceDialogRow[]) : [],
+        kind,
+      });
     } catch (e) {
       setDialog((d) => d && { ...d, error: (e as Error).message });
     }
@@ -169,7 +165,9 @@ export default function App() {
                     field.id === "path"
                       ? {
                           ...field,
-                          suggestions: data.paths.map((item: Row) => item.path),
+                          suggestions: (data.paths ?? [])
+                            .map((item: Row) => item.path)
+                            .filter((path): path is string => typeof path === "string"),
                         }
                       : field,
                   ),
@@ -222,50 +220,7 @@ export default function App() {
     const url = new URL(location.href);
     url.searchParams.delete("token");
     history.replaceState(null, "", url);
-    const stream = new EventSource("/api/app/events");
-    stream.onopen = () => {
-      lastStreamEvent.current = Date.now();
-      setOnline(true);
-    };
-    stream.onerror = () => setOnline(false);
-    stream.onmessage = (event) => {
-      lastStreamEvent.current = Date.now();
-      let data: Row;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        setError(
-          "Invalid workspace update; reconnecting for a fresh snapshot.",
-        );
-        stream.close();
-        setOnline(false);
-        setStreamEpoch((epoch) => epoch + 1);
-        return;
-      }
-      if (data.state) setState(data.state);
-      if (data.events)
-        setEvents((old) => mergeEvents(old, data.events, data.reset));
-      if (data.agents) setAgents(data.agents);
-      if (data.findings) setFindings(data.findings);
-      if (data.attachments) setAttachments(data.attachments);
-    };
-    const heartbeat = () => {
-      lastStreamEvent.current = Date.now();
-    };
-    stream.addEventListener?.("heartbeat", heartbeat);
-    const staleWatchdog = window.setInterval(() => {
-      if (Date.now() - lastStreamEvent.current <= 15_000) return;
-      stream.close();
-      setOnline(false);
-      setError("Live updates stalled; reconnecting and resynchronizing state.");
-      setStreamEpoch((epoch) => epoch + 1);
-    }, 5_000);
-    return () => {
-      window.clearInterval(staleWatchdog);
-      stream.removeEventListener?.("heartbeat", heartbeat);
-      stream.close();
-    };
-  }, [streamEpoch]);
+  }, []);
   useEffect(() => {
     api("/api/capabilities")
       .then((data) => {
@@ -288,13 +243,13 @@ export default function App() {
   useEffect(() => {
     if (view === "history")
       api("/api/runs")
-        .then((data) => setRuns(data.runs))
+        .then((data) => setRuns(data.runs ?? []))
         .catch((e) => setError(e.message));
   }, [view, state.scan_state]);
   useEffect(() => {
     if (view === "evidence")
       api("/api/artifacts" + runQuery)
-        .then((data) => setArtifacts(data.artifacts))
+        .then((data) => setArtifacts(data.artifacts ?? []))
         .catch((e) => setError(e.message));
   }, [view, runQuery, state.scan_state]);
   useEffect(() => {
@@ -327,20 +282,30 @@ export default function App() {
     }
   };
   const browse = async (run: Row) => {
+    if (!run.name) return;
     try {
       const query = `?run=${encodeURIComponent(run.name)}`;
       const [transcript, reports, runRecord] = await Promise.all([
-        api("/api/transcript" + query),
-        api("/api/vulnerabilities" + query),
+        api<{ agents?: HistoricalRun["agents"]; events?: HistoricalRun["events"] }>(
+          "/api/transcript" + query,
+        ),
+        api<Row[]>("/api/vulnerabilities" + query),
         api("/api/run" + query),
       ]);
-      setHistorical({ ...run, ...transcript, findings: reports, runRecord });
+      setHistorical({
+        ...run,
+        name: run.name,
+        agents: transcript.agents ?? [],
+        events: transcript.events ?? [],
+        findings: reports,
+        runRecord,
+      });
       setView("overview");
     } catch (e) {
       setError((e as Error).message);
     }
   };
-  const choose = (row: Row) => {
+  const choose = (row: WorkspaceDialogRow) => {
     if (dialog?.kind === "routing") {
       setDialog({
         title: `Advanced routing · ${row.name}`,
@@ -393,7 +358,7 @@ export default function App() {
     }
     if (dialog?.kind === "providers")
       setDialog({
-        title: row.name,
+        title: row.name ?? "Provider",
         command: "providers.connect",
         payload: { provider_id: row.id },
         fields: [
@@ -411,14 +376,14 @@ export default function App() {
       });
     if (dialog?.kind === "settings")
       setDialog({
-        title: row.label,
+        title: row.label ?? "Setting",
         command: "settings.update",
         payload: { id: row.id },
         fields: [
           {
             id: "value",
             label: `${row.label} · ${row.source} · ${row.apply}`,
-            value: row.value,
+            value: formValue(row.value),
             type:
               row.type === "secret"
                 ? "password"
@@ -438,7 +403,7 @@ export default function App() {
       });
     if (dialog?.kind === "commands") {
       setDialog(null);
-      row.run();
+      row.run?.();
     }
   };
   const submitForm = async (form: HTMLFormElement, discover = false) => {
@@ -464,14 +429,19 @@ export default function App() {
               ...d,
               fields: d.fields?.map((field) => ({
                 ...field,
-                value: payload[field.id],
+                value: formValue(payload[field.id]),
                 ...(field.id === "model_id"
-                  ? { suggestions: data.models?.map((m: Row) => m.id) }
+                  ? {
+                      suggestions: (data.models ?? [])
+                        .map((m: Row) => m.id)
+                        .filter((id): id is string => typeof id === "string"),
+                    }
                   : {}),
               })),
               error:
-                data.error ||
-                `Models from ${data.source}. You can also enter a model ID.`,
+                typeof data.error === "string"
+                  ? data.error
+                  : `Models from ${String(data.source ?? "provider")}. You can also enter a model ID.`,
             },
         );
       } else {
@@ -657,58 +627,22 @@ export default function App() {
         if (e.key === "Escape") setDialog(null);
       }}
     >
-      <aside className="workspace-nav">
-        <div className="brand">
-          <Activity size={24} />
-          <strong>strix</strong>
-          <span>LOCAL</span>
-        </div>
-        <button
-          className="new-scan"
-          onClick={() =>
-            perform("scan.new")
-              .then(() => {
-                setHistorical(null);
-                setView("workspace");
-              })
-              .catch(() => {})
-          }
-        >
-          <Plus size={17} />
-          New scan
-        </button>
-        {[
-          ["overview", "Overview", Sliders],
-          ["workspace", "Workspace", Activity],
-          ["findings", "Findings", FolderOpen],
-          ["evidence", "Evidence & reports", Paperclip],
-          ["history", "History", History],
-        ].map(([id, title, Icon]: any) => (
-          <button
-            key={id}
-            aria-current={view === id ? "page" : undefined}
-            onClick={() => setView(id)}
-          >
-            <Icon size={17} />
-            {title}
-          </button>
-        ))}
-        <div className="nav-bottom">
-          <button onClick={openInbox}>
-            <Bell size={17} />
-            Notifications{" "}
-            <span className="count">{state.notification_unread || 0}</span>
-          </button>
-          <button onClick={openSettings}>
-            <Settings size={17} />
-            Settings
-          </button>
-          <button onClick={palette}>
-            <Search size={17} />
-            Commands <kbd>Ctrl K</kbd>
-          </button>
-        </div>
-      </aside>
+      <WorkspaceNavigation
+        view={view}
+        unread={state.notification_unread || 0}
+        onView={setView}
+        onNewScan={() =>
+          void perform("scan.new")
+            .then(() => {
+              setHistorical(null);
+              setView("workspace");
+            })
+            .catch(() => {})
+        }
+        onInbox={openInbox}
+        onSettings={openSettings}
+        onCommands={palette}
+      />
       <main className="workspace-main">
         <header>
           <div>
@@ -827,7 +761,7 @@ export default function App() {
                   <button
                     onClick={() =>
                       perform("scan.retry", {
-                        agent_id: state.recovery.agent_id,
+                        agent_id: state.recovery?.agent_id,
                       }).catch(() => {})
                     }
                   >
@@ -855,10 +789,10 @@ export default function App() {
                     <span>{state.scan_mode || "deep"} scan</span>
                     <span>{state.target_count || 0} targets</span>
                   </div>
-                  {state.recent_runs?.length > 0 && (
+                  {(state.recent_runs?.length ?? 0) > 0 && (
                     <div className="recent-home">
                       <p>Recent sessions</p>
-                      {state.recent_runs.slice(0, 3).map((run: Row) => (
+                      {(state.recent_runs ?? []).slice(0, 3).map((run: Row) => (
                         <button key={run.name} onClick={() => browse(run)}>
                           {run.name}
                         </button>
@@ -876,7 +810,7 @@ export default function App() {
                     <button onClick={() => setSelectedAgent(null)}>
                       All agents
                     </button>
-                    {displayedAgents.map((agent: Row) => (
+                    {displayedAgents.map((agent: WorkspaceAgent) => (
                       <button
                         key={agent.id}
                         onClick={() => setSelectedAgent(agent.id)}
@@ -915,7 +849,7 @@ export default function App() {
                   />
                 </label>
               )}
-              {visibleEvents.map((event: Row, index: number) => {
+              {visibleEvents.map((event: WorkspaceEvent, index: number) => {
                 const data = event.data || event;
                 if (event.type === "tool")
                   return (
@@ -923,25 +857,30 @@ export default function App() {
                       key={event.id || index}
                       agent={
                         displayedAgents.find(
-                          (a: Row) => a.id === event.agent_id,
+                          (a: WorkspaceAgent) => a.id === event.agent_id,
                         ) || {
                           id: event.agent_id,
                           name: event.agent_id,
+                          parent_id: null,
                           status: "running",
+                          created_at: event.timestamp,
+                          updated_at: event.timestamp,
                         }
                       }
-                      events={[event as any]}
+                      events={[event]}
                       showHeader={false}
                     />
                   );
                 return (
                   <article className="event" key={event.id || index}>
                     <div className="event-label">
-                      {data.role ||
-                        data.tool_name ||
-                        data.name ||
-                        event.type ||
-                        "Event"}
+                      {text(
+                        data.role ||
+                          data.tool_name ||
+                          data.name ||
+                          event.type ||
+                          "Event",
+                      )}
                       <small>{event.agent_id}</small>
                     </div>
                     {data.content || data.text || data.message ? (
@@ -950,7 +889,7 @@ export default function App() {
                       />
                     ) : (
                       <details>
-                        <summary>{data.status || "Details"}</summary>
+                        <summary>{text(data.status || "Details")}</summary>
                         <pre>{text(data)}</pre>
                       </details>
                     )}
@@ -1088,7 +1027,7 @@ export default function App() {
                   </span>
                   {state.scan_started &&
                     !["completed", "stopped", "failed"].includes(
-                      state.scan_state,
+                      state.scan_state ?? "",
                     ) && (
                       <button
                         onClick={() => perform("scan.stop").catch(() => {})}
@@ -1192,258 +1131,39 @@ export default function App() {
             >
               Download PDF report
             </a>
-            {artifacts.map((item) => (
+            {artifacts.filter((item) => item.path).map((item) => (
               <a
                 className="artifact"
                 key={item.path}
-                href={`/api/artifact?path=${encodeURIComponent(item.path)}${historical ? `&run=${encodeURIComponent(historical.name)}` : ""}`}
+                href={`/api/artifact?path=${encodeURIComponent(item.path ?? "")}${historical ? `&run=${encodeURIComponent(historical.name)}` : ""}`}
                 download
               >
                 <Paperclip size={17} />
                 {item.path}
-                <span>{Math.ceil(item.size / 1024)} KiB</span>
+                <span>{Math.ceil((item.size ?? 0) / 1024)} KiB</span>
               </a>
             ))}
           </section>
         )}
       </main>
       {dialog && (
-        <div
-          className="dialog-backdrop"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) setDialog(null);
-          }}
-        >
-          <dialog
-            open
-            aria-modal="true"
-            aria-label={dialog.title}
-            onKeyDown={(e) => {
-              if (e.key !== "Tab") return;
-              const items = Array.from(
-                e.currentTarget.querySelectorAll<HTMLElement>(
-                  "button:not(:disabled),input,select,textarea,a[href]",
-                ),
-              );
-              const first = items[0],
-                last = items[items.length - 1];
-              if (e.shiftKey && document.activeElement === first) {
-                e.preventDefault();
-                last?.focus();
-              } else if (!e.shiftKey && document.activeElement === last) {
-                e.preventDefault();
-                first?.focus();
-              }
-            }}
-          >
-            <div className="dialog-title">
-              <h2>{dialog.title}</h2>
-              <button aria-label="Close dialog" onClick={() => setDialog(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            {dialog.error && (
-              <p role="status" className="notice">
-                {dialog.error}
-              </p>
-            )}
-            {dialog.fields && (
-              <form
-                key={dialog.fields.map((f) => `${f.id}:${f.value}`).join("|")}
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void submitForm(e.currentTarget);
-                }}
-              >
-                {dialog.fields.map((field) => (
-                  <label key={field.id}>
-                    {field.label}
-                    {field.options ? (
-                      <select name={field.id} defaultValue={field.value}>
-                        {field.options.map((option: string) => (
-                          <option key={option}>{option}</option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        name={field.id}
-                        type={field.type || "text"}
-                        defaultValue={
-                          field.type === "checkbox"
-                            ? undefined
-                            : (field.value ?? "")
-                        }
-                        defaultChecked={
-                          field.type === "checkbox" && !!field.value
-                        }
-                        list={
-                          field.suggestions ? field.id + "-models" : undefined
-                        }
-                        onChange={
-                          field.id === "path"
-                            ? (e) => completePath(e.target.value)
-                            : undefined
-                        }
-                        autoComplete={
-                          field.type === "password" ? "new-password" : "off"
-                        }
-                      />
-                    )}
-                    {field.suggestions && (
-                      <datalist id={field.id + "-models"}>
-                        {field.suggestions.map((model: string) => (
-                          <option key={model} value={model} />
-                        ))}
-                      </datalist>
-                    )}
-                  </label>
-                ))}
-                <div className="form-actions">
-                  {dialog.command === "providers.connect" && (
-                    <button
-                      type="button"
-                      onClick={(e) => submitForm(e.currentTarget.form!, true)}
-                    >
-                      Discover models
-                    </button>
-                  )}
-                  <button className="primary" type="submit">
-                    Apply
-                  </button>
-                </div>
-              </form>
-            )}
-            {dialog.rows && (
-              <>
-                {dialog.kind === "notifications" && (
-                  <select
-                    aria-label="Notification filter"
-                    value={inboxFilter}
-                    onChange={(e) => setInboxFilter(e.target.value)}
-                  >
-                    <option value="all">All notifications</option>
-                    <option value="unread">Unread</option>
-                    <option value="error">Errors</option>
-                    <option value="run">Current run</option>
-                  </select>
-                )}
-                <input
-                  aria-label="Filter items"
-                  placeholder="Search…"
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                />
-                <div className="dialog-list">
-                  {dialog.rows
-                    .filter(
-                      (row) =>
-                        (dialog.kind !== "notifications" ||
-                          inboxFilter === "all" ||
-                          (inboxFilter === "unread" && row.unread) ||
-                          (inboxFilter === "error" &&
-                            ["error", "critical"].includes(row.severity)) ||
-                          (inboxFilter === "run" &&
-                            row.run_id === state.run_name)) &&
-                        text(row).toLowerCase().includes(filter.toLowerCase()),
-                    )
-                    .map((row, i) =>
-                      dialog.kind === "notifications" ? (
-                        <article
-                          className={`notification ${row.unread ? "unread" : ""}`}
-                          key={row.id}
-                        >
-                          <strong>{row.title}</strong>
-                          <p>{row.detail}</p>
-                          <small>
-                            {row.severity} · {row.count || 1} events
-                          </small>
-                          <div>
-                            <button
-                              onClick={() =>
-                                perform("notifications.manage", {
-                                  operation: "read",
-                                  id: row.id,
-                                })
-                                  .then(openInbox)
-                                  .catch(() => {})
-                              }
-                            >
-                              Mark read
-                            </button>
-                            <button
-                              onClick={() =>
-                                perform("notifications.manage", {
-                                  operation: "dismiss",
-                                  id: row.id,
-                                })
-                                  .then(openInbox)
-                                  .catch(() => {})
-                              }
-                            >
-                              Dismiss
-                            </button>
-                            {row.actions?.map((action: Row, index: number) => (
-                              <button
-                                key={index}
-                                onClick={() =>
-                                  perform("notifications.manage", {
-                                    operation: "action",
-                                    id: row.id,
-                                    index,
-                                  })
-                                    .then((result) => {
-                                      if (result.action === "open_routes")
-                                        void openProviders();
-                                      else if (
-                                        result.action === "retry_route_test"
-                                      )
-                                        void perform("providers.test").catch(
-                                          () => {},
-                                        );
-                                      else if (result.action === "dismiss") {
-                                        void perform("notifications.manage", {
-                                          operation: "dismiss",
-                                          id: result.target,
-                                        })
-                                          .then(openInbox)
-                                          .catch(() => {});
-                                      } else {
-                                        if (result.action === "open_agent")
-                                          setSelectedAgent(result.target);
-                                        setDialog(null);
-                                        setView(
-                                          result.action === "open_finding"
-                                            ? "findings"
-                                            : "workspace",
-                                        );
-                                      }
-                                    })
-                                    .catch(() => {})
-                                }
-                              >
-                                {action.label || action.action}
-                              </button>
-                            ))}
-                          </div>
-                        </article>
-                      ) : (
-                        <button
-                          className="list-row"
-                          key={row.id || i}
-                          onClick={() => choose(row)}
-                        >
-                          <span>{label(row)}</span>
-                          <small>
-                            {row.source || row.description || row.apply}
-                          </small>
-                        </button>
-                      ),
-                    )}
-                </div>
-              </>
-            )}
-          </dialog>
-        </div>
+        <WorkspaceDialogModal
+          dialog={dialog}
+          inboxFilter={inboxFilter}
+          filter={filter}
+          runName={state.run_name}
+          setDialog={setDialog}
+          setInboxFilter={setInboxFilter}
+          setFilter={setFilter}
+          completePath={completePath}
+          submitForm={submitForm}
+          choose={choose}
+          perform={perform}
+          openInbox={openInbox}
+          openProviders={openProviders}
+          selectAgent={setSelectedAgent}
+          selectView={setView}
+        />
       )}
     </div>
   );

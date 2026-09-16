@@ -14,7 +14,7 @@ import requests
 from strix.config import routes as route_config
 from strix.config.provider_catalog import adapter_models, model_metadata, provider_descriptors
 from strix.config.routes import list_saved_routes, save_route, set_session_route
-from strix.routing import RouteConfig
+from strix.domain.routes import RouteConfig
 from strix.security import get_secret_store, redact_secrets
 from strix.security.secrets import register_secret
 

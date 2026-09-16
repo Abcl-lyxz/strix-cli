@@ -11,13 +11,13 @@ from strix.config import apply_config_override
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.interface.scan_setup import attach_workspace_mount, build_targets_info
-from strix.interface.update_check import self_update
-from strix.interface.utils import (
+from strix.interface.targets import (
     check_mountable_dir,
     collect_local_sources,
     resolve_workspace_files,
     validate_config_file,
 )
+from strix.interface.update_check import self_update
 
 
 def get_version() -> str:

@@ -1,0 +1,92 @@
+{
+  "version": 7,
+  "envelopes": [
+    {
+      "version": 7,
+      "type": "hello",
+      "payload": {"capabilities": ["state-revisions", "collection-deltas"]}
+    },
+    {
+      "version": 7,
+      "type": "state",
+      "payload": {
+        "revision": 4,
+        "state": {"setup_mode": false, "scan_started": true, "scan_state": "running"}
+      }
+    },
+    {
+      "version": 7,
+      "type": "collection_bootstrap",
+      "payload": {
+        "collection": "events",
+        "revision": 2,
+        "cursor": 0,
+        "next_cursor": 1,
+        "done": true,
+        "items": [
+          {
+            "id": "event-1",
+            "type": "chat",
+            "agent_id": "root",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "version": 1,
+            "data": {"role": "assistant", "content": "checkpoint"}
+          }
+        ]
+      }
+    },
+    {
+      "version": 7,
+      "type": "collection_delta",
+      "payload": {
+        "collection": "events",
+        "base_revision": 2,
+        "revision": 3,
+        "cursor": 1,
+        "next_cursor": 2,
+        "done": true,
+        "operations": [
+          {"op": "delete", "id": "event-1", "item": null}
+        ]
+      }
+    },
+    {
+      "version": 7,
+      "type": "command",
+      "request_id": "request-1",
+      "payload": {"command": "scan.retry", "payload": {"agent_id": "root"}}
+    },
+    {
+      "version": 7,
+      "type": "command_result",
+      "request_id": "request-1",
+      "payload": {"ok": true, "command": "scan.retry", "result": {}, "error": null}
+    }
+  ],
+  "workspace_stream": {
+    "reset": true,
+    "state": {"setup_mode": false, "scan_state": "running", "run_name": "fixture-run"},
+    "agents": [
+      {
+        "id": "root",
+        "name": "strix",
+        "parent_id": null,
+        "status": "running",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+      }
+    ],
+    "events": [
+      {
+        "id": "event-1",
+        "type": "chat",
+        "agent_id": "root",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "version": 1,
+        "data": {"role": "assistant", "content": "checkpoint"}
+      }
+    ],
+    "findings": [],
+    "attachments": []
+  }
+}

@@ -84,7 +84,7 @@ def register_backend(
     """Register a custom backend under ``name``.
 
     Intended for downstream users who ship their own runtime — register
-    before any ``session_manager.create_or_reuse`` call. Re-registering
+    before any ``session_manager.create_session`` call. Re-registering
     an existing name overwrites the prior entry. ``supports_bind_mounts``
     defaults to False: a remote runtime cannot see the caller's filesystem, so
     it is handed local sources as manifest entries to upload instead.

@@ -5,18 +5,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import math
-import os
 import webbrowser
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
+from strix.application.commands import Command, CommandRegistry
+from strix.bootstrap import create_app_services
 from strix.config import load_settings
 from strix.config import routes as route_config
-from strix.config.models import is_recommended_or_frontier_model
 from strix.config.routes import (
     list_saved_routes,
     load_routes,
@@ -25,22 +25,15 @@ from strix.config.routes import (
 )
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.config.ui import settings_fields, update_setting
-from strix.core.paths import runtime_state_dir
+from strix.core.paths import runs_base_dir, runtime_state_dir
+from strix.domain.routes import RouteConfig
+from strix.interface.projectors import WorkspaceProjector, display_api_base
 from strix.interface.tui.backend.live_view import TuiLiveView
-from strix.interface.tui.backend.projection import (
-    MAX_TERMINAL_EVENTS,
-    MAX_TERMINAL_VULNERABILITIES,
-    SCAN_MODES,
-    SCOPE_MODES,
-    bounded_state_projection,
-    collection_item_projection,
-    sanitize_terminal_text,
-    terminal_projection,
-)
-from strix.interface.utils import is_subscription_run
+from strix.interface.tui.backend.messages import send_user_message_to_agent
+from strix.interface.tui.backend.projection import SCAN_MODES, SCOPE_MODES, sanitize_terminal_text
+from strix.interface.viewer.server import bundle_is_built, fresh_authorized_url, serve
+from strix.interface.viewer.workspace import BrowserWorkspace
 from strix.interface.workspace import WorkspaceCommands
-from strix.notifications import Notification, get_notification_service
-from strix.routing import RouteConfig
 from strix.security import get_secret_store
 from strix.tools.workspace_search import search_local_workspace
 
@@ -48,26 +41,14 @@ from strix.tools.workspace_search import search_local_workspace
 if TYPE_CHECKING:
     import argparse
 
+    from strix.application.context import AppServices, ScanContext
+    from strix.notifications import Notification
     from strix.report.state import ReportState
 
 
 _STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused"})
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _MAX_PROMPT_BYTES = 256 * 1024
-_LLM_ENV_ALIASES = frozenset(
-    {
-        "STRIX_LLM",
-        "LLM_API_KEY",
-        "OPENAI_API_KEY",
-        "LLM_API_BASE",
-        "OPENAI_API_BASE",
-        "OPENAI_BASE_URL",
-        "LITELLM_BASE_URL",
-        "OLLAMA_API_BASE",
-        "STRIX_REASONING_EFFORT",
-    }
-)
-
 ChangeCallback = Callable[[], None]
 StartCallback = Callable[[], Awaitable[None]]
 VerifyCallback = Callable[[], Awaitable[None]]
@@ -84,16 +65,21 @@ class ApplicationController:
         live_view: TuiLiveView | None = None,
         coordinator: Any = None,
         report_state: ReportState | None = None,
+        services: AppServices | None = None,
         on_start: StartCallback | None = None,
         on_verify: VerifyCallback | None = None,
         on_quit: QuitCallback | None = None,
         on_change: ChangeCallback | None = None,
     ) -> None:
         self.args = args
+        self.services = services or create_app_services()
         self.workspace = WorkspaceCommands(self)
+        self.commands = CommandRegistry()
+        self.projector = WorkspaceProjector()
         self.live_view = live_view or TuiLiveView()
         self.coordinator = coordinator
         self.report_state = report_state
+        self.scan_context: ScanContext | None = None
         self.scan_loop: asyncio.AbstractEventLoop | None = None
         self.setup_mode = bool(args.needs_setup)
         self.scan_started = not self.setup_mode
@@ -159,8 +145,45 @@ class ApplicationController:
         requested_routes = getattr(args, "route", None) or []
         self.selected_route = str(requested_routes[0]) if requested_routes else ""
         self.recovery: dict[str, Any] = {}
-        self.notification_service = get_notification_service()
+        self.notification_service = self.services.notifications
         self._unsubscribe_notifications = self.notification_service.subscribe(self._on_notification)
+        self._register_commands()
+
+    def _register_commands(self) -> None:
+        handlers = {
+            "setup.add_target": self._add_target,
+            "setup.remove_target": self._remove_target,
+            "setup.clear_targets": self._clear_targets,
+            "setup.set_instruction": self._set_instruction,
+            "setup.configure": self._configure_setup,
+            "setup.start": self._start,
+            "setup.confirm_mount": self._confirm_mount,
+            "config.update": self._update_config,
+            "routes.manage": self._manage_routes,
+            "notifications.manage": self._manage_notifications,
+            "storage.show": self._show_storage,
+            "agent.send_message": self._send_message,
+            "agent.stop": self._stop_agent,
+            "workspace.find": self._find_workspace,
+            "viewer.open": self._open_viewer,
+            "app.quit": self._quit,
+        }
+        for name, handler in handlers.items():
+            self.commands.register(name, handler)
+        for namespace in (
+            "attachments",
+            "mcp",
+            "notifications",
+            "paths",
+            "providers",
+            "scan",
+            "sessions",
+            "settings",
+        ):
+            self.commands.register_namespace(namespace, self._handle_workspace_command)
+
+    async def _handle_workspace_command(self, command: Command) -> dict[str, Any]:
+        return await self.workspace.handle(command.name, command.payload)
 
     def _on_notification(self, notification: Notification) -> None:
         """Surface actionable global events while retaining every event in the inbox."""
@@ -172,19 +195,17 @@ class ApplicationController:
             if current is not self.scan_loop:
                 self.scan_loop.call_soon_threadsafe(self._on_notification, notification)
                 return
-        if notification.event_type.startswith(
+        if notification.event_type == "model.progress":
+            self.recovery = {}
+        elif notification.event_type.startswith(
             ("model.", "runtime.route.", "security.credential", "agent.failed")
-        ):
-            self.recovery = (
-                {}
-                if notification.event_type.endswith("recovered")
-                else {
-                    "state": notification.event_type,
-                    "title": notification.title,
-                    "detail": notification.detail,
-                    "agent_id": notification.agent_id,
-                }
-            )
+        ) and not notification.event_type.endswith("recovered"):
+            self.recovery = {
+                "state": notification.event_type,
+                "title": notification.title,
+                "detail": notification.detail,
+                "agent_id": notification.agent_id,
+            }
         if self.notification_service.should_surface(notification):
             detail = f": {notification.detail}" if notification.detail else ""
             self._append_message(
@@ -226,11 +247,14 @@ class ApplicationController:
         *,
         report_state: ReportState | None = None,
         scan_loop: asyncio.AbstractEventLoop | None = None,
+        scan_context: ScanContext | None = None,
     ) -> None:
         if report_state is not None:
             self.report_state = report_state
         if scan_loop is not None:
             self.scan_loop = scan_loop
+        if scan_context is not None:
+            self.scan_context = scan_context
 
     def set_mcp_connections(self, roster: list[dict[str, Any]]) -> None:
         """Store the run's MCP connection roster and repaint.
@@ -276,213 +300,23 @@ class ApplicationController:
         self.messages = self.messages[-200:]
 
     def snapshot(self) -> dict[str, Any]:
-        """Return small mutable state; histories are streamed as collections."""
-        model = ""
-        api_key_configured = False
-        api_base = ""
-        reasoning_effort = "high"
-        streaming_enabled = True
-        prompt_cache = True
-        llm_timeout = 300
-        max_tool_calls_per_turn = 32
-        max_context_images = 3
-        editor_command = ""
-        with contextlib.suppress(Exception):
-            settings = load_settings()
-            editor_command = (
-                getattr(getattr(settings, "keyboard", None), "external_editor", None) or ""
-            )
-            model = (settings.llm.model or "").strip()
-            api_key_configured = bool((settings.llm.api_key or "").strip())
-            api_base = _display_api_base((settings.llm.api_base or "").strip())
-            reasoning_effort = settings.llm.reasoning_effort
-            streaming_enabled = not settings.llm.disable_streaming
-            prompt_cache = settings.llm.prompt_cache
-            llm_timeout = settings.llm.timeout
-            max_tool_calls_per_turn = settings.llm.max_tool_calls_per_turn
-            max_context_images = settings.runtime.max_context_images
-            routes = load_routes(
-                settings, selected=[self.selected_route] if self.selected_route else None
-            )
-            if routes:
-                selected = routes[0]
-                model = selected.model
-                api_key_configured = bool(
-                    selected.api_key_ref or selected.api_key_env or settings.llm.api_key
-                )
-                api_base = _display_api_base(selected.base_url or "")
-        usage: dict[str, Any] = {}
-        if self.report_state is not None:
-            usage = dict(self.report_state.get_total_llm_usage())
-        subscription = False
-        with contextlib.suppress(Exception):
-            subscription = is_subscription_run(self.report_state)
-        model_warning = ""
-        if model and not is_recommended_or_frontier_model(model):
-            model_warning = (
-                f"{model} is not a recommended frontier model. Pentest quality could be degraded."
-            )
-        route_health: list[dict[str, Any]] = []
-        if self.report_state is not None:
-            get_run_dir = getattr(self.report_state, "get_run_dir", None)
-            if callable(get_run_dir):
-                path = runtime_state_dir(get_run_dir()) / "routes.json"
-                with contextlib.suppress(OSError, ValueError, TypeError):
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    if isinstance(payload, dict) and isinstance(payload.get("routes"), list):
-                        route_health = payload["routes"][:32]
-        state = {
-            "setup_mode": self.setup_mode,
-            "scan_started": self.scan_started,
-            "scan_state": self.scan_state,
-            "targets": [
-                terminal_projection(target, max_string=128) for target in self.targets[:16]
-            ],
-            "target_ids": [self.target_id(target) for target in self.targets[:16]],
-            "target_count": len(self.targets),
-            "working_dir": str(Path.cwd()),
-            "pending_mount": self.pending_workspace_mount or "",
-            "instruction": terminal_projection(self.instruction, max_string=2 * 1024),
-            "scan_mode": self.scan_mode,
-            "max_budget_usd": self.max_budget_usd,
-            "max_turns": self.max_turns,
-            "max_agents": self.max_agents,
-            "scope_mode": self.scope_mode,
-            "diff_base": terminal_projection(self.diff_base, max_string=256),
-            "model": terminal_projection(model, max_string=256),
-            "model_warning": terminal_projection(model_warning, max_string=512),
-            # Credentials are write-only over the TUI protocol.  A snapshot
-            # reveals presence, never the key itself.
-            "api_key_configured": api_key_configured,
-            "api_base": terminal_projection(api_base, max_string=512),
-            "reasoning_effort": reasoning_effort,
-            "streaming_enabled": streaming_enabled,
-            "prompt_cache": prompt_cache,
-            "llm_timeout": llm_timeout,
-            "max_tool_calls_per_turn": max_tool_calls_per_turn,
-            "max_context_images": max_context_images,
-            "config_env_override": any(alias in os.environ for alias in _LLM_ENV_ALIASES),
-            "selected_route": terminal_projection(self.selected_route, max_string=128),
-            "notification_unread": self.notification_service.unread_count(),
-            "caido_url": terminal_projection(
-                getattr(self.report_state, "caido_url", None), max_string=1024
-            ),
-            "messages": [
-                {
-                    "id": str(message.get("id", ""))[:64],
-                    "text": terminal_projection(message.get("text", ""), max_string=256),
-                    "level": str(message.get("level", "info"))[:32],
-                }
-                for message in self.messages[-10:]
-            ],
-            "usage": terminal_projection(usage, max_string=256, max_items=20),
-            "route_health": terminal_projection(route_health, max_string=512, max_items=32),
-            "subscription": subscription,
-            "connections": [
-                {
-                    "name": terminal_projection(entry["name"], max_string=64),
-                    "tool_count": entry["tool_count"],
-                    "dead": entry["dead"],
-                }
-                for entry in self.mcp_connections[:32]
-            ],
-            "viewer_status": self.viewer_status,
-            "viewer_url": terminal_projection(self.viewer_url, max_string=1024),
-            "error": terminal_projection(
-                self.error
-                or (
-                    getattr(self.report_state, "run_record", {}).get("storage_error")
-                    if self.report_state
-                    else None
-                ),
-                max_string=2 * 1024,
-            ),
-            "attachments": terminal_projection(self.workspace.public_attachments()),
-            "recovery": terminal_projection(self.recovery),
-            "editor_command": editor_command,
-            "recent_runs": self.workspace.recent_sessions() if self.setup_mode else [],
-        }
-        return bounded_state_projection(state)
+        return self.projector.snapshot(self)
 
     def collection(self, name: str) -> list[dict[str, Any]]:
-        """Return one bounded terminal projection with stable item identities."""
-        if name == "agents":
-            return [
-                {
-                    key: terminal_projection(agent.get(key), max_string=256, max_items=5)
-                    for key in (
-                        "id",
-                        "name",
-                        "parent_id",
-                        "status",
-                        "wait_kind",
-                        "error_message",
-                        "created_at",
-                        "updated_at",
-                    )
-                    if key in agent
-                }
-                for agent in self.live_view.agents.values()
-            ]
-        if name == "events":
-            return [collection_item_projection(event) for event in self.live_view.events]
-        if name == "vulnerabilities":
-            reports = (
-                self.report_state.vulnerability_reports if self.report_state is not None else []
-            )[-MAX_TERMINAL_VULNERABILITIES:]
-            result: list[dict[str, Any]] = []
-            for index, report in enumerate(reports):
-                projected = collection_item_projection(report)
-                report_id = projected.get("id")
-                if not isinstance(report_id, str) or not report_id:
-                    projected["id"] = f"vulnerability-{index}"
-                result.append(projected)
-            return result
-        raise ValueError(f"Unknown collection: {name}")
+        return self.projector.collection(self, name)
 
     def collection_snapshot(self, name: str) -> tuple[int | None, list[dict[str, Any]]]:
-        """Return a collection cursor and complete bounded projection."""
-        if name == "events":
-            cursor, events = self.live_view.event_snapshot(limit=MAX_TERMINAL_EVENTS)
-            return cursor, [collection_item_projection(event) for event in events]
-        return None, self.collection(name)
+        return self.projector.collection_snapshot(self, name)
 
     def collection_changes(
         self,
         name: str,
         cursor: int,
     ) -> tuple[int, list[dict[str, Any]]]:
-        """Return event upserts since a monotonic source cursor."""
-        if name != "events":
-            raise ValueError(f"Collection {name!r} does not expose incremental changes")
-        next_cursor, events = self.live_view.event_changes_since(cursor)
-        return next_cursor, [
-            collection_item_projection(event) for event in events[-MAX_TERMINAL_EVENTS:]
-        ]
+        return self.projector.collection_changes(self, name, cursor)
 
     async def handle(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
-        handlers = {
-            "setup.add_target": self._add_target,
-            "setup.remove_target": self._remove_target,
-            "setup.clear_targets": self._clear_targets,
-            "setup.set_instruction": self._set_instruction,
-            "setup.configure": self._configure_setup,
-            "setup.start": self._start,
-            "setup.confirm_mount": self._confirm_mount,
-            "config.update": self._update_config,
-            "routes.manage": self._manage_routes,
-            "notifications.manage": self._manage_notifications,
-            "storage.show": self._show_storage,
-            "agent.send_message": self._send_message,
-            "agent.stop": self._stop_agent,
-            "workspace.find": self._find_workspace,
-            "viewer.open": self._open_viewer,
-            "app.quit": self._quit,
-        }
-        handler = handlers.get(command)
-        result = (
-            await handler(payload) if handler else await self.workspace.handle(command, payload)
-        )
+        result = await self.commands.dispatch(Command(command, dict(payload)))
         self.notify_changed()
         return result
 
@@ -782,8 +616,6 @@ class ApplicationController:
             if "LLM_API_BASE" in route_updates:
                 edited.base_url = route_updates["LLM_API_BASE"]
             if "LLM_API_KEY" in route_updates:
-                from uuid import uuid4
-
                 ref = f"route.{edited.name}.ui-{uuid4().hex[:12]}"
                 # A session edit must not overwrite a saved connection's credential.
                 get_secret_store().set(ref, str(route_updates["LLM_API_KEY"] or ""))
@@ -809,9 +641,9 @@ class ApplicationController:
                 or (selected and selected.api_key_ref)
                 or settings.llm.api_key
             ),
-            "api_base": _display_api_base(edited.base_url or "")
+            "api_base": display_api_base(edited.base_url or "")
             if edited is not None and route_updates
-            else _display_api_base(settings.llm.api_base or ""),
+            else display_api_base(settings.llm.api_base or ""),
             "reasoning_effort": settings.llm.reasoning_effort,
             "selected_route": self.selected_route,
         }
@@ -1028,13 +860,8 @@ class ApplicationController:
         }
 
     async def _open_viewer(self, _payload: dict[str, Any]) -> dict[str, Any]:
-        from strix.core.paths import runs_base_dir
-        from strix.interface.viewer.workspace import BrowserWorkspace
-
         if self.viewer_url:
             with contextlib.suppress(Exception):
-                from strix.interface.viewer.server import fresh_authorized_url
-
                 webbrowser.open(
                     fresh_authorized_url(self._viewer_httpd, self.viewer_url)
                     if self._viewer_httpd is not None
@@ -1042,14 +869,6 @@ class ApplicationController:
                 )
             return {"status": "running", "url": self.viewer_url}
         try:
-            from strix.interface.tui.backend.messages import (
-                send_user_message_to_agent,
-            )
-            from strix.interface.viewer.server import (
-                bundle_is_built,
-                serve,
-            )
-
             if not bundle_is_built():
                 self.viewer_status = "unavailable"
                 return {"status": self.viewer_status, "error": "Viewer UI not built"}
@@ -1151,23 +970,3 @@ class ApplicationController:
     def _require_setup_mutable(self) -> None:
         if not self.setup_mode or self.scan_started or self._start_in_progress:
             raise RuntimeError("Setup can no longer be changed after the scan starts")
-
-
-def _display_api_base(value: str) -> str:
-    """Project an API URL without query, fragment, or embedded credentials."""
-    if not value:
-        return ""
-    parsed = urlparse(value)
-    if not parsed.scheme or not parsed.hostname:
-        return ""
-    host = parsed.hostname
-    if ":" in host:
-        host = f"[{host}]"
-    with contextlib.suppress(ValueError):
-        if parsed.port is not None:
-            host += f":{parsed.port}"
-    return f"{parsed.scheme}://{host}{parsed.path}"
-
-
-# Compatibility name for existing transports and integrations.
-TuiController = ApplicationController

@@ -1,0 +1,39 @@
+"""Notification publication boundary."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Protocol
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+class NotificationPublisher(Protocol):
+    """Publish durable application incidents without exposing storage details."""
+
+    path: Path
+
+    def publish(self, event_type: str, **kwargs: Any) -> Any: ...
+
+    def configure_headless(self, **kwargs: Any) -> None: ...
+
+    def subscribe(self, callback: Any) -> Any: ...
+
+    def record_output(self, detail: str, **kwargs: Any) -> None: ...
+
+    def list(self, **kwargs: Any) -> list[Any]: ...
+
+    def get(self, notification_id: str) -> Any: ...
+
+    def mark_read(self, notification_id: str) -> bool: ...
+
+    def dismiss(self, notification_id: str) -> bool: ...
+
+    def clear_read(self) -> int: ...
+
+    def unread_count(self) -> int: ...
+
+    def set_preference(self, category: str, **kwargs: Any) -> None: ...
+
+    def should_surface(self, notification: Any) -> bool: ...

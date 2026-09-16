@@ -15,7 +15,6 @@ from agents import RunContextWrapper, function_tool
 from strix.core.agents import Status, coordinator_from_context
 from strix.core.execution import notify_parent_on_terminal
 from strix.core.hooks import LLM_TURN_KEY
-from strix.report.state import get_global_report_state
 from strix.skills import validate_requested_skills
 
 
@@ -29,19 +28,21 @@ def _ctx(ctx: RunContextWrapper) -> dict[str, Any]:
     return ctx.context if isinstance(ctx.context, dict) else {}
 
 
-def _filed_reports_by(agent_id: str) -> list[dict[str, Any]]:
+def _filed_reports_by(
+    agent_id: str,
+    report_state: Any | None,
+) -> list[dict[str, Any]]:
     """Vulnerability reports the agent actually filed, from report state.
 
     The narrative ``findings`` an agent hands to ``agent_finish`` is prose; a
     parent that wants to act on a child's work needs the report ids. Read them
     from the report state rather than trusting the child's description.
     """
-    state = get_global_report_state()
-    if state is None:
+    if report_state is None:
         return []
     filed: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for report in state.get_existing_vulnerabilities():
+    for report in report_state.get_existing_vulnerabilities():
         if report.get("agent_id") != agent_id:
             continue
         report_id = str(report.get("id") or "")
@@ -693,7 +694,8 @@ async def agent_finish(
             default=str,
         )
 
-    filed_reports = _filed_reports_by(me)
+    scan_context = inner.get("scan_context")
+    filed_reports = _filed_reports_by(me, getattr(scan_context, "report_state", None))
     filed_report_ids = [str(r.get("id")) for r in filed_reports]
 
     parent_notified = False

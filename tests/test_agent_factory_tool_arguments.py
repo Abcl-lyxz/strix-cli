@@ -10,7 +10,7 @@ from agents.tool import FunctionTool
 
 from strix.agents import factory
 from strix.tools.notes.tools import list_notes
-from strix.tools.reporting.tool import list_reports
+from strix.tools.reporting.queries import list_reports
 
 
 def _capturing_tool(

@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -19,7 +19,7 @@ from agents.models.interface import Model, ModelProvider
 
 from strix.llm.context_budget import context_window, count_tokens
 from strix.llm.error_envelope import error_envelope
-from strix.notifications import NotificationAction, notify
+from strix.notifications import NotificationAction
 from strix.resilience import full_jitter_delay, retry_after_seconds
 from strix.security import get_secret_store, redact_secrets, register_secret
 from strix.utils.secret_files import write_secret_text
@@ -36,6 +36,9 @@ if TYPE_CHECKING:
     from agents.tool import Tool
     from openai.types.responses.response_prompt_param import ResponsePromptParam
 
+    from strix.domain.routes import RouteConfig
+    from strix.ports.notifications import NotificationPublisher
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,103 +50,6 @@ RouteFailureKind = Literal[
     "incompatible",
     "fatal",
 ]
-
-
-@dataclass(slots=True)
-class RouteConfig:
-    """Persistable, non-secret route definition."""
-
-    name: str
-    model: str
-    base_url: str | None = None
-    priority: int = 1
-    max_concurrency: int = 2
-    rpm: int | None = None
-    tpm: int | None = None
-    enabled: bool = True
-    provider_id: str | None = None
-    adapter_id: str | None = None
-    transport: str | None = None
-    model_id: str | None = None
-    auth_scheme: str | None = None
-    context_window_tokens: int | None = None
-    max_output_tokens: int | None = None
-    metadata_source: str | None = None
-    metadata_confidence: str | None = None
-    metadata_refreshed_at: str | None = None
-    api_key_ref: str | None = None
-    headers_ref: str | None = None
-    api_key_env: str | None = field(default=None, repr=False, compare=False)
-    headers_env: str | None = field(default=None, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        self.name = self.name.strip()
-        self.model = self.model.strip()
-        if not self.name or len(self.name) > 80:
-            raise ValueError("route name must be 1-80 characters")
-        if not self.model:
-            raise ValueError("route model cannot be empty")
-        if self.priority < 1:
-            raise ValueError("route priority must be at least 1")
-        if self.max_concurrency < 1:
-            raise ValueError("route max_concurrency must be at least 1")
-        if self.rpm is not None and self.rpm < 1:
-            raise ValueError("route rpm must be at least 1")
-        if self.tpm is not None and self.tpm < 1:
-            raise ValueError("route tpm must be at least 1")
-        if self.context_window_tokens is not None and self.context_window_tokens < 1:
-            raise ValueError("route context_window_tokens must be positive")
-        if self.max_output_tokens is not None and self.max_output_tokens < 1:
-            raise ValueError("route max_output_tokens must be positive")
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any], *, allow_env: bool = False) -> RouteConfig:
-        # Explicitly reject likely literal secrets in route files/config.
-        forbidden = value.keys() & {"api_key", "key", "token", "headers"}
-        if forbidden:
-            raise ValueError(
-                "route files cannot contain literal secrets; use an environment reference"
-            )
-        allowed = {
-            "name",
-            "model",
-            "base_url",
-            "priority",
-            "max_concurrency",
-            "rpm",
-            "tpm",
-            "enabled",
-            "provider_id",
-            "adapter_id",
-            "transport",
-            "model_id",
-            "auth_scheme",
-            "context_window_tokens",
-            "max_output_tokens",
-            "metadata_source",
-            "metadata_confidence",
-            "metadata_refreshed_at",
-            "api_key_ref",
-            "headers_ref",
-        }
-        if allow_env:
-            allowed.update({"api_key_env", "headers_env"})
-        extra = value.keys() - allowed
-        if extra:
-            raise ValueError(f"unsupported route fields: {', '.join(sorted(extra))}")
-        return cls(**{key: value[key] for key in allowed if key in value})
-
-    def to_dict(self) -> dict[str, Any]:
-        result = asdict(self)
-        result.pop("api_key_env", None)
-        result.pop("headers_env", None)
-        return {key: value for key, value in result.items() if value is not None}
-
-    def public_dict(self) -> dict[str, Any]:
-        result = self.to_dict()
-        result["has_api_key"] = bool(self.api_key_ref or self.api_key_env)
-        result["has_headers"] = bool(self.headers_ref or self.headers_env)
-        return result
 
 
 @dataclass(slots=True)
@@ -244,6 +150,7 @@ class RoutePool:
         route_reloader: Callable[[], tuple[object, list[RouteConfig]]] | None = None,
         stream_idle_timeout: float = 300.0,
         max_attempts_per_route: int = 2,
+        notifications: NotificationPublisher | None = None,
     ) -> None:
         enabled = [route for route in routes if route.enabled]
         if not enabled:
@@ -263,7 +170,16 @@ class RoutePool:
         self._route_revision: object | None = None
         self.stream_idle_timeout = max(0.0, stream_idle_timeout)
         self.max_attempts_per_route = max(1, max_attempts_per_route)
+        self._notifications = notifications
         self._restore_health()
+
+    def _notify(self, event_type: str, **kwargs: Any) -> None:
+        if self._notifications is None:
+            return
+        try:
+            self._notifications.publish(event_type, **kwargs)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            logger.exception("notification publication failed for %s", event_type)
 
     @property
     def route_models(self) -> tuple[str, ...]:
@@ -413,7 +329,7 @@ class RoutePool:
                             and _explicitly_lacks_tool_support(state.config.model)
                         ):
                             state.disabled_for_run = True
-                            notify(
+                            self._notify(
                                 "runtime.route.incompatible",
                                 title=f"Route {state.config.name} does not support tools",
                                 severity="error",
@@ -612,7 +528,7 @@ class RoutePool:
                     )
                 state.successful_turns += 1
                 if recovered:
-                    notify(
+                    self._notify(
                         "runtime.route.recovered",
                         title=f"Route {state.config.name} recovered",
                         severity="info",
@@ -658,7 +574,7 @@ class RoutePool:
                 retry_after=retry_after_seconds(error),
             )
             state.cooldown_until = time.monotonic() + max(0.25, delay)
-            notify(
+            self._notify(
                 "runtime.route.cooldown",
                 title=f"Route {state.config.name} is cooling down",
                 detail=safe_error,
@@ -671,7 +587,7 @@ class RoutePool:
         elif kind == "authentication":
             state.probe_in_flight = False
             state.blocked_reason = "credential, quota, or billing failure"
-            notify(
+            self._notify(
                 "security.credential_required",
                 title=f"Route {state.config.name} needs attention",
                 detail=safe_error,
@@ -684,7 +600,7 @@ class RoutePool:
         elif kind == "incompatible":
             state.probe_in_flight = False
             state.disabled_for_run = True
-            notify(
+            self._notify(
                 "runtime.route.incompatible",
                 title=f"Route {state.config.name} is incompatible with this scan",
                 detail=safe_error,

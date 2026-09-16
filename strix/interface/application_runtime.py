@@ -13,21 +13,23 @@ import time
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from strix.bootstrap import create_scan_context
 from strix.config import load_settings
 from strix.config.routes import load_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS
 from strix.core.agents import AgentCoordinator
 from strix.core.hooks import BudgetExceededError
-from strix.core.ownership import RunLease
-from strix.core.paths import run_dir_for
+from strix.core.ownership import RunLease, run_is_active
+from strix.core.paths import run_dir_for, runs_base_dir, runtime_state_dir
 from strix.core.runner import run_strix_scan
-from strix.interface.application import ApplicationController as TuiController
+from strix.interface.application import ApplicationController
 from strix.interface.output import WorkspaceOutput
 from strix.interface.scan_setup import (
     build_targets_info,
     preflight_model_connection,
     prepare_run,
 )
+from strix.interface.targets import read_workspace_files
 from strix.interface.tui.backend.live_view import TuiLiveView
 from strix.interface.tui.backend.server import TuiBackendServer
 from strix.interface.tui.sidecar import (
@@ -40,9 +42,8 @@ from strix.interface.tui.sidecar import (
     tui_source_dir,
     wait_process,
 )
-from strix.interface.utils import read_workspace_files
 from strix.llm.errors import classify_model_failure
-from strix.report.state import ReportState, set_global_report_state
+from strix.report.state import ReportState
 from strix.routing import resolve_route_secrets
 from strix.telemetry import report_error, set_scan_phase
 from strix.utils.resource_paths import get_strix_resource_path
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
     import argparse
     import socket
     import subprocess
+
+    from strix.application.context import ScanContext
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,7 @@ class WorkspaceRuntime:
             max_active_agents=getattr(args, "max_agents", DEFAULT_MAX_AGENTS)
         )
         self.report_state: ReportState | None = None
+        self.scan_context: ScanContext | None = None
         self.scan_config: dict[str, Any] = {}
         self.scan_task: asyncio.Task[None] | None = None
         self.run_lease: RunLease | None = None
@@ -93,7 +97,7 @@ class WorkspaceRuntime:
         self._preflight_failure: str | None = None
         self._preflight_failure_connection: tuple[str, str, str] | None = None
         self._preflight_retry_at = 0.0
-        self.controller = TuiController(
+        self.controller = ApplicationController(
             args,
             live_view=self.live_view,
             coordinator=self.coordinator,
@@ -101,6 +105,7 @@ class WorkspaceRuntime:
             on_verify=self.ensure_model_verified,
             on_quit=self.quit,
         )
+        self.coordinator.set_notification_publisher(self.controller.services.notifications)
         self.controller.workspace.runtime = self
 
     async def new_session(self, resume: str = "") -> None:  # noqa: PLR0915 - reset all scan-owned state
@@ -108,9 +113,6 @@ class WorkspaceRuntime:
         if self.scan_task is not None and not self.scan_task.done():
             raise RuntimeError("Stop the active scan before starting or resuming another")
         if resume:
-            from strix.core.ownership import run_is_active
-            from strix.core.paths import runs_base_dir
-
             root = runs_base_dir().resolve()
             run = (root / resume).resolve()
             if run.parent != root or not (run / "run.json").is_file():
@@ -126,10 +128,12 @@ class WorkspaceRuntime:
         self._preflight_failure_connection = None
         self._preflight_retry_at = 0.0
         self.coordinator = AgentCoordinator(max_active_agents=self.controller.max_agents)
+        self.coordinator.set_notification_publisher(self.controller.services.notifications)
         self.live_view = TuiLiveView()
         self.controller.coordinator = self.coordinator
         self.controller.live_view = self.live_view
         self.controller.report_state = None
+        self.controller.scan_context = None
         self.controller.scan_started = False
         self.controller.setup_mode = True
         self.controller.scan_state = "setup"
@@ -156,6 +160,7 @@ class WorkspaceRuntime:
         self.args.local_sources = []
         self.args.diff_scope = {"active": False}
         self.report_state = None
+        self.scan_context = None
         if resume:
             self.args.resume = resume
             self.args.run_name = resume
@@ -207,11 +212,18 @@ class WorkspaceRuntime:
         self.report_state.hydrate_from_run_dir()
         self.report_state.set_scan_config(self.scan_config)
         self.report_state.save_run_data()
-        set_global_report_state(self.report_state)
+        self.scan_context = create_scan_context(
+            scan_id=self.scan_config["run_name"],
+            run_dir=self.report_state.get_run_dir(),
+            state_dir=runtime_state_dir(self.report_state.get_run_dir()),
+            report_state=self.report_state,
+            services=self.controller.services,
+        )
         self.live_view.hydrate_from_run_dir(self.report_state.get_run_dir())
         self.controller.set_runtime(
             report_state=self.report_state,
             scan_loop=asyncio.get_running_loop(),
+            scan_context=self.scan_context,
         )
         self.report_state.vulnerability_found_callback = lambda _report: (
             self.controller.notify_changed()
@@ -417,6 +429,7 @@ class WorkspaceRuntime:
                 max_budget_usd=self.args.max_budget_usd,
                 event_sink=self.capture_event,
                 mcp_status_sink=self.capture_mcp_status,
+                scan_context=self.scan_context,
             )
             await self._sync_agent_state()
             if self.controller.scan_state == "running":
@@ -446,7 +459,7 @@ class WorkspaceRuntime:
 
     def capture_event(self, agent_id: str, event: Any) -> None:
         data = getattr(event, "data", None)
-        if getattr(data, "type", "") in {"response.output_text.delta", "response.completed"}:
+        if getattr(data, "type", "") == "response.completed":
             self.controller.recovery = {}
         self.live_view.ingest_sdk_event(agent_id, event)
         self.controller.notify_changed()
@@ -642,7 +655,7 @@ class GoTuiRuntime(WorkspaceRuntime):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    async def run(self) -> None:
+    async def run(self) -> ReportState | None:
         # Redirect the process's sys.stdout/sys.stderr while the TUI runs so
         # logging handlers created during the scan never paint over the Go
         # TUI's alt screen. The child still inherits the real terminal fds;
@@ -698,7 +711,8 @@ class GoTuiRuntime(WorkspaceRuntime):
         # exited cleanly so the CLI reports it instead of exiting 0.
         if self.scan_error is not None:
             raise self.scan_error
+        return self.report_state
 
 
-async def run_go_tui(args: argparse.Namespace) -> None:
-    await GoTuiRuntime(args).run()
+async def run_go_tui(args: argparse.Namespace) -> ReportState | None:
+    return await GoTuiRuntime(args).run()

@@ -25,10 +25,11 @@ from strix.config.routes import (
     set_route_enabled,
     set_route_key,
 )
+from strix.domain.routes import RouteConfig
 from strix.intel import refresh_intelligence
 from strix.intel import status as intelligence_status
-from strix.notifications import Notification, get_notification_service, notify
-from strix.routing import RouteConfig, RoutedModel, RoutePool
+from strix.notifications import Notification, NotificationService, notify
+from strix.routing import RoutedModel, RoutePool
 from strix.security import get_secret_store
 from strix.tools.mcp.loader import load_user_mcp_configs
 
@@ -258,7 +259,7 @@ def run_notifications(argv: list[str]) -> int:
         action_parser.add_argument("id")
     sub.add_parser("clear")
     args = parser.parse_args(argv)
-    service = get_notification_service()
+    service = NotificationService()
     console = Console()
     if args.command == "list":
         notifications = service.list(

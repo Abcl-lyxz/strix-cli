@@ -8,13 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 from agents.lifecycle import RunHooks
 
-from strix.report.state import get_global_report_state
+from strix.report.costs import streamed_openrouter_costs
 
 
 if TYPE_CHECKING:
     from agents import RunContextWrapper
     from agents.agent import Agent
     from agents.items import ModelResponse, TResponseInputItem
+
+    from strix.ports.reporting import UsageRepository
 
 
 logger = logging.getLogger(__name__)
@@ -121,6 +123,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         max_budget_usd: float | None = None,
         max_turns: int | None = None,
         interactive: bool = False,
+        usage_repository: UsageRepository | None = None,
     ) -> None:
         if max_budget_usd is not None and (
             not math.isfinite(max_budget_usd) or max_budget_usd <= 0
@@ -133,6 +136,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         self._budget_increment = max_budget_usd
         self._max_turns = max_turns
         self._interactive = interactive
+        self._usage_repository = usage_repository
 
     def extend_budget(self) -> None:
         if self._max_budget_usd is None or self._budget_increment is None:
@@ -184,7 +188,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
     ) -> None:
         if self._max_budget_usd is None:
             return
-        report_state = get_global_report_state()
+        report_state = self._usage_repository
         if report_state is None:
             return
         cost = report_state.get_total_llm_cost()
@@ -228,7 +232,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         agent: Agent[dict[str, Any]],
         response: ModelResponse,
     ) -> None:
-        report_state = get_global_report_state()
+        report_state = self._usage_repository
         if report_state is None:
             return
 
@@ -250,6 +254,9 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
                 route=actual_route if isinstance(actual_route, str) else None,
                 usage=response.usage,
             )
+            observed_cost = streamed_openrouter_costs.take(response)
+            if observed_cost is not None:
+                report_state.record_observed_llm_cost(observed_cost)
         except Exception:
             logger.exception("failed to record SDK usage for agent %s", agent_id)
 

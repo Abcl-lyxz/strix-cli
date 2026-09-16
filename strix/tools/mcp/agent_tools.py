@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Any
 
 from agents import RunContextWrapper, function_tool
 
-from strix.tools.mcp.client import _errored_tool_output
 from strix.tools.mcp.naming import namespaced_tool_name
 from strix.tools.mcp.registry import MCP_REGISTRY_CONTEXT_KEY, McpRegistry
 from strix.tools.mcp.session import McpConnectionUnavailableError
+from strix.tools.mcp.transport import errored_tool_output
 
 
 if TYPE_CHECKING:
@@ -164,7 +164,7 @@ async def call_mcp(
     try:
         available = await entry.session.list_tools()
     except McpConnectionUnavailableError as exc:
-        return _errored_tool_output(str(exc))
+        return errored_tool_output(str(exc))
     valid_names = {mcp_tool.name for mcp_tool in available}
     if tool not in valid_names:
         offered = ", ".join(sorted(valid_names)) or "(none)"

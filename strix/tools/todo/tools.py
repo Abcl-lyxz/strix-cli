@@ -3,22 +3,17 @@
 from __future__ import annotations
 
 import json
-import logging
-import threading
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from agents import RunContextWrapper, function_tool
 
-from strix.utils.atomic import atomic_write_text
+from strix.tools.artifacts import artifact_store_from_tool
 
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
-
-logger = logging.getLogger(__name__)
+    from strix.ports.artifacts import ArtifactRepository
 
 
 VALID_PRIORITIES = ["low", "normal", "high", "critical"]
@@ -36,69 +31,19 @@ def _todo_sort_key(todo: dict[str, Any]) -> tuple[int, int, str]:
     )
 
 
-_todos_storage: dict[str, dict[str, dict[str, Any]]] = {}
-
-_todos_path: Path | None = None
-_todos_io_lock = threading.RLock()
-
-
-def hydrate_todos_from_disk(state_dir: Path) -> None:
-    global _todos_path  # noqa: PLW0603
-    _todos_path = state_dir / "todos.json"
-    with _todos_io_lock:
-        _todos_storage.clear()
-        if not _todos_path.exists():
-            return
-        try:
-            data = json.loads(_todos_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.exception(
-                "todos.json at %s is unreadable; starting with empty todos",
-                _todos_path,
-            )
-            return
-        if not isinstance(data, dict):
-            return
-        loaded = 0
-        for aid, by_id in data.items():
-            if not isinstance(aid, str) or not isinstance(by_id, dict):
-                continue
-            cleaned = {
-                str(tid): t
-                for tid, t in by_id.items()
-                if isinstance(tid, str) and isinstance(t, dict)
-            }
-            if cleaned:
-                _todos_storage[aid] = cleaned
-                loaded += len(cleaned)
-        logger.info(
-            "todos hydrated from %s (%d agent(s), %d todo(s))",
-            _todos_path,
-            len(_todos_storage),
-            loaded,
-        )
-
-
-def _persist() -> None:
-    path = _todos_path
-    if path is None:
-        return
-    try:
-        with _todos_io_lock:
-            atomic_write_text(
-                path, lambda: json.dumps(_todos_storage, ensure_ascii=False, default=str)
-            )
-    except Exception:
-        logger.exception("todos persist to %s failed", path)
-
-
 def _agent_id_from(ctx: RunContextWrapper) -> str:
     inner = ctx.context if isinstance(ctx.context, dict) else {}
     return str(inner.get("agent_id") or "default")
 
 
-def _get_agent_todos(agent_id: str) -> dict[str, dict[str, Any]]:
-    return _todos_storage.setdefault(agent_id, {})
+def _get_agent_todos(
+    store: ArtifactRepository, agent_id: str
+) -> dict[str, dict[str, Any]]:
+    todos = store.data.setdefault(agent_id, {})
+    if not isinstance(todos, dict):
+        todos = {}
+        store.data[agent_id] = todos
+    return todos
 
 
 def _normalize_priority(priority: str | None, default: str = "normal") -> str:
@@ -115,9 +60,10 @@ def _coerce_priority(priority: str | None, default: str = "normal") -> str:
         return default
 
 
-def _sorted_todos(agent_id: str) -> list[dict[str, Any]]:
+def _sorted_todos(store: ArtifactRepository, agent_id: str) -> list[dict[str, Any]]:
     todos_list = [
-        {**todo, "todo_id": todo_id} for todo_id, todo in _get_agent_todos(agent_id).items()
+        {**todo, "todo_id": todo_id}
+        for todo_id, todo in _get_agent_todos(store, agent_id).items()
     ]
     todos_list.sort(key=_todo_sort_key)
     return todos_list
@@ -296,6 +242,7 @@ async def create_todo(ctx: RunContextWrapper, todos: str) -> str:
         ``skipped``.
     """
     agent_id = _agent_id_from(ctx)
+    store = artifact_store_from_tool(ctx, "todos")
     try:
         tasks = _normalize_bulk_todos(todos)
         if not tasks:
@@ -305,7 +252,7 @@ async def create_todo(ctx: RunContextWrapper, todos: str) -> str:
                 default=str,
             )
 
-        agent_todos = _get_agent_todos(agent_id)
+        agent_todos = _get_agent_todos(store, agent_id)
         seen = {todo["title"].strip().lower() for todo in agent_todos.values()}
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
@@ -336,15 +283,15 @@ async def create_todo(ctx: RunContextWrapper, todos: str) -> str:
             default=str,
         )
 
-    _persist()
+    store.persist()
     return json.dumps(
         {
             "success": True,
             "created": created,
             "created_count": len(created),
             "skipped": skipped,
-            "todos": _sorted_todos(agent_id),
-            "total_count": len(_get_agent_todos(agent_id)),
+            "todos": _sorted_todos(store, agent_id),
+            "total_count": len(_get_agent_todos(store, agent_id)),
         },
         ensure_ascii=False,
         default=str,
@@ -368,8 +315,9 @@ async def list_todos(
             ``"critical"``.
     """
     agent_id = _agent_id_from(ctx)
+    store = artifact_store_from_tool(ctx, "todos")
     try:
-        agent_todos = _get_agent_todos(agent_id)
+        agent_todos = _get_agent_todos(store, agent_id)
         status_filter = status.lower() if isinstance(status, str) else None
         priority_filter = priority.lower() if isinstance(priority, str) else None
 
@@ -446,8 +394,9 @@ async def update_todo(ctx: RunContextWrapper, updates: str) -> str:
             "priority": "high"}]``.
     """
     agent_id = _agent_id_from(ctx)
+    store = artifact_store_from_tool(ctx, "todos")
     try:
-        agent_todos = _get_agent_todos(agent_id)
+        agent_todos = _get_agent_todos(store, agent_id)
         updates_to_apply = _normalize_bulk_updates(updates)
         if not updates_to_apply:
             return json.dumps(
@@ -475,12 +424,12 @@ async def update_todo(ctx: RunContextWrapper, updates: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False, default=str)
 
     if updated:
-        _persist()
+        store.persist()
     response: dict[str, Any] = {
         "success": len(errors) == 0,
         "updated": updated,
         "updated_count": len(updated),
-        "todos": _sorted_todos(agent_id),
+        "todos": _sorted_todos(store, agent_id),
         "total_count": len(agent_todos),
     }
     if errors:
@@ -488,9 +437,11 @@ async def update_todo(ctx: RunContextWrapper, updates: str) -> str:
     return json.dumps(response, ensure_ascii=False, default=str)
 
 
-def _mark(*, agent_id: str, todo_ids: str, new_status: str) -> str:
+def _mark(
+    *, store: ArtifactRepository, agent_id: str, todo_ids: str, new_status: str
+) -> str:
     try:
-        agent_todos = _get_agent_todos(agent_id)
+        agent_todos = _get_agent_todos(store, agent_id)
         ids = _normalize_todo_ids(todo_ids)
         if not ids:
             msg = f"Provide a non-empty 'todo_ids' list to mark as {new_status}"
@@ -512,13 +463,13 @@ def _mark(*, agent_id: str, todo_ids: str, new_status: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False, default=str)
 
     if marked:
-        _persist()
+        store.persist()
     response: dict[str, Any] = {
         "success": len(errors) == 0,
         "marked": marked,
         "marked_count": len(marked),
         "new_status": new_status,
-        "todos": _sorted_todos(agent_id),
+        "todos": _sorted_todos(store, agent_id),
         "total_count": len(agent_todos),
     }
     if errors:
@@ -536,7 +487,12 @@ async def mark_todo_done(ctx: RunContextWrapper, todo_ids: str) -> str:
         todo_ids: JSON array of todo IDs to mark done. For one todo,
             pass a one-item list.
     """
-    return _mark(agent_id=_agent_id_from(ctx), todo_ids=todo_ids, new_status="done")
+    return _mark(
+        store=artifact_store_from_tool(ctx, "todos"),
+        agent_id=_agent_id_from(ctx),
+        todo_ids=todo_ids,
+        new_status="done",
+    )
 
 
 @function_tool(timeout=30)
@@ -549,7 +505,12 @@ async def mark_todo_pending(ctx: RunContextWrapper, todo_ids: str) -> str:
         todo_ids: JSON array of todo IDs to reset to pending. For one
             todo, pass a one-item list.
     """
-    return _mark(agent_id=_agent_id_from(ctx), todo_ids=todo_ids, new_status="pending")
+    return _mark(
+        store=artifact_store_from_tool(ctx, "todos"),
+        agent_id=_agent_id_from(ctx),
+        todo_ids=todo_ids,
+        new_status="pending",
+    )
 
 
 @function_tool(timeout=30)
@@ -563,8 +524,9 @@ async def delete_todo(ctx: RunContextWrapper, todo_ids: str) -> str:
             a one-item list.
     """
     agent_id = _agent_id_from(ctx)
+    store = artifact_store_from_tool(ctx, "todos")
     try:
-        agent_todos = _get_agent_todos(agent_id)
+        agent_todos = _get_agent_todos(store, agent_id)
         ids = _normalize_todo_ids(todo_ids)
         if not ids:
             return json.dumps(
@@ -585,12 +547,12 @@ async def delete_todo(ctx: RunContextWrapper, todo_ids: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False, default=str)
 
     if deleted:
-        _persist()
+        store.persist()
     response: dict[str, Any] = {
         "success": len(errors) == 0,
         "deleted": deleted,
         "deleted_count": len(deleted),
-        "todos": _sorted_todos(agent_id),
+        "todos": _sorted_todos(store, agent_id),
         "total_count": len(agent_todos),
     }
     if errors:

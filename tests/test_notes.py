@@ -8,23 +8,21 @@ from typing import TYPE_CHECKING
 import pytest
 
 import strix.tools.notes.tools as notes_tools
+from strix.adapters.artifacts import JsonArtifactStore
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from pathlib import Path
 
 
-@pytest.fixture(autouse=True)
-def _reset_notes_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setattr(notes_tools, "_notes_path", None)
-    with notes_tools._notes_lock:
-        notes_tools._notes_storage.clear()
-    yield
-    with notes_tools._notes_lock:
-        notes_tools._notes_storage.clear()
+@pytest.fixture
+def note_store(tmp_path: Path) -> JsonArtifactStore:
+    return JsonArtifactStore(tmp_path / "notes.json")
 
 
-def test_create_note_retries_on_note_id_collision(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_note_retries_on_note_id_collision(
+    monkeypatch: pytest.MonkeyPatch, note_store: JsonArtifactStore
+) -> None:
     generated_ids = iter(
         [
             uuid.UUID("abcdef00-0000-4000-8000-000000000000"),
@@ -34,50 +32,56 @@ def test_create_note_retries_on_note_id_collision(monkeypatch: pytest.MonkeyPatc
     )
     monkeypatch.setattr("strix.tools.notes.tools.uuid.uuid4", lambda: next(generated_ids))
 
-    first = notes_tools._create_note_impl("first", "original content")
-    second = notes_tools._create_note_impl("second", "new content")
+    first = notes_tools._create_note_impl(note_store, "first", "original content")
+    second = notes_tools._create_note_impl(note_store, "second", "new content")
 
     assert first["success"] is True
     assert first["note_id"] == "abcdef"
     assert second["success"] is True
     assert second["note_id"] == "123456"
     assert second["total_count"] == 2
-    assert notes_tools._notes_storage["abcdef"]["content"] == "original content"
-    assert notes_tools._notes_storage["123456"]["content"] == "new content"
+    assert note_store.data["abcdef"]["content"] == "original content"
+    assert note_store.data["123456"]["content"] == "new content"
 
 
 def test_create_note_returns_error_after_repeated_note_id_collisions(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, note_store: JsonArtifactStore
 ) -> None:
     monkeypatch.setattr(notes_tools, "_NOTE_ID_GENERATION_ATTEMPTS", 2)
     monkeypatch.setattr(
         "strix.tools.notes.tools.uuid.uuid4",
         lambda: uuid.UUID("abcdef00-0000-4000-8000-000000000000"),
     )
-    notes_tools._notes_storage["abcdef"] = {"content": "existing"}
+    note_store.data["abcdef"] = {"content": "existing"}
 
-    result = notes_tools._create_note_impl("second", "new content")
+    result = notes_tools._create_note_impl(note_store, "second", "new content")
 
     assert result == {
         "success": False,
         "error": "Failed to generate a unique note ID",
         "note_id": None,
     }
-    assert notes_tools._notes_storage == {"abcdef": {"content": "existing"}}
+    assert note_store.data == {"abcdef": {"content": "existing"}}
 
 
-def test_create_note_records_author() -> None:
-    result = notes_tools._create_note_impl("t", "c", agent_id="agent-1", agent_name="Agent One")
-    note = notes_tools._notes_storage[result["note_id"]]
+def test_create_note_records_author(note_store: JsonArtifactStore) -> None:
+    result = notes_tools._create_note_impl(
+        note_store, "t", "c", agent_id="agent-1", agent_name="Agent One"
+    )
+    note = note_store.data[result["note_id"]]
     assert note["agent_id"] == "agent-1"
     assert note["agent_name"] == "Agent One"
 
 
-def test_list_notes_exposes_author_and_flags_caller() -> None:
-    notes_tools._create_note_impl("mine", "c", agent_id="agent-1", agent_name="Agent One")
-    notes_tools._create_note_impl("theirs", "c", agent_id="agent-2", agent_name="Agent Two")
+def test_list_notes_exposes_author_and_flags_caller(note_store: JsonArtifactStore) -> None:
+    notes_tools._create_note_impl(
+        note_store, "mine", "c", agent_id="agent-1", agent_name="Agent One"
+    )
+    notes_tools._create_note_impl(
+        note_store, "theirs", "c", agent_id="agent-2", agent_name="Agent Two"
+    )
 
-    result = notes_tools._list_notes_impl(caller_agent_id="agent-1")
+    result = notes_tools._list_notes_impl(note_store, caller_agent_id="agent-1")
     by_title = {n["title"]: n for n in result["notes"]}
     assert by_title["mine"]["agent_name"] == "Agent One"
     assert by_title["mine"].get("by_you") is True
@@ -85,49 +89,57 @@ def test_list_notes_exposes_author_and_flags_caller() -> None:
     assert "by_you" not in by_title["theirs"]
 
 
-def test_list_notes_without_author_has_no_attribution() -> None:
-    notes_tools._create_note_impl("anon", "c")
-    entry = notes_tools._list_notes_impl(caller_agent_id="agent-1")["notes"][0]
+def test_list_notes_without_author_has_no_attribution(note_store: JsonArtifactStore) -> None:
+    notes_tools._create_note_impl(note_store, "anon", "c")
+    entry = notes_tools._list_notes_impl(note_store, caller_agent_id="agent-1")["notes"][0]
     assert "agent_name" not in entry
     assert "by_you" not in entry
 
 
-def test_get_note_flags_caller_ownership() -> None:
+def test_get_note_flags_caller_ownership(note_store: JsonArtifactStore) -> None:
     note_id = notes_tools._create_note_impl(
-        "mine", "c", agent_id="agent-1", agent_name="Agent One"
+        note_store, "mine", "c", agent_id="agent-1", agent_name="Agent One"
     )["note_id"]
-    mine = notes_tools._get_note_impl(note_id, caller_agent_id="agent-1")
+    mine = notes_tools._get_note_impl(note_store, note_id, caller_agent_id="agent-1")
     assert mine["note"].get("by_you") is True
     assert mine["note"]["agent_name"] == "Agent One"
-    theirs = notes_tools._get_note_impl(note_id, caller_agent_id="agent-9")
+    theirs = notes_tools._get_note_impl(note_store, note_id, caller_agent_id="agent-9")
     assert "by_you" not in theirs["note"]
 
 
 @pytest.mark.parametrize("nullish", ["null", "none", "NULL", " None ", "undefined", "nil"])
-def test_list_notes_ignores_nullish_filter_strings(nullish: str) -> None:
-    notes_tools._create_note_impl("recon", "content", category="findings", tags=["auth"])
-    notes_tools._create_note_impl("other", "content", category="general")
+def test_list_notes_ignores_nullish_filter_strings(
+    nullish: str, note_store: JsonArtifactStore
+) -> None:
+    notes_tools._create_note_impl(
+        note_store, "recon", "content", category="findings", tags=["auth"]
+    )
+    notes_tools._create_note_impl(note_store, "other", "content", category="general")
 
-    unfiltered = notes_tools._list_notes_impl()
+    unfiltered = notes_tools._list_notes_impl(note_store)
     assert unfiltered["filtered_count"] == 2
 
-    assert notes_tools._list_notes_impl(category=nullish) == unfiltered
-    assert notes_tools._list_notes_impl(search=nullish) == unfiltered
+    assert notes_tools._list_notes_impl(note_store, category=nullish) == unfiltered
+    assert notes_tools._list_notes_impl(note_store, search=nullish) == unfiltered
 
 
 @pytest.mark.parametrize("tag", ["null", "none"])
-def test_list_notes_filters_on_a_literal_nullish_tag(tag: str) -> None:
-    notes_tools._create_note_impl("tagged", "content", tags=[tag])
-    notes_tools._create_note_impl("other", "content", tags=["auth"])
+def test_list_notes_filters_on_a_literal_nullish_tag(
+    tag: str, note_store: JsonArtifactStore
+) -> None:
+    notes_tools._create_note_impl(note_store, "tagged", "content", tags=[tag])
+    notes_tools._create_note_impl(note_store, "other", "content", tags=["auth"])
 
-    assert [n["title"] for n in notes_tools._list_notes_impl(tags=[tag])["notes"]] == ["tagged"]
-    mixed = notes_tools._list_notes_impl(tags=[tag, "auth"])
+    assert [
+        n["title"] for n in notes_tools._list_notes_impl(note_store, tags=[tag])["notes"]
+    ] == ["tagged"]
+    mixed = notes_tools._list_notes_impl(note_store, tags=[tag, "auth"])
     assert sorted(n["title"] for n in mixed["notes"]) == ["other", "tagged"]
 
 
-def test_list_notes_still_filters_on_real_values() -> None:
-    notes_tools._create_note_impl("recon", "content", category="findings")
-    notes_tools._create_note_impl("other", "content", category="general")
+def test_list_notes_still_filters_on_real_values(note_store: JsonArtifactStore) -> None:
+    notes_tools._create_note_impl(note_store, "recon", "content", category="findings")
+    notes_tools._create_note_impl(note_store, "other", "content", category="general")
 
-    result = notes_tools._list_notes_impl(category="findings")
+    result = notes_tools._list_notes_impl(note_store, category="findings")
     assert [n["title"] for n in result["notes"]] == ["recon"]

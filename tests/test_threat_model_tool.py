@@ -8,15 +8,20 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from strix.adapters.artifacts import JsonArtifactStore
 from strix.agents.factory import _BASE_TOOLS
-from strix.tools.threat_model import tools as threat_model_tools
 from strix.tools.threat_model.tools import (
-    _amend_impl,
-    _get_impl,
-    _save_impl,
+    _amend_impl as _amend_store,
+)
+from strix.tools.threat_model.tools import (
+    _get_impl as _get_store,
+)
+from strix.tools.threat_model.tools import (
+    _save_impl as _save_store,
+)
+from strix.tools.threat_model.tools import (
     amend_threat_model,
     get_threat_model,
-    hydrate_threat_models_from_disk,
     save_threat_model,
 )
 
@@ -65,11 +70,41 @@ def _make_repo(tmp_path: Path, name: str = "repo") -> Path:
     return repo
 
 
+_STORE: JsonArtifactStore
+
+
+def hydrate_threat_models_from_disk(state_dir: Path) -> JsonArtifactStore:
+    global _STORE  # noqa: PLW0603 - test fixture selects the active repository
+    _STORE = JsonArtifactStore.hydrate(state_dir / "threat_models.json")
+    return _STORE
+
+
+def _get_impl(target: str, scan_targets: list[str] | None = None) -> dict[str, object]:
+    return _get_store(_STORE, target, scan_targets)
+
+
+def _save_impl(
+    target: str,
+    content: str,
+    agent_name: str | None,
+    scan_targets: list[str] | None = None,
+) -> dict[str, object]:
+    return _save_store(_STORE, target, content, agent_name, scan_targets)
+
+
+def _amend_impl(
+    target: str,
+    addendum: str,
+    agent_name: str | None,
+    scan_targets: list[str] | None = None,
+) -> dict[str, object]:
+    return _amend_store(_STORE, target, addendum, agent_name, scan_targets)
+
+
 @pytest.fixture(autouse=True)
-def _empty_store() -> None:
-    """Each test is its own run, so it starts with an empty, unmirrored store."""
-    threat_model_tools._MODELS.clear()
-    threat_model_tools._store_path = None
+def _empty_store(tmp_path: Path) -> None:
+    """Each test is its own run, so it starts with an empty repository."""
+    hydrate_threat_models_from_disk(tmp_path / "unmirrored")
 
 
 def test_missing_model_reports_not_found(tmp_path: Path) -> None:
@@ -126,7 +161,6 @@ def test_resuming_the_same_run_keeps_the_model(tmp_path: Path) -> None:
     _save_impl(str(repo), _MODEL, "root")
     _amend_impl(str(repo), _ADDENDUM, "agent-a")
 
-    threat_model_tools._MODELS.clear()  # what the resuming process starts from
     hydrate_threat_models_from_disk(state_dir)
 
     result = _get_impl(str(repo))

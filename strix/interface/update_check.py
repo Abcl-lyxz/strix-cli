@@ -32,7 +32,6 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from strix.notifications import NotificationAction, notify
-from strix.report.state import get_global_report_state
 from strix.telemetry._common import get_version
 from strix.utils.atomic import atomic_write_text
 
@@ -63,13 +62,6 @@ def _source_checkout_root() -> Path | None:
         if (candidate / ".git").exists() and (candidate / "pyproject.toml").is_file()
         else None
     )
-
-
-def _active_scan() -> bool:
-    with contextlib.suppress(Exception):
-        report = get_global_report_state()
-        return bool(report is not None and report.run_record.get("status") == "running")
-    return False
 
 
 def _is_disabled() -> bool:
@@ -725,7 +717,10 @@ def _atomic_replace_with_rollback(current: Path, staged: Path) -> Path:
 
 
 def self_update(  # noqa: PLR0911
-    console: Console | None = None, version: str | None = None
+    console: Console | None = None,
+    version: str | None = None,
+    *,
+    scan_status: str | None = None,
 ) -> bool:
     """Replace the running standalone binary with the latest release.
 
@@ -734,7 +729,7 @@ def self_update(  # noqa: PLR0911
     """
     console = console or Console()
 
-    if _active_scan():
+    if scan_status == "running":
         console.print("[yellow]An update cannot be installed during an active scan.[/]")
         notify(
             "update.failed",

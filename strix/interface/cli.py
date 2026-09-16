@@ -13,20 +13,21 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from strix.bootstrap import create_app_services, create_scan_context
 from strix.config import load_settings
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.ownership import owned_cli
+from strix.core.paths import runtime_state_dir
 from strix.core.runner import run_strix_scan
-from strix.notifications import get_notification_service
-from strix.report.state import ReportState, set_global_report_state
+from strix.report.state import ReportState
 from strix.runtime import session_manager
 
-from .utils import (
+from .presentation import (
     build_live_stats_text,
     format_vulnerability_report,
     has_model_response,
-    read_workspace_files,
 )
+from .targets import read_workspace_files
 
 
 logger = logging.getLogger(__name__)
@@ -42,10 +43,11 @@ def _resolve_sandbox_image() -> str:
 
 
 @owned_cli
-async def run_cli(args: Any) -> None:  # noqa: PLR0915
+async def run_cli(args: Any) -> ReportState:  # noqa: PLR0915
     console = Console()
+    services = create_app_services()
     if bool(getattr(args, "non_interactive", False)):
-        get_notification_service().configure_headless(
+        services.notifications.configure_headless(
             enabled=True,
             structured=os.environ.get("STRIX_NOTIFICATION_FORMAT", "").lower() == "json",
         )
@@ -151,7 +153,13 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, signal_handler)
 
-    set_global_report_state(report_state)
+    scan_context = create_scan_context(
+        scan_id=args.run_name,
+        run_dir=report_state.get_run_dir(),
+        state_dir=runtime_state_dir(report_state.get_run_dir()),
+        report_state=report_state,
+        services=services,
+    )
 
     startup_phase: list[str] = ["Starting up"]
 
@@ -217,12 +225,13 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
                     max_turns=getattr(args, "max_turns", DEFAULT_MAX_TURNS),
                     max_agents=getattr(args, "max_agents", DEFAULT_MAX_AGENTS),
                     status_sink=_note_startup_phase,
+                    scan_context=scan_context,
                 )
             finally:
                 stop_updates.set()
                 update_thread.join(timeout=1)
                 with contextlib.suppress(Exception):
-                    await session_manager.cleanup(args.run_name)
+                    await session_manager.cleanup(args.run_name, scan_context)
 
     except Exception as e:
         console.print(f"[bold red]Error during penetration test:[/] {e}")
@@ -248,3 +257,4 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
 
         console.print(final_report_panel)
         console.print()
+    return report_state

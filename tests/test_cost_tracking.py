@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import litellm
 import pytest
@@ -14,11 +14,9 @@ from strix.config.models import (
     _configure_litellm_compatibility,
     _install_openrouter_stream_cost_capture,
 )
-from strix.report.state import (
-    ReportState,
+from strix.report.costs import (
     litellm_cost_callback,
     openrouter_stream_cost,
-    set_global_report_state,
     streamed_openrouter_costs,
 )
 
@@ -26,6 +24,11 @@ from strix.report.state import (
 @pytest.fixture(autouse=True)
 def _clear_streamed_costs() -> None:
     streamed_openrouter_costs.clear()
+
+
+def _captured_cost(kwargs: object, response: object) -> float | None:
+    litellm_cost_callback(kwargs, response)
+    return streamed_openrouter_costs.take(response)
 
 
 def test_streaming_logging_stays_enabled_for_cost_callback() -> None:
@@ -39,31 +42,22 @@ def test_streaming_logging_stays_enabled_for_cost_callback() -> None:
 
 
 def test_cost_callback_reads_openrouter_stream_usage_cost() -> None:
-    report_state = MagicMock()
     response = SimpleNamespace(
+        id="response-usage",
         usage=SimpleNamespace(cost=1.2345),
         _hidden_params={},
     )
-
-    with patch("strix.report.state.get_global_report_state", return_value=report_state):
-        litellm_cost_callback({"response_cost": None}, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(1.2345)
+    assert _captured_cost({"response_cost": None}, response) == pytest.approx(1.2345)
 
 
 def test_cost_callback_reads_usage_cost_from_mapping_response() -> None:
-    report_state = MagicMock()
-    response = {"usage": {"cost": 0.125}}
-
-    with patch("strix.report.state.get_global_report_state", return_value=report_state):
-        litellm_cost_callback({}, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(0.125)
+    response = {"id": "response-mapping", "usage": {"cost": 0.125}}
+    assert _captured_cost({}, response) == pytest.approx(0.125)
 
 
 def test_cost_callback_reads_byok_upstream_inference_cost() -> None:
-    report_state = MagicMock()
     response = SimpleNamespace(
+        id="response-byok",
         usage=SimpleNamespace(
             cost=0,
             is_byok=True,
@@ -72,15 +66,12 @@ def test_cost_callback_reads_byok_upstream_inference_cost() -> None:
         _hidden_params={},
     )
 
-    with patch("strix.report.state.get_global_report_state", return_value=report_state):
-        litellm_cost_callback({"response_cost": None}, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(6.75e-06)
+    assert _captured_cost({"response_cost": None}, response) == pytest.approx(6.75e-06)
 
 
 def test_cost_callback_sums_usage_cost_and_upstream_inference_cost() -> None:
-    report_state = MagicMock()
     response = {
+        "id": "response-byok-total",
         "usage": {
             "cost": 0.01,
             "is_byok": True,
@@ -88,15 +79,12 @@ def test_cost_callback_sums_usage_cost_and_upstream_inference_cost() -> None:
         }
     }
 
-    with patch("strix.report.state.get_global_report_state", return_value=report_state):
-        litellm_cost_callback({}, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(pytest.approx(0.21))
+    assert _captured_cost({}, response) == pytest.approx(0.21)
 
 
 def test_cost_callback_ignores_upstream_cost_for_non_byok_responses() -> None:
-    report_state = MagicMock()
     response = {
+        "id": "response-non-byok",
         "usage": {
             "cost": 0.05,
             "is_byok": False,
@@ -104,15 +92,14 @@ def test_cost_callback_ignores_upstream_cost_for_non_byok_responses() -> None:
         }
     }
 
-    with patch("strix.report.state.get_global_report_state", return_value=report_state):
-        litellm_cost_callback({}, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(0.05)
+    assert _captured_cost({}, response) == pytest.approx(0.05)
 
 
 def test_cost_callback_estimates_cost_with_provider_prefixed_model() -> None:
-    report_state = MagicMock()
-    response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    response = {
+        "id": "response-prefixed",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
     kwargs = {
         "response_cost": None,
         "model": "anthropic/claude-sonnet-4.5",
@@ -125,17 +112,16 @@ def test_cost_callback_estimates_cost_with_provider_prefixed_model() -> None:
         raise ValueError(kwargs["model"])
 
     with (
-        patch("strix.report.state.get_global_report_state", return_value=report_state),
         patch("litellm.completion_cost", side_effect=fake_completion_cost),
     ):
-        litellm_cost_callback(kwargs, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(0.5)
+        assert _captured_cost(kwargs, response) == pytest.approx(0.5)
 
 
 def test_cost_callback_estimates_cost_with_bare_model_fallback() -> None:
-    report_state = MagicMock()
-    response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    response = {
+        "id": "response-bare",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
     kwargs = {
         "response_cost": None,
         "model": "openai/gpt-4o-mini",
@@ -148,25 +134,21 @@ def test_cost_callback_estimates_cost_with_bare_model_fallback() -> None:
         raise ValueError(kwargs["model"])
 
     with (
-        patch("strix.report.state.get_global_report_state", return_value=report_state),
         patch("litellm.completion_cost", side_effect=fake_completion_cost),
     ):
-        litellm_cost_callback(kwargs, response)
-
-    report_state.record_observed_llm_cost.assert_called_once_with(0.025)
+        assert _captured_cost(kwargs, response) == pytest.approx(0.025)
 
 
 def test_cost_callback_records_nothing_when_no_cost_available() -> None:
-    report_state = MagicMock()
-    response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    response = {
+        "id": "response-unknown",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
 
     with (
-        patch("strix.report.state.get_global_report_state", return_value=report_state),
         patch("litellm.completion_cost", side_effect=ValueError("unknown model")),
     ):
-        litellm_cost_callback({"response_cost": None, "model": "x/y"}, response)
-
-    report_state.record_observed_llm_cost.assert_not_called()
+        assert _captured_cost({"response_cost": None, "model": "x/y"}, response) is None
 
 
 def test_openrouter_stream_cost_extracts_plain_and_byok_totals() -> None:
@@ -183,24 +165,21 @@ def test_openrouter_stream_cost_extracts_plain_and_byok_totals() -> None:
 
 
 def test_cost_callback_recovers_streamed_openrouter_cost_by_response_id() -> None:
-    report_state = MagicMock()
     streamed_openrouter_costs.remember("gen-abc", {"cost": 0.42})
     # LiteLLM strips cost from the rebuilt streamed usage; only the id survives.
     response = SimpleNamespace(id="gen-abc", usage=SimpleNamespace(cost=None), _hidden_params={})
 
     with (
-        patch("strix.report.state.get_global_report_state", return_value=report_state),
         patch("litellm.completion_cost", side_effect=ValueError("unknown model")),
     ):
         litellm_cost_callback({"response_cost": None, "model": "moonshotai/kimi-k3"}, response)
 
-    report_state.record_observed_llm_cost.assert_called_once_with(0.42)
-    # The entry is consumed so a later response cannot double-count it.
+    # The callback consumes the parser value and republishes it for the run hook.
+    assert streamed_openrouter_costs.take(response) == pytest.approx(0.42)
     assert streamed_openrouter_costs.take(response) is None
 
 
 def test_streamed_openrouter_cost_prefers_provider_report_over_estimate() -> None:
-    report_state = MagicMock()
     streamed_openrouter_costs.remember("gen-xyz", {"cost": 0.9})
     response = SimpleNamespace(
         id="gen-xyz",
@@ -209,12 +188,11 @@ def test_streamed_openrouter_cost_prefers_provider_report_over_estimate() -> Non
     )
 
     with (
-        patch("strix.report.state.get_global_report_state", return_value=report_state),
         patch("litellm.completion_cost", return_value=0.1) as estimate,
     ):
         litellm_cost_callback({"response_cost": None, "model": "moonshotai/kimi-k3"}, response)
 
-    report_state.record_observed_llm_cost.assert_called_once_with(0.9)
+    assert streamed_openrouter_costs.take(response) == pytest.approx(0.9)
     estimate.assert_not_called()
 
 
@@ -224,13 +202,10 @@ def test_streamed_openrouter_costs_ignores_entries_without_cost() -> None:
     assert streamed_openrouter_costs.take(SimpleNamespace(id="gen-none")) is None
 
 
-def test_streamed_openrouter_costs_cleared_on_new_run() -> None:
+def test_streamed_openrouter_costs_can_be_cleared_for_new_run() -> None:
     streamed_openrouter_costs.remember("gen-stale", {"cost": 0.7})
-    try:
-        set_global_report_state(ReportState.__new__(ReportState))
-        assert streamed_openrouter_costs.take(SimpleNamespace(id="gen-stale")) is None
-    finally:
-        set_global_report_state(None)
+    streamed_openrouter_costs.clear()
+    assert streamed_openrouter_costs.take(SimpleNamespace(id="gen-stale")) is None
 
 
 def test_openrouter_stream_handler_records_cost() -> None:

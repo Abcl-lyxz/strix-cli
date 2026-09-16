@@ -14,8 +14,8 @@ from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData
 
 from strix.tools.mcp import BearerAuth, McpConnectionConfig
-from strix.tools.mcp import client as mcp_client
 from strix.tools.mcp import session as mcp_session
+from strix.tools.mcp import transport as mcp_transport
 from strix.tools.mcp.failures import FailureInfo, HttpStatusRecorder, classify
 
 
@@ -25,7 +25,7 @@ _mcp_tool: Any = _test_mcp_client._mcp_tool
 
 
 def _built_server(server: Any) -> Any:
-    return mcp_client.BuiltMcpServer(server, None)
+    return mcp_transport.BuiltMcpServer(server, None)
 
 
 def _http_error(status: int, *, retry_after: str | None = None) -> httpx.HTTPStatusError:
@@ -181,7 +181,7 @@ async def test_rate_limit_retries_and_succeeds(
             _sequence_server("rate"),
         ]
     )
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(builds)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(builds)))
     session = mcp_session.SupervisedMcpSession(_config("rate"))
     assert await session.start()
     result = await session.dispatch("read", {}, label="rate_read")
@@ -206,7 +206,7 @@ async def test_server_exhaustion_quarantines_then_revives(
             _sequence_server("quarantine"),
         ]
     )
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(builds)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(builds)))
     session = mcp_session.SupervisedMcpSession(_config("quarantine"))
     assert await session.start()
     result = await session.dispatch("read", {}, label="quarantine_read")
@@ -240,7 +240,7 @@ async def test_success_resets_quarantine_strikes(
             _sequence_server("strikes"),
         ]
     )
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(builds)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(builds)))
     session = mcp_session.SupervisedMcpSession(_config("strikes"))
     assert await session.start()
 
@@ -261,7 +261,7 @@ async def test_success_resets_quarantine_strikes(
 @pytest.mark.asyncio
 async def test_auth_failure_dies_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     builds = [_sequence_server("auth", _http_error(401))]
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(builds.pop()))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(builds.pop()))
     session = mcp_session.SupervisedMcpSession(_config("auth"))
     assert await session.start()
     result = await session.dispatch("read", {}, label="auth_read")
@@ -284,7 +284,7 @@ async def test_call_http_rejection_preserves_session(
     first = _sequence_server(name, _http_error(status))
     second = _sequence_server(name)
     builds = iter([first, second])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(builds)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(builds)))
 
     session = mcp_session.SupervisedMcpSession(_config(name))
     assert await session.start()
@@ -317,7 +317,7 @@ async def test_call_jsonrpc_error_preserves_session(
         builds += 1
         return _built_server(_sequence_server("rpc-error", error))
 
-    monkeypatch.setattr(mcp_client, "_build_server", build)
+    monkeypatch.setattr(mcp_transport, "build_server", build)
     monkeypatch.setattr(mcp_session, "_retry_delay", _zero_delay)
 
     session = mcp_session.SupervisedMcpSession(_config("rpc-error"))
@@ -342,7 +342,7 @@ async def test_list_tools_during_quarantine_reports_temporary_state(
     clock = [100.0]
     monkeypatch.setattr("strix.tools.mcp.session.time.monotonic", lambda: clock[0])
     builds = iter([_sequence_server("cooldown", _http_error(500)) for _ in range(3)])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(builds)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(builds)))
     session = mcp_session.SupervisedMcpSession(_config("cooldown"))
     assert await session.start()
     await session.dispatch("read", {}, label="cooldown_read")
@@ -381,11 +381,11 @@ async def test_cancelled_call_uses_recorded_status(
     second = _sequence_server("cancelled")
     builds = iter(
         [
-            mcp_client.BuiltMcpServer(first, recorder),
-            mcp_client.BuiltMcpServer(second, None),
+            mcp_transport.BuiltMcpServer(first, recorder),
+            mcp_transport.BuiltMcpServer(second, None),
         ]
     )
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: next(builds))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: next(builds))
     monkeypatch.setattr(mcp_session, "_retry_delay", _zero_delay)
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
@@ -407,14 +407,14 @@ async def test_build_server_passes_explicit_http_values(
         def __init__(self, **kwargs: Any) -> None:
             captured.update(kwargs)
 
-    monkeypatch.setattr(mcp_client, "MCPServerStreamableHttp", Server)
+    monkeypatch.setattr(mcp_transport, "MCPServerStreamableHttp", Server)
     config = _config(
         "values",
         http_timeout_seconds=11,
         sse_read_timeout_seconds=22,
         session_timeout_seconds=33,
     )
-    mcp_client._build_server(config)
+    mcp_transport.build_server(config)
     assert captured["params"]["timeout"] == 11
     assert captured["params"]["sse_read_timeout"] == 22
     assert captured["client_session_timeout_seconds"] == 33
@@ -426,7 +426,7 @@ async def test_build_server_passes_explicit_http_values(
 
 @pytest.mark.asyncio
 async def test_http_factory_awaits_response_recorder() -> None:
-    built = mcp_client._build_server(_config("hook"))
+    built = mcp_transport.build_server(_config("hook"))
     assert built.recorder is not None
     factory = cast("Any", built.server).params["httpx_client_factory"]
     client = factory(headers={}, timeout=httpx.Timeout(1), auth=None)
@@ -509,7 +509,7 @@ async def test_resilience_logs_do_not_include_request_secrets(
     monkeypatch.setattr(mcp_session, "_retry_delay", _zero_delay)
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
     server = _sequence_server("redaction", _http_error(401))
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
     session = mcp_session.SupervisedMcpSession(_config("redaction"))
     assert await session.start()
     with caplog.at_level("WARNING"):

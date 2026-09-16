@@ -13,9 +13,9 @@ from agents.model_settings import ModelSettings
 from agents.retry import ModelRetrySettings
 
 from strix import routing
+from strix.domain.routes import RouteConfig
 from strix.routing import (
     AllRoutesUnavailableError,
-    RouteConfig,
     RouteContextOverflowError,
     RoutePool,
     classify_route_failure,

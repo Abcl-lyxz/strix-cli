@@ -25,7 +25,7 @@ from strix.interface.tui.backend.protocol import (
 if TYPE_CHECKING:
     import socket
 
-    from strix.interface.tui.backend.controller import TuiController
+    from strix.interface.application import ApplicationController
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class _CollectionState:
 class TuiBackendServer:
     """Serve one TUI child over an authenticated, connected socket."""
 
-    def __init__(self, controller: TuiController) -> None:
+    def __init__(self, controller: ApplicationController) -> None:
         self.controller = controller
         self._socket: socket.socket | None = None
         self._reader_task: asyncio.Task[None] | None = None

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -13,16 +15,21 @@ from strix.report.dedupe import (
     _prepare_report_for_comparison,
     check_duplicate,
 )
-from strix.report.state import ReportState, set_global_report_state
+from strix.report.state import ReportState
 from strix.tools.finish.tool import finish_scan
-from strix.tools.reporting import tool as reporting_tool
-from strix.tools.reporting.tool import (
-    _do_create,
-    _do_create_dependency,
-    _do_update,
-    _normalize_http_exchange_ids,
-    _verify_http_exchange_ids,
-    create_dependency_report,
+from strix.tools.reporting import validation as reporting_validation
+from strix.tools.reporting.dependencies import (
+    _do_create_dependency as _raw_do_create_dependency,
+)
+from strix.tools.reporting.dependencies import create_dependency_report
+from strix.tools.reporting.revisions import (
+    _do_update as _raw_do_update,
+)
+from strix.tools.reporting.validation import _normalize_http_exchange_ids, _verify_http_exchange_ids
+from strix.tools.reporting.vulnerabilities import (
+    _do_create as _raw_do_create,
+)
+from strix.tools.reporting.vulnerabilities import (
     create_vulnerability_report,
     update_vulnerability_report,
 )
@@ -62,11 +69,22 @@ _DEP_EVIDENCE = "src/render.ts:14 imports the package."
 _DEP_REASONING = "Only scripts/import.py reaches the sink, so the impact is availability only."
 
 
-@pytest.fixture
+_do_create = _raw_do_create
+_do_create_dependency = _raw_do_create_dependency
+_do_update = _raw_do_update
+
+
+@pytest.fixture(autouse=True)
 def report_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReportState:
     monkeypatch.chdir(tmp_path)
     state = ReportState(run_name="test-run")
-    set_global_report_state(state)
+    monkeypatch.setitem(globals(), "_do_create", partial(_raw_do_create, report_state=state))
+    monkeypatch.setitem(
+        globals(),
+        "_do_create_dependency",
+        partial(_raw_do_create_dependency, report_state=state),
+    )
+    monkeypatch.setitem(globals(), "_do_update", partial(_raw_do_update, report_state=state))
     return state
 
 
@@ -626,12 +644,15 @@ async def test_dependency_report_dedupe_candidate_includes_dependency_metadata(
     async def fake_check_duplicate(
         candidate: dict[str, object],
         existing: list[dict[str, object]],
+        _usage_repository: Any = None,
     ) -> dict[str, object]:
         captured["candidate"] = candidate
         captured["existing"] = existing
         return {"is_duplicate": False}
 
-    monkeypatch.setattr("strix.report.dedupe.check_duplicate", fake_check_duplicate)
+    monkeypatch.setattr(
+        "strix.tools.reporting.dependencies.check_duplicate", fake_check_duplicate
+    )
     report_state.vulnerability_reports.append(
         {
             "id": "vuln-0001",
@@ -1365,7 +1386,9 @@ async def test_duplicate_verdict_rejects_without_touching_the_existing_report(
     _seed_weak_report(report_state)
 
     async def fake_check_duplicate(
-        _candidate: dict[str, Any], _existing: list[dict[str, Any]]
+        _candidate: dict[str, Any],
+        _existing: list[dict[str, Any]],
+        _usage_repository: Any = None,
     ) -> dict[str, Any]:
         return {
             "is_duplicate": True,
@@ -1374,7 +1397,9 @@ async def test_duplicate_verdict_rejects_without_touching_the_existing_report(
             "reason": "Same root cause on the same endpoint.",
         }
 
-    monkeypatch.setattr("strix.report.dedupe.check_duplicate", fake_check_duplicate)
+    monkeypatch.setattr(
+        "strix.tools.reporting.vulnerabilities.check_duplicate", fake_check_duplicate
+    )
 
     result = await _do_create(**_CONFIRMED_KWARGS, agent_id="834f79fb", agent_name="Validation")
 
@@ -1452,7 +1477,7 @@ async def test_http_exchange_ids_must_exist_in_current_proxy_project(
     ) -> set[str]:
         return {"1042"}
 
-    monkeypatch.setattr(reporting_tool, "existing_request_ids", existing_request_ids)
+    monkeypatch.setattr(reporting_validation, "existing_request_ids", existing_request_ids)
 
     request_ids, errors, warning = await _verify_http_exchange_ids(
         cast("Any", object()),
@@ -1473,7 +1498,7 @@ async def test_http_exchange_ids_are_dropped_when_proxy_cannot_be_queried(
     ) -> set[str]:
         raise RuntimeError("Caido client is not available")
 
-    monkeypatch.setattr(reporting_tool, "existing_request_ids", existing_request_ids)
+    monkeypatch.setattr(reporting_validation, "existing_request_ids", existing_request_ids)
 
     request_ids, errors, warning = await _verify_http_exchange_ids(
         cast("Any", object()),
@@ -1516,10 +1541,13 @@ async def test_evidence_only_update_reports_proxy_outage_as_retryable(
     ) -> set[str]:
         raise RuntimeError("Caido client is not available")
 
-    monkeypatch.setattr(reporting_tool, "existing_request_ids", existing_request_ids)
+    monkeypatch.setattr(reporting_validation, "existing_request_ids", existing_request_ids)
 
     ctx = ToolContext(
-        context={"agent_id": "root"},
+        context={
+            "agent_id": "root",
+            "scan_context": SimpleNamespace(report_state=report_state),
+        },
         tool_name="update_vulnerability_report",
         tool_call_id="call-1",
         tool_arguments="{}",

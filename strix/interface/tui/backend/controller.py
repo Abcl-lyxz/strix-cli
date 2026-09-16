@@ -1,10 +1,6 @@
-"""Compatibility import for the shared application controller."""
+"""Canonical controller import for terminal backend callers."""
 
-import sys
-
-from strix.interface import application
-from strix.interface.application import TuiController
+from strix.interface.application import ApplicationController
 
 
-sys.modules[__name__] = application
-__all__ = ["TuiController"]
+__all__ = ["ApplicationController"]

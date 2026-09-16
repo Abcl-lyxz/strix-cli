@@ -9,18 +9,55 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from strix.adapters.artifacts import JsonArtifactStore
 from strix.tools.coverage.tools import (
-    _list_impl,
-    _record_impl,
-    _update_impl,
-    get_coverage_entries,
-    hydrate_coverage_from_disk,
-    outcome_counts,
+    _list_impl as _list_from_store,
+)
+from strix.tools.coverage.tools import (
+    _record_impl as _record_to_store,
+)
+from strix.tools.coverage.tools import (
+    _update_impl as _update_store,
+)
+from strix.tools.coverage.tools import (
+    get_coverage_entries as _coverage_entries,
+)
+from strix.tools.coverage.tools import (
+    outcome_counts as _outcome_counts,
 )
 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+_STORE: JsonArtifactStore
+
+
+def hydrate_coverage_from_disk(state_dir: Path) -> JsonArtifactStore:
+    global _STORE  # noqa: PLW0603 - test fixture selects the active repository
+    _STORE = JsonArtifactStore.hydrate(state_dir / "coverage.json")
+    return _STORE
+
+
+def get_coverage_entries() -> list[dict[str, Any]]:
+    return _coverage_entries(_STORE)
+
+
+def outcome_counts() -> dict[str, int]:
+    return _outcome_counts(_STORE)
+
+
+def _record_impl(**kwargs: Any) -> dict[str, Any]:
+    return _record_to_store(store=_STORE, **kwargs)
+
+
+def _update_impl(**kwargs: Any) -> dict[str, Any]:
+    return _update_store(store=_STORE, **kwargs)
+
+
+def _list_impl(**kwargs: Any) -> dict[str, Any]:
+    return _list_from_store(store=_STORE, **kwargs)
 
 
 @pytest.fixture(autouse=True)

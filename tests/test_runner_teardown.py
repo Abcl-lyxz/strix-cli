@@ -7,8 +7,6 @@ from typing import Any
 import pytest
 from agents import ModelSettings
 
-import strix.tools.notes.tools as notes_tools
-import strix.tools.todo.tools as todo_tools
 from strix.core import runner
 from strix.core.agents import AgentCoordinator
 from strix.runtime import session_manager
@@ -24,16 +22,14 @@ def _wire_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setattr(runner, "load_settings", lambda: settings)
     monkeypatch.setattr(runner, "configure_sdk_model_defaults", lambda _s: None)
     monkeypatch.setattr(runner, "uses_chat_completions_tool_schema", lambda _m, _s: False)
-    monkeypatch.setattr(todo_tools, "hydrate_todos_from_disk", lambda _d: None)
-    monkeypatch.setattr(notes_tools, "hydrate_notes_from_disk", lambda _d: None)
 
-    async def _create_or_reuse(*_a: Any, **_k: Any) -> dict[str, Any]:
+    async def _create_session(*_a: Any, **_k: Any) -> dict[str, Any]:
         return {"client": object(), "session": object(), "caido_client": None}
 
     async def _cleanup(*_a: Any, **_k: Any) -> None:
         return None
 
-    monkeypatch.setattr(session_manager, "create_or_reuse", _create_or_reuse)
+    monkeypatch.setattr(session_manager, "create_session", _create_session)
     monkeypatch.setattr(session_manager, "cleanup", _cleanup)
     monkeypatch.setattr(runner, "build_root_task", lambda _c: "task")
     monkeypatch.setattr(runner, "build_scope_context", lambda _c: "")

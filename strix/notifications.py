@@ -500,19 +500,9 @@ def _row_to_notification(row: sqlite3.Row) -> Notification:
     )
 
 
-_default_service: NotificationService | None = None
-
-
-def get_notification_service() -> NotificationService:
-    global _default_service  # noqa: PLW0603
-    if _default_service is None:
-        _default_service = NotificationService()
-    return _default_service
-
-
 def notify(event_type: str, **kwargs: Any) -> Notification | None:
-    """Best-effort publisher for subsystem error paths."""
+    """Persist one pre-composition incident without a process-global service."""
     try:
-        return get_notification_service().publish(event_type, **kwargs)
+        return NotificationService().publish(event_type, **kwargs)
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return None

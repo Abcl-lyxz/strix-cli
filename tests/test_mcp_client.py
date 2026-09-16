@@ -43,6 +43,7 @@ from strix.tools.mcp import (
 )
 from strix.tools.mcp import client as mcp_client
 from strix.tools.mcp import session as mcp_session_mod
+from strix.tools.mcp import transport as mcp_transport
 
 
 if TYPE_CHECKING:
@@ -167,8 +168,8 @@ def _config(name: str, allowed_tools: list[str] | None) -> McpConnectionConfig:
     )
 
 
-def _built_server(server: MCPServer) -> mcp_client.BuiltMcpServer:
-    return mcp_client.BuiltMcpServer(server, None)
+def _built_server(server: MCPServer) -> mcp_transport.BuiltMcpServer:
+    return mcp_transport.BuiltMcpServer(server, None)
 
 
 def _ctx(registry: McpRegistry | None) -> ToolContext[dict[str, Any]]:
@@ -287,7 +288,7 @@ def test_unknown_field_is_rejected() -> None:
 
 
 def test_bearer_auth_builds_authorization_header() -> None:
-    headers = mcp_client._auth_headers(_config("files_main", []))
+    headers = mcp_transport._auth_headers(_config("files_main", []))
 
     assert headers == {"Authorization": "Bearer run-token"}
 
@@ -305,7 +306,7 @@ async def test_connect_returns_sessions_without_registering_agent_tools(
         "db": FakeMCPServer("db", [_mcp_tool("query")]),
     }
     monkeypatch.setattr(
-        mcp_client, "_build_server", lambda config: _built_server(servers[config.name])
+        mcp_transport, "build_server", lambda config: _built_server(servers[config.name])
     )
 
     connections = await mcp_client.connect_mcp_servers(
@@ -323,7 +324,7 @@ async def test_connect_returns_sessions_without_registering_agent_tools(
 @pytest.mark.asyncio
 async def test_tool_count_honors_the_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     server = FakeMCPServer("fs", [_mcp_tool("read_file"), _mcp_tool("write_file")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
 
     connections = await mcp_client.connect_mcp_servers([_config("fs", ["read_file"])])
 
@@ -337,7 +338,7 @@ async def test_connection_notes_ride_on_the_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = FakeMCPServer("db", [_mcp_tool("query")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
     config = McpConnectionConfig(
         name="db",
         url="https://mcp.example.com",
@@ -364,7 +365,7 @@ def test_build_server_stdio_branch() -> None:
         env={"TOKEN": "x"},
     )
 
-    server = mcp_client._build_server(config).server
+    server = mcp_transport.build_server(config).server
 
     assert isinstance(server, MCPServerStdio)
     assert server.name == "local_fs"
@@ -374,7 +375,7 @@ def test_build_server_stdio_branch() -> None:
 
 
 def test_build_server_http_branch() -> None:
-    server = mcp_client._build_server(_config("files_main", ["list_files"])).server
+    server = mcp_transport.build_server(_config("files_main", ["list_files"])).server
 
     assert isinstance(server, MCPServerStreamableHttp)
     assert server.name == "files_main"
@@ -856,7 +857,7 @@ async def test_connect_skips_a_connection_whose_connect_is_cancelled(
 
     servers = {"good": _Tracking("good"), "bad": _Tracking("bad", cancel_connect=True)}
     monkeypatch.setattr(
-        mcp_client, "_build_server", lambda config: _built_server(servers[config.name])
+        mcp_transport, "build_server", lambda config: _built_server(servers[config.name])
     )
 
     configs = [_config("good", ["t"]), _config("bad", ["t"])]
@@ -894,7 +895,7 @@ async def test_connect_cleans_up_started_sessions_when_attach_is_cancelled(
 
     servers = {"good": _Tracking("good"), "slow": _Tracking("slow", block_connect=True)}
     monkeypatch.setattr(
-        mcp_client, "_build_server", lambda config: _built_server(servers[config.name])
+        mcp_transport, "build_server", lambda config: _built_server(servers[config.name])
     )
 
     async def _attach() -> list[Any]:
@@ -974,7 +975,7 @@ async def test_attach_populates_registry_with_provider_and_transform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = FakeMCPServer("db", [_mcp_tool("query")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
 
     def transform(_label: str, structured: Any) -> Any:
         return {"kept": structured}
@@ -1007,7 +1008,7 @@ async def test_attach_bare_request_matches_the_command_line_shape(
     # The command-line path wraps each config in a bare request (no provider or
     # transform); purpose then falls back to the connection's notes.
     server = FakeMCPServer("db", [_mcp_tool("query")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
     config = McpConnectionConfig(
         name="db",
         url="https://mcp.example.com",
@@ -1039,7 +1040,7 @@ async def test_attach_is_fail_open_and_skips_a_failed_connection(
 
     servers = {"good": good, "bad": _Failing("bad", [_mcp_tool("t")])}
     monkeypatch.setattr(
-        mcp_client, "_build_server", lambda config: _built_server(servers[config.name])
+        mcp_transport, "build_server", lambda config: _built_server(servers[config.name])
     )
 
     registry = McpRegistry()
@@ -1248,7 +1249,7 @@ async def test_call_mcp_reconnects_and_retries_after_a_session_death(
     first = _DyingHttpServer("fs", [_mcp_tool("read_file")], death=ConnectionError("403"))
     second = FakeMCPServer("fs", [_mcp_tool("read_file")])
     built = iter([first, second])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(built)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(built)))
 
     session = await _started_session(_secret_config("fs"))
     registry = McpRegistry()
@@ -1276,13 +1277,13 @@ async def test_call_mcp_marks_connection_dead_when_reconnect_keeps_failing(
     first = _DyingHttpServer("fs", [_mcp_tool("read_file")], death=ConnectionError("403"))
     built = {"n": 0}
 
-    def _build(_config: McpConnectionConfig) -> mcp_client.BuiltMcpServer:
+    def _build(_config: McpConnectionConfig) -> mcp_transport.BuiltMcpServer:
         built["n"] += 1
         if built["n"] == 1:
             return _built_server(first)
         raise ConnectionError("cannot reconnect")
 
-    monkeypatch.setattr(mcp_client, "_build_server", _build)
+    monkeypatch.setattr(mcp_transport, "build_server", _build)
 
     session = await _started_session(_secret_config("fs"))
     registry = McpRegistry()
@@ -1340,7 +1341,7 @@ async def test_idle_session_death_self_heals_on_reconnect(
     first = FakeMCPServer("fs", [_mcp_tool("read_file")])
     second = FakeMCPServer("fs", [_mcp_tool("read_file")])
     built = iter([first, second])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(built)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(built)))
 
     session = await _started_session(_secret_config("fs"))
     registry = McpRegistry()
@@ -1370,7 +1371,7 @@ async def test_flapping_idle_session_is_marked_dead_without_looping(
     first = FakeMCPServer("fs", [_mcp_tool("read_file")])
     second = FakeMCPServer("fs", [_mcp_tool("read_file")])
     built = iter([first, second])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(next(built)))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(next(built)))
 
     session = await _started_session(_secret_config("fs"))
     registry = McpRegistry()
@@ -1439,7 +1440,7 @@ async def test_aclose_is_bounded_when_an_in_flight_call_hangs(
     # aclose falls back to cancelling the supervising task, and cleanup still runs.
     monkeypatch.setattr(mcp_session_mod, "_SHUTDOWN_TIMEOUT", 0.2)
     server = _HangingCallServer("fs", [_mcp_tool("read_file")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
 
     session = await _started_session(_secret_config("fs"))
     call = asyncio.create_task(session.dispatch("read_file", {}, label="fs_read_file"))
@@ -1463,7 +1464,7 @@ async def test_aclose_cleans_up_when_connect_is_cancelled_mid_await(
     # is cancelled; aclose must not raise on it and must still cancel + clean up the
     # partially connected supervisor.
     server = _HangingConnectServer("fs", [_mcp_tool("read_file")])
-    monkeypatch.setattr(mcp_client, "_build_server", lambda _config: _built_server(server))
+    monkeypatch.setattr(mcp_transport, "build_server", lambda _config: _built_server(server))
 
     session = SupervisedMcpSession(_secret_config("fs"))
     start = asyncio.create_task(session.start())
@@ -1488,7 +1489,7 @@ async def test_a_session_death_is_contained_and_other_connections_survive(
     healthy = FakeMCPServer("healthy", [_mcp_tool("read_file")])
     dying_builds = {"n": 0}
 
-    def _build(config: McpConnectionConfig) -> mcp_client.BuiltMcpServer:
+    def _build(config: McpConnectionConfig) -> mcp_transport.BuiltMcpServer:
         if config.name == "healthy":
             return _built_server(healthy)
         # The dying connection connects once, then its rebuild raises, so it ends
@@ -1498,7 +1499,7 @@ async def test_a_session_death_is_contained_and_other_connections_survive(
             return _built_server(dying)
         raise ConnectionError("cannot reconnect")
 
-    monkeypatch.setattr(mcp_client, "_build_server", _build)
+    monkeypatch.setattr(mcp_transport, "build_server", _build)
 
     dying_session = await _started_session(_secret_config("dying"))
     healthy_session = await _started_session(_secret_config("healthy"))
@@ -1532,7 +1533,7 @@ async def test_reconnect_reuses_the_stored_config_and_never_logs_the_token(
     # inventory list_mcps emits.
     seen_tokens: list[str | None] = []
 
-    def _build(config: McpConnectionConfig) -> mcp_client.BuiltMcpServer:
+    def _build(config: McpConnectionConfig) -> mcp_transport.BuiltMcpServer:
         seen_tokens.append(config.auth.token if config.auth else None)
         if len(seen_tokens) == 1:
             return _built_server(
@@ -1540,7 +1541,7 @@ async def test_reconnect_reuses_the_stored_config_and_never_logs_the_token(
             )
         return _built_server(FakeMCPServer("fs", [_mcp_tool("read_file")]))
 
-    monkeypatch.setattr(mcp_client, "_build_server", _build)
+    monkeypatch.setattr(mcp_transport, "build_server", _build)
 
     config = _secret_config("fs")
     token = config.auth.token if config.auth else ""

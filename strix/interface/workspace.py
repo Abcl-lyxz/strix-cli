@@ -22,15 +22,17 @@ from strix.config.ui import settings_fields, update_setting
 from strix.core.paths import runs_base_dir
 from strix.interface.attachments import complete_paths, describe_attachment
 from strix.interface.connections import connections, update_connection
+from strix.interface.scan_setup import preflight_model_connection
+from strix.interface.viewer.server import build_runs_payload
 
 
 if TYPE_CHECKING:
+    from strix.interface.application import ApplicationController
     from strix.interface.application_runtime import WorkspaceRuntime
-    from strix.interface.tui.backend.controller import TuiController
 
 
 class WorkspaceCommands:
-    def __init__(self, controller: TuiController) -> None:
+    def __init__(self, controller: ApplicationController) -> None:
         self.controller = controller
         self.runtime: WorkspaceRuntime | None = None
         self.attachments: list[dict[str, Any]] = []
@@ -127,10 +129,6 @@ class WorkspaceCommands:
         if command == "providers.advanced":
             return update_route_options(payload)
         if command == "providers.test":
-            from strix.interface.scan_setup import (
-                preflight_model_connection,
-            )
-
             await preflight_model_connection(
                 "",
                 selected_routes=[c.selected_route] if c.selected_route else None,
@@ -203,10 +201,6 @@ class WorkspaceCommands:
                     ]
             return {"attachments": self.public_attachments()}
         if command == "sessions.list":
-            from strix.interface.viewer.server import (
-                build_runs_payload,
-            )
-
             return build_runs_payload(runs_base_dir(), verified=True)
         if command == "scan.stop":
             if self.runtime is not None and self.runtime.scan_task is not None:
@@ -282,14 +276,10 @@ class WorkspaceCommands:
         )
 
     async def stage_live(self, item: dict[str, Any]) -> None:
-        from strix.runtime.session_manager import (
-            cached_session,
-        )
-
-        bundle = cached_session(str(self.controller.args.run_name))
-        if not bundle:
+        scan_context = self.controller.scan_context
+        session = scan_context.sandbox_session if scan_context is not None else None
+        if session is None:
             raise RuntimeError("Sandbox is not ready; attachment was not sent")
-        session = bundle["session"]
         for entry in item["files"]:
             destination = entry["workspace_path"]
             result = await session.exec("mkdir", "-p", destination.rsplit("/", 1)[0])

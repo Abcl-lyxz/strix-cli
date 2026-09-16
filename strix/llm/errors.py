@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING
+
+from openai import APIError
 
 from strix.llm.tool_arguments import InvalidToolArgumentsError
 
 
-FailureKind = Literal[
-    "transient",
-    "authentication",
-    "billing",
-    "context",
-    "policy",
-    "incompatible",
-    "malformed",
-    "fatal",
-]
+if TYPE_CHECKING:
+    from strix.domain.failures import FailureKind
 
 
 def classify_model_failure(error: BaseException) -> FailureKind:  # noqa: PLR0911 - ordered classification
@@ -97,6 +91,7 @@ def classify_model_failure(error: BaseException) -> FailureKind:  # noqa: PLR091
         status in {408, 409, 425, 429}
         or (isinstance(status, int) and 500 <= status <= 599)
         or isinstance(error, TimeoutError | ConnectionError | OSError)
+        or (isinstance(error, APIError) and status is None)
         or any(
             marker in type(error).__name__.lower()
             for marker in ("timeout", "connection", "ratelimit", "serviceunavailable")

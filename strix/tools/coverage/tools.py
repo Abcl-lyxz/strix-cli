@@ -18,26 +18,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from agents import RunContextWrapper, function_tool
 
-from strix.utils.atomic import atomic_write_text
+from strix.tools.artifacts import artifact_store_from_tool
 
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from strix.ports.artifacts import ArtifactRepository
 
 
 logger = logging.getLogger(__name__)
 
 
-_coverage_storage: dict[str, dict[str, Any]] = {}
-_coverage_lock = threading.RLock()
-_coverage_path: Path | None = None
 _ENTRY_ID_GENERATION_ATTEMPTS = 1024
 _EVIDENCE_PREVIEW_CHARS = 240
 
@@ -67,78 +63,31 @@ def _caller_identity(ctx: RunContextWrapper) -> tuple[str | None, str | None]:
     return agent_id, agent_name
 
 
-def _generate_entry_id() -> str | None:
-    """Allocate an unused entry id. Callers must already hold ``_coverage_lock``."""
+def _generate_entry_id(store: ArtifactRepository) -> str | None:
+    """Allocate an unused entry id. The caller holds the repository lock."""
     for _ in range(_ENTRY_ID_GENERATION_ATTEMPTS):
         entry_id = uuid.uuid4().hex[:6]
-        if entry_id not in _coverage_storage:
+        if entry_id not in store.data:
             return entry_id
     return None
 
 
-def hydrate_coverage_from_disk(state_dir: Path) -> None:
-    global _coverage_path  # noqa: PLW0603
-    _coverage_path = state_dir / "coverage.json"
-    with _coverage_lock:
-        _coverage_storage.clear()
-        if not _coverage_path.exists():
-            return
-        try:
-            data = json.loads(_coverage_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.exception(
-                "coverage.json at %s is unreadable; starting with empty coverage",
-                _coverage_path,
-            )
-            return
-        if not isinstance(data, dict):
-            return
-        _coverage_storage.update(
-            {
-                eid: entry
-                for eid, entry in data.items()
-                if isinstance(eid, str) and isinstance(entry, dict)
-            }
-        )
-        logger.info(
-            "coverage hydrated from %s (%d entr(ies))",
-            _coverage_path,
-            len(_coverage_storage),
-        )
-
-
-def _persist_locked() -> None:
-    """Mirror the ledger to disk. Callers must already hold ``_coverage_lock``.
-
-    Serialization and the rename happen in one critical section. Releasing
-    the lock in between would let a writer holding an older serialization win
-    the rename and silently roll back a concurrent agent's entry, so the
-    ledger would hydrate short on resume.
-    """
-    path = _coverage_path
-    if path is None:
-        return
-    try:
-        with _coverage_lock:
-            atomic_write_text(
-                path, lambda: json.dumps(_coverage_storage, ensure_ascii=False, default=str)
-            )
-    except Exception:
-        logger.exception("coverage persist to %s failed", path)
-
-
-def get_coverage_entries() -> list[dict[str, Any]]:
+def get_coverage_entries(store: ArtifactRepository) -> list[dict[str, Any]]:
     """Return every coverage entry, newest last. Used by ``finish_scan``."""
-    with _coverage_lock:
-        entries = [{**entry, "entry_id": eid} for eid, entry in _coverage_storage.items()]
+    with store.lock:
+        entries = [
+            {**entry, "entry_id": eid}
+            for eid, entry in store.data.items()
+            if isinstance(entry, dict)
+        ]
     entries.sort(key=lambda e: str(e.get("created_at", "")))
     return entries
 
 
-def outcome_counts() -> dict[str, int]:
+def outcome_counts(store: ArtifactRepository) -> dict[str, int]:
     """Count coverage entries per outcome, in the canonical outcome order."""
     counts: dict[str, int] = {}
-    for entry in get_coverage_entries():
+    for entry in get_coverage_entries(store):
         outcome = str(entry.get("outcome", "")).lower()
         counts[outcome] = counts.get(outcome, 0) + 1
     return {o: counts[o] for o in VALID_OUTCOMES if o in counts}
@@ -163,7 +112,9 @@ def _validate(
     return normalized, errors
 
 
-def _duplicate_of_locked(surface: str, risk_area: str) -> tuple[str, dict[str, Any]] | None:
+def _duplicate_of_locked(
+    store: ArtifactRepository, surface: str, risk_area: str
+) -> tuple[str, dict[str, Any]] | None:
     """Find an existing row for this exact surface and risk area.
 
     Callers must already hold ``_coverage_lock``. The uniqueness check and the
@@ -173,7 +124,9 @@ def _duplicate_of_locked(surface: str, risk_area: str) -> tuple[str, dict[str, A
     rejection exists to prevent.
     """
     key = (surface.strip().lower(), risk_area.strip().lower())
-    for entry_id, entry in _coverage_storage.items():
+    for entry_id, entry in store.data.items():
+        if not isinstance(entry, dict):
+            continue
         existing = (
             str(entry.get("surface", "")).strip().lower(),
             str(entry.get("risk_area", "")).strip().lower(),
@@ -185,6 +138,7 @@ def _duplicate_of_locked(surface: str, risk_area: str) -> tuple[str, dict[str, A
 
 def _record_impl(
     *,
+    store: ArtifactRepository,
     surface: str,
     risk_area: str,
     outcome: str,
@@ -211,8 +165,8 @@ def _record_impl(
     if agent_name:
         entry["agent_name"] = agent_name
 
-    with _coverage_lock:
-        duplicate = _duplicate_of_locked(surface, risk_area)
+    with store.lock:
+        duplicate = _duplicate_of_locked(store, surface, risk_area)
         if duplicate is not None:
             existing_id, existing = duplicate
             owner = existing.get("agent_name") or "another agent"
@@ -232,11 +186,11 @@ def _record_impl(
                 "existing_outcome": existing.get("outcome", ""),
             }
 
-        entry_id = _generate_entry_id()
+        entry_id = _generate_entry_id(store)
         if entry_id is None:
             return {"success": False, "error": "Could not allocate a coverage entry id"}
-        _coverage_storage[entry_id] = entry
-        _persist_locked()
+        store.data[entry_id] = entry
+        store.persist()
     logger.info(
         "Coverage recorded: id=%s outcome=%s surface=%s",
         entry_id,
@@ -253,6 +207,7 @@ def _record_impl(
 
 def _update_impl(
     *,
+    store: ArtifactRepository,
     entry_id: str,
     outcome: str,
     evidence: str,
@@ -260,9 +215,9 @@ def _update_impl(
     agent_name: str | None,
 ) -> dict[str, Any]:
     key = (entry_id or "").strip()
-    with _coverage_lock:
-        existing = _coverage_storage.get(key)
-        if existing is None:
+    with store.lock:
+        existing = store.data.get(key)
+        if not isinstance(existing, dict):
             return {
                 "success": False,
                 "error": (
@@ -298,7 +253,7 @@ def _update_impl(
             existing["agent_id"] = agent_id
         if agent_name:
             existing["agent_name"] = agent_name
-        _persist_locked()
+        store.persist()
     logger.info(
         "Coverage updated: id=%s %s -> %s surface=%s",
         key,
@@ -319,7 +274,11 @@ def _update_impl(
 
 
 def _list_impl(
-    *, outcome: str | None, surface: str | None, caller_agent_id: str | None
+    *,
+    store: ArtifactRepository,
+    outcome: str | None,
+    surface: str | None,
+    caller_agent_id: str | None,
 ) -> dict[str, Any]:
     normalized_outcome: str | None = None
     if outcome and outcome.strip():
@@ -331,7 +290,7 @@ def _list_impl(
             }
 
     entries: list[dict[str, Any]] = []
-    for entry in get_coverage_entries():
+    for entry in get_coverage_entries(store):
         if normalized_outcome and entry.get("outcome") != normalized_outcome:
             continue
         if surface and surface.strip().lower() not in str(entry.get("surface", "")).lower():
@@ -364,8 +323,8 @@ def _list_impl(
         "success": True,
         "entries": entries,
         "filtered_count": len(entries),
-        "total_count": len(_coverage_storage),
-        "outcome_counts": outcome_counts(),
+        "total_count": len(store.data),
+        "outcome_counts": outcome_counts(store),
     }
 
 
@@ -432,8 +391,10 @@ async def record_coverage(
             the test performed, or the missing piece.
     """
     agent_id, agent_name = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "coverage")
     result = await asyncio.to_thread(
         _record_impl,
+        store=store,
         surface=surface,
         risk_area=risk_area,
         outcome=outcome,
@@ -487,8 +448,10 @@ async def update_coverage(
             know why this closed differently the second time.
     """
     agent_id, agent_name = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "coverage")
     result = await asyncio.to_thread(
         _update_impl,
+        store=store,
         entry_id=entry_id,
         outcome=outcome,
         evidence=evidence,
@@ -524,7 +487,12 @@ async def list_coverage(
             surface name.
     """
     caller_agent_id, _ = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "coverage")
     result = await asyncio.to_thread(
-        _list_impl, outcome=outcome, surface=surface, caller_agent_id=caller_agent_id
+        _list_impl,
+        store=store,
+        outcome=outcome,
+        surface=surface,
+        caller_agent_id=caller_agent_id,
     )
     return json.dumps(result, ensure_ascii=False, default=str)

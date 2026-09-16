@@ -21,16 +21,19 @@ import json
 import logging
 import re
 import subprocess
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from agents import RunContextWrapper, function_tool
 
 from strix.core.agents import AgentCoordinator
-from strix.utils.atomic import atomic_write_text
+from strix.tools.artifacts import artifact_store_from_tool
+
+
+if TYPE_CHECKING:
+    from strix.ports.artifacts import ArtifactRepository
 
 
 logger = logging.getLogger(__name__)
@@ -42,13 +45,6 @@ _MIN_AMENDMENT_CHARS = 80
 _MAX_AMENDMENTS = 40
 _GIT_TIMEOUT_SECONDS = 10
 _DEFAULT_PORTS = {"http": "80", "https": "443"}
-
-_store_lock = threading.RLock()
-
-# The whole store: target identity -> model. It holds exactly the models this
-# scan derived, and is mirrored to the run's state directory for resume.
-_MODELS: dict[str, dict[str, Any]] = {}
-_store_path: Path | None = None
 
 _REQUIRED_SECTIONS = (
     "overview",
@@ -205,56 +201,6 @@ def _resolve_target(
     return (_snap_to_scan_target(raw, known) if known else raw), None
 
 
-def hydrate_threat_models_from_disk(state_dir: Path) -> None:
-    """Point the store at this run's mirror and load whatever it already holds.
-
-    A resumed scan is the same scan, so its agents have to keep the baseline
-    the earlier ones agreed on. The mirror lives under the run directory, so a
-    different scan never reads it.
-    """
-    global _store_path  # noqa: PLW0603
-    _store_path = state_dir / "threat_models.json"
-    with _store_lock:
-        _MODELS.clear()
-        if not _store_path.is_file():
-            return
-        try:
-            data = json.loads(_store_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.exception(
-                "threat_models.json at %s is unreadable; starting with no models",
-                _store_path,
-            )
-            return
-        if not isinstance(data, dict):
-            return
-        _MODELS.update(
-            {
-                identity: model
-                for identity, model in data.items()
-                if isinstance(identity, str) and isinstance(model, dict)
-            }
-        )
-        logger.info("threat models hydrated from %s (%d)", _store_path, len(_MODELS))
-
-
-def _persist_locked() -> None:
-    """Mirror the store to disk. Callers must already hold ``_store_lock``.
-
-    Serializing and renaming in one critical section keeps a writer holding an
-    older serialization from winning the rename and dropping a concurrent
-    agent's model or amendment.
-    """
-    path = _store_path
-    if path is None:
-        return
-    try:
-        with _store_lock:
-            atomic_write_text(path, lambda: json.dumps(_MODELS, ensure_ascii=False, default=str))
-    except OSError:
-        logger.exception("threat model mirror to %s failed", path)
-
-
 def _missing_sections(content: str) -> list[str]:
     lowered = content.lower()
     return [section for section in _REQUIRED_SECTIONS if section not in lowered]
@@ -282,15 +228,17 @@ def _not_found(identity: str) -> dict[str, Any]:
     }
 
 
-def _get_impl(target: str, scan_targets: list[str] | None = None) -> dict[str, Any]:
+def _get_impl(
+    store: ArtifactRepository, target: str, scan_targets: list[str] | None = None
+) -> dict[str, Any]:
     resolved, error = _resolve_target(target, scan_targets)
     if resolved is None:
         return {"success": False, "error": error}
 
     identity = _target_identity(resolved)
-    with _store_lock:
-        model = _MODELS.get(identity)
-        if model is None:
+    with store.lock:
+        model = store.data.get(identity)
+        if not isinstance(model, dict):
             return _not_found(identity)
         content = model.get("content")
         amendments = list(_amendments_of(model))
@@ -314,6 +262,7 @@ def _get_impl(target: str, scan_targets: list[str] | None = None) -> dict[str, A
 
 
 def _save_impl(
+    store: ArtifactRepository,
     target: str,
     content: str,
     agent_name: str | None,
@@ -350,16 +299,18 @@ def _save_impl(
         }
 
     identity = _target_identity(resolved)
-    with _store_lock:
-        existing = _MODELS.get(identity)
+    with store.lock:
+        existing = store.data.get(identity)
+        if not isinstance(existing, dict):
+            existing = None
         folded = len(_amendments_of(existing)) if existing else 0
-        _MODELS[identity] = {
+        store.data[identity] = {
             "target": identity,
             "written_at": datetime.now(UTC).isoformat(),
             "written_by": agent_name,
             "content": body,
         }
-        _persist_locked()
+        store.persist()
 
     message = (
         "Threat model shared with this scan. Subagents should call get_threat_model "
@@ -379,12 +330,12 @@ def _save_impl(
 
 
 def _append_amendment(
-    identity: str, amendment: dict[str, Any]
+    store: ArtifactRepository, identity: str, amendment: dict[str, Any]
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Add an amendment to the stored model. Returns (amendments, error)."""
-    with _store_lock:
-        model = _MODELS.get(identity)
-        if model is None or not str(model.get("content", "")).strip():
+    with store.lock:
+        model = store.data.get(identity)
+        if not isinstance(model, dict) or not str(model.get("content", "")).strip():
             return None, (
                 "No threat model exists for this target yet, so there is nothing to "
                 "amend. Derive the base model and call save_threat_model instead."
@@ -400,11 +351,12 @@ def _append_amendment(
         if len(json.dumps(sized, ensure_ascii=False).encode("utf-8")) > _MAX_MODEL_BYTES:
             return None, "Threat model with this amendment exceeds 512KB; tighten it."
         model["amendments"] = candidate
-        _persist_locked()
+        store.persist()
         return candidate, None
 
 
 def _amend_impl(
+    store: ArtifactRepository,
     target: str,
     addendum: str,
     agent_name: str | None,
@@ -427,6 +379,7 @@ def _amend_impl(
 
     identity = _target_identity(resolved)
     amendments, amend_error = _append_amendment(
+        store,
         identity,
         {
             "at": datetime.now(UTC).isoformat(),
@@ -500,7 +453,12 @@ async def get_threat_model(ctx: RunContextWrapper, target: str) -> str:
             pointed at, so agents converge on one model.
     """
     return json.dumps(
-        await asyncio.to_thread(_get_impl, target, _scan_targets(ctx)),
+        await asyncio.to_thread(
+            _get_impl,
+            artifact_store_from_tool(ctx, "threat_models"),
+            target,
+            _scan_targets(ctx),
+        ),
         ensure_ascii=False,
         default=str,
     )
@@ -570,7 +528,12 @@ async def save_threat_model(ctx: RunContextWrapper, target: str, content: str) -
     """
     return json.dumps(
         await asyncio.to_thread(
-            _save_impl, target, content, _caller_agent_name(ctx), _scan_targets(ctx)
+            _save_impl,
+            artifact_store_from_tool(ctx, "threat_models"),
+            target,
+            content,
+            _caller_agent_name(ctx),
+            _scan_targets(ctx),
         ),
         ensure_ascii=False,
         default=str,
@@ -620,7 +583,12 @@ async def amend_threat_model(ctx: RunContextWrapper, target: str, addendum: str)
     """
     return json.dumps(
         await asyncio.to_thread(
-            _amend_impl, target, addendum, _caller_agent_name(ctx), _scan_targets(ctx)
+            _amend_impl,
+            artifact_store_from_tool(ctx, "threat_models"),
+            target,
+            addendum,
+            _caller_agent_name(ctx),
+            _scan_targets(ctx),
         ),
         ensure_ascii=False,
         default=str,

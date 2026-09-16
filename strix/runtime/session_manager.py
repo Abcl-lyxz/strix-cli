@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from agents.sandbox.entries import BaseEntry, File, LocalDir
 from agents.sandbox.manifest import Environment, Manifest
@@ -22,6 +22,7 @@ from strix.runtime.profiles import active_profile
 
 
 if TYPE_CHECKING:
+    from strix.application.context import ScanContext
     from strix.runtime.status import StatusSink
 
 
@@ -30,13 +31,6 @@ logger = logging.getLogger(__name__)
 
 # In-container Caido sidecar port (matches the image's caido-cli bind).
 _CONTAINER_CAIDO_PORT = 48080
-
-
-_SESSION_CACHE: dict[str, dict[str, Any]] = {}
-
-
-def cached_session(scan_id: str) -> dict[str, Any] | None:
-    return _SESSION_CACHE.get(scan_id)
 
 
 # Manifest root inside the container; entry keys hang off this path.
@@ -271,9 +265,10 @@ def _gitdir_from_pointer(git_file: Path) -> Path | None:
     return None
 
 
-async def create_or_reuse(
+async def create_session(
     scan_id: str,
     *,
+    scan_context: ScanContext,
     image: str,
     local_sources: list[dict[str, Any]],
     extra_files: list[dict[str, Any]] | None = None,
@@ -295,10 +290,10 @@ async def create_or_reuse(
         if status_sink is not None:
             status_sink(phase)
 
-    cached = _SESSION_CACHE.get(scan_id)
+    cached = scan_context.runtime_resources.get("sandbox_bundle")
     if cached is not None:
         logger.info("Reusing existing sandbox session for scan %s", scan_id)
-        return cached
+        return cast("dict[str, Any]", cached)
 
     backend_name = load_settings().runtime.backend
     backend = get_backend(backend_name)
@@ -393,7 +388,7 @@ async def create_or_reuse(
             "caido_client": caido_client,
             "extra_file_staging_dir": staging_dir,
         }
-        _SESSION_CACHE[scan_id] = bundle
+        scan_context.runtime_resources["sandbox_bundle"] = bundle
     except BaseException:
         # Until the bundle is cached, cleanup(scan_id) cannot find the
         # staging dir, so it is removed here.
@@ -408,7 +403,7 @@ def _remove_staging_dir(staging_dir: Path | None) -> None:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
 
-async def cleanup(scan_id: str) -> None:
+async def cleanup(scan_id: str, scan_context: ScanContext) -> None:
     """Tear down ``scan_id``'s container and drop its cache entry.
 
     Best-effort: any error during ``client.delete`` is logged and
@@ -416,7 +411,7 @@ async def cleanup(scan_id: str) -> None:
     scan from starting; the worst case is a stranded container that
     Docker's normal reaping will catch on next ``docker prune``.
     """
-    bundle = _SESSION_CACHE.pop(scan_id, None)
+    bundle = scan_context.runtime_resources.pop("sandbox_bundle", None)
     if bundle is None:
         logger.debug("cleanup(%s): no cached session", scan_id)
         return

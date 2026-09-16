@@ -9,7 +9,7 @@ from rich.text import Text
 
 from strix.config import IntegrationSettings, codex, load_settings
 from strix.interface.docker_cli import find_docker_cli
-from strix.interface.utils import (
+from strix.interface.docker_runtime import (
     check_docker_connection,
     image_exists,
     process_pull_line,

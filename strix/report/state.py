@@ -2,20 +2,19 @@ import json
 import logging
 import re
 import subprocess
-import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from strix.config import codex
 from strix.config.loader import load_settings
 from strix.core.paths import run_dir_for, runtime_state_dir
-from strix.notifications import NotificationAction, notify
-from strix.report.coverage import write_coverage
-from strix.report.pricing import resolve_litellm_model
+from strix.notifications import NotificationAction
+from strix.ports.notifications import NotificationPublisher
+from strix.report.coverage import build_coverage_document, read_agent_graph, write_coverage
 from strix.report.sarif import write_sarif
 from strix.report.writer import (
     read_run_record,
@@ -23,6 +22,7 @@ from strix.report.writer import (
     write_run_record,
     write_vulnerabilities,
 )
+from strix.utils.atomic import path_lock, storage_failures
 
 
 if TYPE_CHECKING:
@@ -30,8 +30,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-_global_report_state: Optional["ReportState"] = None
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
@@ -164,17 +162,6 @@ def _git_head(repo_path: str) -> tuple[str | None, str | None]:
     return commit, branch
 
 
-def get_global_report_state() -> Optional["ReportState"]:
-    return _global_report_state
-
-
-def set_global_report_state(report_state: Optional["ReportState"]) -> None:
-    global _global_report_state  # noqa: PLW0603
-    _global_report_state = report_state
-    # New run: drop any streamed-cost entries a prior run left unconsumed.
-    streamed_openrouter_costs.clear()
-
-
 class ReportState:
     """Per-scan product artifact state plus artifact writer.
 
@@ -199,7 +186,7 @@ class ReportState:
         self.scan_config: dict[str, Any] | None = None
         # Imported here so importing this module never enters the agents SDK
         # package (which the warm-up thread may be initializing concurrently).
-        from strix.report.usage import LLMUsageLedger
+        from strix.report.usage import LLMUsageLedger  # noqa: PLC0415
 
         self._llm_usage = LLMUsageLedger()
         self._telemetry_llm_usage_baseline: dict[str, Any] = {}
@@ -226,6 +213,28 @@ class ReportState:
         self._sarif_repo_ctx_ready: bool = False
 
         self.scan_ended_exit_reason: str | None = None
+        self._coverage_entries: Callable[[], list[dict[str, Any]]] = list
+        self._notifications: NotificationPublisher | None = None
+
+    def set_notification_publisher(self, publisher: NotificationPublisher) -> None:
+        """Bind the process-owned notification output at the composition root."""
+
+        self._notifications = publisher
+
+    def _notify(self, event_type: str, **kwargs: Any) -> None:
+        if self._notifications is None:
+            return
+        try:
+            self._notifications.publish(event_type, **kwargs)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            logger.exception("notification publication failed for %s", event_type)
+
+    def set_coverage_entries_provider(
+        self, provider: Callable[[], list[dict[str, Any]]]
+    ) -> None:
+        """Inject the scan-owned coverage query without importing tool code."""
+
+        self._coverage_entries = provider
 
     def get_run_dir(self) -> Path:
         if self._run_dir is None:
@@ -409,7 +418,7 @@ class ReportState:
             self.vulnerability_found_callback(report)
 
         self.vulnerability_reports.append(report)
-        notify(
+        self._notify(
             "finding.created",
             title=f"{report['severity'].title()} finding: {report['title']}",
             detail=str(report.get("target") or ""),
@@ -605,7 +614,7 @@ class ReportState:
         if self.run_record.get("storage_error"):
             raise OSError(self.run_record["storage_error"])
         self.scan_ended_exit_reason = self.scan_ended_exit_reason or "finished_by_tool"
-        notify(
+        self._notify(
             "scan.completed",
             title=f"Scan {self.run_name or self.run_id} completed",
             detail=f"{len(self.vulnerability_reports)} finding(s) recorded.",
@@ -709,12 +718,9 @@ class ReportState:
         into :meth:`_save_artifacts`.
         """
         try:
-            from strix.report.coverage import build_coverage_document, read_agent_graph
-            from strix.tools.coverage.tools import get_coverage_entries
-
             return build_coverage_document(
                 run_record=self.run_record,
-                entries=get_coverage_entries(),
+                entries=self._coverage_entries(),
                 agent_graph=read_agent_graph(runtime_state_dir(self.get_run_dir())),
                 vulnerability_reports=self.vulnerability_reports,
                 exit_reason=self.scan_ended_exit_reason,
@@ -724,8 +730,6 @@ class ReportState:
             return None
 
     def _save_artifacts(self) -> None:
-        from strix.utils.atomic import path_lock
-
         with path_lock(self.get_run_dir() / "run.json"):
             self._save_artifacts_locked()
 
@@ -765,8 +769,6 @@ class ReportState:
             except Exception:
                 logger.exception("SARIF emit failed (non-fatal; CSV/MD unaffected)")
 
-            from strix.utils.atomic import storage_failures
-
             errors = storage_failures(run_dir)
             errors.pop(str((run_dir / "run.json").resolve()), None)
             if errors:
@@ -779,12 +781,10 @@ class ReportState:
 
             logger.info("Essential scan data saved to: %s", run_dir)
         except (OSError, RuntimeError) as exc:
-            from strix.notifications import notify
-
             self.run_record["storage_error"] = str(exc)
             if self.run_record.get("status") == "completed":
                 self.run_record["status"] = "failed"
-            notify(
+            self._notify(
                 "storage.failed",
                 title="Scan data could not be saved",
                 detail=str(exc),
@@ -851,223 +851,3 @@ class ReportState:
     def _hydrate_llm_usage(self, raw_usage: Any) -> None:
         self._llm_usage.hydrate(raw_usage)
         self._sync_llm_usage_record()
-
-
-def openrouter_stream_cost(usage: Any) -> float | None:
-    """Total OpenRouter-reported cost from a raw stream ``usage`` block, or None.
-
-    Non-BYOK responses bill everything to ``usage.cost``. BYOK responses put the
-    OpenRouter fee in ``usage.cost`` (often 0) and the provider charge in
-    ``usage.cost_details.upstream_inference_cost``, so BYOK totals sum the two.
-    """
-    if not isinstance(usage, dict):
-        return None
-    total = 0.0
-    cost = usage.get("cost")
-    if isinstance(cost, int | float) and cost > 0:
-        total += float(cost)
-    if bool(usage.get("is_byok")):
-        details = usage.get("cost_details")
-        upstream = details.get("upstream_inference_cost") if isinstance(details, dict) else None
-        if isinstance(upstream, int | float) and upstream > 0:
-            total += float(upstream)
-    return total if total > 0 else None
-
-
-def _response_id(completion_response: Any) -> str | None:
-    response_id = getattr(completion_response, "id", None)
-    if response_id is None and isinstance(completion_response, dict):
-        response_id = cast("dict[str, Any]", completion_response).get("id")
-    return response_id if isinstance(response_id, str) and response_id else None
-
-
-class StreamedOpenRouterCosts:
-    """Correlates OpenRouter's per-stream cost from the parser to the cost callback.
-
-    LiteLLM rebuilds streamed responses from token-only chunks and drops the
-    ``usage.cost`` OpenRouter reports in its final stream chunk (its non-streamed
-    path preserves it; streaming snapshots hidden params at stream start). Every
-    scan streams, so the OpenRouter streaming handler (see strix.config.models)
-    records the cost here keyed by response id, and the callback takes it back out
-    for the matching rebuilt response. Entries are removed on read; ``clear()``
-    runs per scan so nothing accumulates across runs.
-    """
-
-    def __init__(self) -> None:
-        self._costs: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def remember(self, response_id: Any, usage: Any) -> None:
-        cost = openrouter_stream_cost(usage)
-        if cost is None or not (isinstance(response_id, str) and response_id):
-            return
-        with self._lock:
-            self._costs[response_id] = cost
-
-    def take(self, completion_response: Any) -> float | None:
-        response_id = _response_id(completion_response)
-        if response_id is None:
-            return None
-        with self._lock:
-            return self._costs.pop(response_id, None)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._costs.clear()
-
-
-streamed_openrouter_costs = StreamedOpenRouterCosts()
-
-
-def litellm_cost_callback(
-    kwargs: Any,
-    completion_response: Any,
-    _start_time: Any = None,
-    _end_time: Any = None,
-) -> None:
-    """LiteLLM ``success_callback`` adapter; forwards observed cost to the active scan."""
-    cost: float | None = None
-    raw = kwargs.get("response_cost") if isinstance(kwargs, dict) else None
-    if isinstance(raw, int | float) and raw > 0:
-        cost = float(raw)
-
-    if cost is None:
-        hidden = getattr(completion_response, "_hidden_params", None) or {}
-        candidate = hidden.get("response_cost") if isinstance(hidden, dict) else None
-        if isinstance(candidate, int | float) and candidate > 0:
-            cost = float(candidate)
-        else:
-            headers = hidden.get("additional_headers") or {} if isinstance(hidden, dict) else {}
-            raw = (
-                headers.get("llm_provider-x-litellm-response-cost")
-                if isinstance(headers, dict)
-                else None
-            )
-            try:
-                value = float(raw) if raw is not None else None
-            except (TypeError, ValueError):
-                value = None
-            if value is not None and value > 0:
-                cost = value
-
-    if cost is None:
-        cost = _usage_reported_cost(completion_response)
-
-    # Recover the exact OpenRouter cost the streaming handler stashed for this
-    # response — LiteLLM drops it from streamed usage, so nothing above sees it.
-    if cost is None:
-        cost = streamed_openrouter_costs.take(completion_response)
-
-    if cost is None:
-        cost = _estimate_response_cost(kwargs, completion_response)
-
-    if cost is None or cost <= 0:
-        return
-    report_state = get_global_report_state()
-    if report_state is None:
-        return
-    try:
-        report_state.record_observed_llm_cost(cost)
-    except Exception:
-        logger.exception("Failed to record observed LiteLLM cost")
-
-
-def _usage_reported_cost(completion_response: Any) -> float | None:
-    """Provider-reported cost from the ``usage`` block (e.g. OpenRouter).
-
-    Non-BYOK responses charge everything to ``usage.cost``. BYOK responses
-    charge only the OpenRouter fee to ``usage.cost`` (often 0) and report the
-    provider charge in ``usage.cost_details.upstream_inference_cost``, so the
-    true BYOK total is the sum of the two.
-    """
-    usage: Any = getattr(completion_response, "usage", None)
-    if usage is None and isinstance(completion_response, dict):
-        usage = cast("dict[str, Any]", completion_response).get("usage")
-    if usage is None:
-        return None
-
-    def _field(container: Any, name: str) -> Any:
-        if isinstance(container, dict):
-            return cast("dict[str, Any]", container).get(name)
-        return getattr(container, name, None)
-
-    total = 0.0
-    usage_cost = _field(usage, "cost")
-    if isinstance(usage_cost, int | float) and usage_cost > 0:
-        total += float(usage_cost)
-
-    if bool(_field(usage, "is_byok")):
-        upstream = _field(_field(usage, "cost_details"), "upstream_inference_cost")
-        if isinstance(upstream, int | float) and upstream > 0:
-            total += float(upstream)
-
-    return total if total > 0 else None
-
-
-def _estimate_response_cost(kwargs: Any, completion_response: Any) -> float | None:
-    """Best-effort LiteLLM cost-map estimate when no provider-reported cost exists.
-
-    LiteLLM strips provider cost fields when rebuilding streamed responses and
-    returns no ``response_cost`` for models missing from its cost map, so try
-    the provider-prefixed name, the raw name, and the bare model name.
-    """
-    from litellm import completion_cost
-
-    model = kwargs.get("model") if isinstance(kwargs, dict) else None
-    if not isinstance(model, str) or not model:
-        if isinstance(completion_response, dict):
-            model = cast("dict[str, Any]", completion_response).get("model")
-        else:
-            model = getattr(completion_response, "model", None)
-    if not isinstance(model, str) or not model:
-        return None
-
-    provider = None
-    litellm_params = kwargs.get("litellm_params") if isinstance(kwargs, dict) else None
-    if isinstance(litellm_params, dict):
-        provider = litellm_params.get("custom_llm_provider")
-
-    usage_payload = _usage_payload(completion_response)
-    if usage_payload is None:
-        return None
-
-    candidates: list[str] = []
-    if isinstance(provider, str) and provider and not model.startswith(f"{provider}/"):
-        candidates.append(f"{provider}/{model}")
-    candidates.append(model)
-    if "/" in model:
-        candidates.append(model.rsplit("/", 1)[-1])
-
-    for candidate in candidates:
-        resolved = resolve_litellm_model(candidate)
-        if not resolved:
-            continue
-        try:
-            value = completion_cost(
-                completion_response={"model": resolved, "usage": usage_payload},
-                model=resolved,
-            )
-        except Exception:  # nosec B112  # noqa: BLE001, S112
-            continue
-        if isinstance(value, int | float) and value > 0:
-            return float(value)
-    return None
-
-
-def _usage_payload(completion_response: Any) -> dict[str, Any] | None:
-    """Token counts as a plain dict, detached from the response's provider metadata."""
-    usage: Any = getattr(completion_response, "usage", None)
-    if usage is None and isinstance(completion_response, dict):
-        usage = cast("dict[str, Any]", completion_response).get("usage")
-    if usage is None:
-        return None
-    if hasattr(usage, "model_dump"):
-        usage = usage.model_dump()
-    if not isinstance(usage, dict):
-        return None
-    payload = cast("dict[str, Any]", usage)
-    if not payload.get("total_tokens") and not (
-        payload.get("prompt_tokens") or payload.get("completion_tokens")
-    ):
-        return None
-    return payload

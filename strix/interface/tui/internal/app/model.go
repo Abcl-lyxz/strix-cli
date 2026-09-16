@@ -101,67 +101,20 @@ type workspaceSearchMatch struct {
 }
 
 type Model struct {
-	dialog                 workspaceDialog
-	client                 *Client
-	width, height          int
-	snapshot               protocol.Snapshot
-	input                  textarea.Model
-	apiKeyInput            textinput.Model
-	viewport               viewport.Model
-	viewportContent        string
-	vulnViewport           viewport.Model
-	modal                  modalMode
-	focus                  focusMode
-	options                []string
-	filtered               []string
-	cursor                 int
-	collapsedAgents        map[string]bool
-	expandedEvents         map[string]bool
-	blockCache             map[string]renderedBlock
-	eventSpans             []eventSpan
-	setupLog               []string
-	pendingPrompt          string
-	pendingDrafts          map[string]string
-	outboundDrafts         map[string]string
-	errorText              string
-	fatalError             error
-	selectedAgent          int
-	selectedVuln           int
-	agentOffset            int
-	vulnOffset             int
-	mcpOffset              int
-	modalChoice            int
-	reportFocus            string
-	ready                  bool
-	quitting               bool
-	showSplash             bool
-	splashStarted          time.Time
-	splashFrame            int
-	sweepFrame             int
-	budgetPauseNotified    bool
-	followOutput           bool
-	selection              selectionState
-	toastQueue             []string
-	draftHistory           []string
-	draftIndex             int
-	pastedDraft            bool
-	toast                  string
-	toastID                int
-	draggingScrollbar      scrollbarTarget
-	stateRevision          int
-	collectionRevisions    map[string]int
-	collectionAssemblies   map[string]*collectionAssembly
-	resyncRequested        map[string]bool
-	resyncRequests         map[string]string
-	seenMessages           map[string]bool
-	vulnerabilityCopied    bool
-	vulnerabilityCopyError string
-	searchQuery            string
-	searchRoot             string
-	searchMatchCount       int
-	searchTruncated        bool
-	searchMatches          []workspaceSearchMatch
-	apiKeyError            string
+	client        *Client
+	width, height int
+	snapshot      protocol.Snapshot
+	ready         bool
+	quitting      bool
+	setupFeature
+	transcriptFeature
+	agentsFeature
+	findingsFeature
+	workspaceFeature
+	notificationFeature
+	protocolFeature
+	recoveryFeature
+	presentationFeature
 }
 
 var (
@@ -345,10 +298,21 @@ func New(client *Client) Model {
 	input.Placeholder = setupPlaceholder
 	input.Focus()
 	return Model{
-		client: client, input: input, apiKeyInput: apiKeyInput, viewport: viewport.New(80, 20), vulnViewport: viewport.New(80, 20),
-		collapsedAgents: map[string]bool{}, expandedEvents: map[string]bool{}, blockCache: map[string]renderedBlock{}, showSplash: true, splashStarted: time.Now(), followOutput: true,
-		collectionRevisions: map[string]int{}, collectionAssemblies: map[string]*collectionAssembly{}, resyncRequested: map[string]bool{}, resyncRequests: map[string]string{},
-		seenMessages: map[string]bool{}, pendingDrafts: map[string]string{}, outboundDrafts: map[string]string{},
+		client:       client,
+		setupFeature: setupFeature{input: input, apiKeyInput: apiKeyInput},
+		transcriptFeature: transcriptFeature{
+			viewport: viewport.New(80, 20), expandedEvents: map[string]bool{},
+			blockCache: map[string]renderedBlock{}, followOutput: true,
+		},
+		agentsFeature:       agentsFeature{collapsedAgents: map[string]bool{}},
+		findingsFeature:     findingsFeature{vulnViewport: viewport.New(80, 20)},
+		notificationFeature: notificationFeature{seenMessages: map[string]bool{}},
+		protocolFeature: protocolFeature{
+			collectionRevisions: map[string]int{}, collectionAssemblies: map[string]*collectionAssembly{},
+			resyncRequested: map[string]bool{}, resyncRequests: map[string]string{},
+			pendingDrafts: map[string]string{}, outboundDrafts: map[string]string{},
+		},
+		presentationFeature: presentationFeature{showSplash: true, splashStarted: time.Now()},
 	}
 }
 

@@ -4,32 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
-import threading
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from agents import RunContextWrapper, function_tool
 
+from strix.tools.artifacts import artifact_store_from_tool
 from strix.tools.nullish import clean_optional
-from strix.utils.atomic import atomic_write_text
 
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from strix.ports.artifacts import ArtifactRepository
 
 
-logger = logging.getLogger(__name__)
-
-
-_notes_storage: dict[str, dict[str, Any]] = {}
 _VALID_NOTE_CATEGORIES = ["general", "findings", "methodology", "questions", "plan", "wiki"]
-_notes_lock = threading.RLock()
 _DEFAULT_CONTENT_PREVIEW_CHARS = 280
 _NOTE_ID_GENERATION_ATTEMPTS = 1024
-
-_notes_path: Path | None = None
 
 
 def _caller_identity(ctx: RunContextWrapper) -> tuple[str | None, str | None]:
@@ -47,59 +38,16 @@ def _caller_identity(ctx: RunContextWrapper) -> tuple[str | None, str | None]:
     return agent_id, agent_name
 
 
-def _generate_note_id() -> str | None:
+def _generate_note_id(store: ArtifactRepository) -> str | None:
     for _ in range(_NOTE_ID_GENERATION_ATTEMPTS):
         note_id = uuid.uuid4().hex[:6]
-        if note_id not in _notes_storage:
+        if note_id not in store.data:
             return note_id
     return None
 
 
-def hydrate_notes_from_disk(state_dir: Path) -> None:
-    global _notes_path  # noqa: PLW0603
-    _notes_path = state_dir / "notes.json"
-    with _notes_lock:
-        _notes_storage.clear()
-        if not _notes_path.exists():
-            return
-        try:
-            data = json.loads(_notes_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.exception(
-                "notes.json at %s is unreadable; starting with empty notes",
-                _notes_path,
-            )
-            return
-        if not isinstance(data, dict):
-            return
-        _notes_storage.update(
-            {
-                nid: note
-                for nid, note in data.items()
-                if isinstance(nid, str) and isinstance(note, dict)
-            }
-        )
-        logger.info(
-            "notes hydrated from %s (%d note(s))",
-            _notes_path,
-            len(_notes_storage),
-        )
-
-
-def _persist() -> None:
-    path = _notes_path
-    if path is None:
-        return
-    try:
-        with _notes_lock:
-            atomic_write_text(
-                path, lambda: json.dumps(_notes_storage, ensure_ascii=False, default=str)
-            )
-    except Exception:
-        logger.exception("notes persist to %s failed", path)
-
-
 def _filter_notes(
+    store: ArtifactRepository,
     category: str | None = None,
     tags: list[str] | None = None,
     search_query: str | None = None,
@@ -108,7 +56,9 @@ def _filter_notes(
     search_query = clean_optional(search_query)
 
     filtered: list[dict[str, Any]] = []
-    for note_id, note in _notes_storage.items():
+    for note_id, note in store.data.items():
+        if not isinstance(note, dict):
+            continue
         if category and note.get("category") != category:
             continue
         if tags:
@@ -169,6 +119,7 @@ def _to_note_listing_entry(
 
 
 def _create_note_impl(
+    store: ArtifactRepository,
     title: str,
     content: str,
     category: str = "general",
@@ -176,7 +127,7 @@ def _create_note_impl(
     agent_id: str | None = None,
     agent_name: str | None = None,
 ) -> dict[str, Any]:
-    with _notes_lock:
+    with store.lock:
         try:
             if not title or not title.strip():
                 return {"success": False, "error": "Title cannot be empty", "note_id": None}
@@ -191,7 +142,7 @@ def _create_note_impl(
                     "note_id": None,
                 }
 
-            note_id = _generate_note_id()
+            note_id = _generate_note_id(store)
             if note_id is None:
                 return {
                     "success": False,
@@ -212,29 +163,32 @@ def _create_note_impl(
                 note["agent_id"] = agent_id
             if agent_name:
                 note["agent_name"] = agent_name
-            _notes_storage[note_id] = note
+            store.data[note_id] = note
         except (ValueError, TypeError) as e:
             return {"success": False, "error": f"Failed to create note: {e}", "note_id": None}
         else:
-            _persist()
+            store.persist()
             return {
                 "success": True,
                 "note_id": note_id,
                 "message": f"Note '{title}' created successfully",
-                "total_count": len(_notes_storage),
+                "total_count": len(store.data),
             }
 
 
 def _list_notes_impl(
+    store: ArtifactRepository,
     category: str | None = None,
     tags: list[str] | None = None,
     search: str | None = None,
     include_content: bool = False,
     caller_agent_id: str | None = None,
 ) -> dict[str, Any]:
-    with _notes_lock:
+    with store.lock:
         try:
-            filtered = _filter_notes(category=category, tags=tags, search_query=search)
+            filtered = _filter_notes(
+                store, category=category, tags=tags, search_query=search
+            )
             notes = [
                 _to_note_listing_entry(
                     n, include_content=include_content, caller_agent_id=caller_agent_id
@@ -253,16 +207,18 @@ def _list_notes_impl(
             "success": True,
             "notes": notes,
             "filtered_count": len(notes),
-            "total_count": len(_notes_storage),
+            "total_count": len(store.data),
         }
 
 
-def _get_note_impl(note_id: str, caller_agent_id: str | None = None) -> dict[str, Any]:
-    with _notes_lock:
+def _get_note_impl(
+    store: ArtifactRepository, note_id: str, caller_agent_id: str | None = None
+) -> dict[str, Any]:
+    with store.lock:
         try:
             if not note_id or not note_id.strip():
                 return {"success": False, "error": "Note ID cannot be empty", "note": None}
-            note = _notes_storage.get(note_id)
+            note = store.data.get(note_id)
             if note is None:
                 return {
                     "success": False,
@@ -279,16 +235,19 @@ def _get_note_impl(note_id: str, caller_agent_id: str | None = None) -> dict[str
 
 
 def _update_note_impl(
+    store: ArtifactRepository,
     note_id: str,
     title: str | None = None,
     content: str | None = None,
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    with _notes_lock:
+    with store.lock:
         try:
-            if note_id not in _notes_storage:
+            if note_id not in store.data:
                 return {"success": False, "error": f"Note with ID '{note_id}' not found"}
-            note = _notes_storage[note_id]
+            note = store.data[note_id]
+            if not isinstance(note, dict):
+                return {"success": False, "error": f"Note with ID '{note_id}' is invalid"}
             if title is not None:
                 if not title.strip():
                     return {"success": False, "error": "Title cannot be empty"}
@@ -303,32 +262,34 @@ def _update_note_impl(
         except (ValueError, TypeError) as e:
             return {"success": False, "error": f"Failed to update note: {e}"}
         else:
-            _persist()
+            store.persist()
             return {
                 "success": True,
                 "note_id": note_id,
                 "message": f"Note '{note['title']}' updated successfully",
-                "total_count": len(_notes_storage),
+                "total_count": len(store.data),
             }
 
 
-def _delete_note_impl(note_id: str) -> dict[str, Any]:
-    with _notes_lock:
+def _delete_note_impl(store: ArtifactRepository, note_id: str) -> dict[str, Any]:
+    with store.lock:
         try:
-            if note_id not in _notes_storage:
+            if note_id not in store.data:
                 return {"success": False, "error": f"Note with ID '{note_id}' not found"}
-            note = _notes_storage[note_id]
+            note = store.data[note_id]
+            if not isinstance(note, dict):
+                return {"success": False, "error": f"Note with ID '{note_id}' is invalid"}
             note_title = note["title"]
-            del _notes_storage[note_id]
+            del store.data[note_id]
         except (ValueError, TypeError) as e:
             return {"success": False, "error": f"Failed to delete note: {e}"}
         else:
-            _persist()
+            store.persist()
             return {
                 "success": True,
                 "note_id": note_id,
                 "message": f"Note '{note_title}' deleted successfully",
-                "total_count": len(_notes_storage),
+                "total_count": len(store.data),
             }
 
 
@@ -372,9 +333,10 @@ async def create_note(
         tags: Optional free-form tags.
     """
     agent_id, agent_name = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "notes")
     return json.dumps(
         await asyncio.to_thread(
-            _create_note_impl, title, content, category, tags, agent_id, agent_name
+            _create_note_impl, store, title, content, category, tags, agent_id, agent_name
         ),
         ensure_ascii=False,
         default=str,
@@ -411,9 +373,11 @@ async def list_notes(
             when True the full ``content`` is included.
     """
     caller_agent_id, _ = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "notes")
     return json.dumps(
         await asyncio.to_thread(
             _list_notes_impl,
+            store,
             category=category,
             tags=tags,
             search=search,
@@ -433,8 +397,9 @@ async def get_note(ctx: RunContextWrapper, note_id: str) -> str:
         note_id: Note id from ``create_note`` or a ``list_notes`` entry.
     """
     caller_agent_id, _ = _caller_identity(ctx)
+    store = artifact_store_from_tool(ctx, "notes")
     return json.dumps(
-        await asyncio.to_thread(_get_note_impl, note_id, caller_agent_id),
+        await asyncio.to_thread(_get_note_impl, store, note_id, caller_agent_id),
         ensure_ascii=False,
         default=str,
     )
@@ -460,9 +425,11 @@ async def update_note(
         content: New content, or ``None`` to keep.
         tags: New tags list, or ``None`` to keep.
     """
+    store = artifact_store_from_tool(ctx, "notes")
     return json.dumps(
         await asyncio.to_thread(
             _update_note_impl,
+            store,
             note_id=note_id,
             title=title,
             content=content,
@@ -480,6 +447,9 @@ async def delete_note(ctx: RunContextWrapper, note_id: str) -> str:
     Args:
         note_id: Note id to delete.
     """
+    store = artifact_store_from_tool(ctx, "notes")
     return json.dumps(
-        await asyncio.to_thread(_delete_note_impl, note_id), ensure_ascii=False, default=str
+        await asyncio.to_thread(_delete_note_impl, store, note_id),
+        ensure_ascii=False,
+        default=str,
     )

@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from strix.core.sessions import session_write_lock
-from strix.notifications import notify
 from strix.utils.atomic import atomic_write_text
 
 
@@ -20,6 +19,8 @@ if TYPE_CHECKING:
 
     from agents.items import TResponseInputItem
     from agents.memory import Session
+
+    from strix.ports.notifications import NotificationPublisher
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ class AgentCoordinator:
         self._reserve_stopped = False
         self._budget_paused = False
         self._extend_budget: Callable[[], None] | None = None
+        self._notifications: NotificationPublisher | None = None
+
+    def set_notification_publisher(self, publisher: NotificationPublisher) -> None:
+        self._notifications = publisher
 
     def set_snapshot_path(self, path: Path) -> None:
         self._snapshot_path = path
@@ -626,13 +631,14 @@ class AgentCoordinator:
                     raise
             except OSError:
                 logger.exception("coordinator snapshot to %s failed", path)
-                notify(
-                    "storage.failed",
-                    title="Agent state could not be saved",
-                    detail=str(path),
-                    severity="error",
-                    dedupe_key=f"storage:{path}",
-                )
+                if self._notifications is not None:
+                    self._notifications.publish(
+                        "storage.failed",
+                        title="Agent state could not be saved",
+                        detail=str(path),
+                        severity="error",
+                        dedupe_key=f"storage:{path}",
+                    )
 
 
 def coordinator_from_context(ctx: dict[str, Any]) -> AgentCoordinator | None:

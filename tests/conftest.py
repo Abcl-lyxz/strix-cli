@@ -47,7 +47,6 @@ def _isolate_global_strix_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.setattr(mcp_loader, "_session_configs", {})
     monkeypatch.setattr(secret_module, "_known_values", set())
     monkeypatch.setattr(notification_module, "_DEFAULT_PATH", tmp_path / "state.db")
-    monkeypatch.setattr(notification_module, "_default_service", None)
     for name in (
         "STRIX_ROUTES_FILE",
         "STRIX_LLM",

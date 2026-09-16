@@ -12,7 +12,7 @@ import pytest
 from agents.tool import ToolOutputImage
 
 from strix.config.settings import DEFAULT_MAX_TURNS
-from strix.interface.tui.backend.controller import TuiController
+from strix.interface.tui.backend.controller import ApplicationController
 from strix.interface.tui.backend.projection import bounded_state_projection, terminal_projection
 from strix.interface.tui.backend.protocol import (
     MAX_COMMAND_BYTES,
@@ -119,7 +119,7 @@ async def receive_initial_state(connection: socket.socket) -> None:
 async def test_server_requires_ready_before_state_or_commands() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     start_task = asyncio.create_task(server.start(backend))
     try:
         hello = await receive_message(child)
@@ -160,7 +160,7 @@ async def test_server_requires_ready_before_state_or_commands() -> None:
 async def test_server_rejects_handshake_mismatch(version: int, capabilities: list[str]) -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     start_task = asyncio.create_task(server.start(backend))
     try:
         await receive_message(child)
@@ -180,7 +180,7 @@ async def test_server_rejects_handshake_mismatch(version: int, capabilities: lis
 async def test_server_command_round_trip_over_inherited_socket() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     await start_server(server, backend, child)
     try:
         await send_message(
@@ -204,7 +204,7 @@ async def test_server_command_round_trip_over_inherited_socket() -> None:
 
 
 def test_unicode_heavy_setup_state_stays_within_control_frame_limit() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     controller.instruction = "🔒" * 10_000
     controller.targets = [f"https://例え.{index}/" + "界" * 500 for index in range(20)]
     controller.error = "失" * 10_000
@@ -234,7 +234,7 @@ def test_unicode_heavy_setup_state_stays_within_control_frame_limit() -> None:
 
 
 def test_defensive_state_projection_preserves_usage_summary() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     controller.report_state = cast(
         "Any",
         SimpleNamespace(
@@ -260,7 +260,7 @@ async def test_persistence_error_does_not_kill_command_reader(
 ) -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     calls = 0
 
     async def handle(command: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -303,7 +303,7 @@ async def test_persistence_error_does_not_kill_command_reader(
 async def test_invalid_version_error_is_correlated_and_next_command_succeeds() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     await start_server(server, backend, child)
     try:
         await send_message(
@@ -338,7 +338,7 @@ async def test_invalid_version_error_is_correlated_and_next_command_succeeds() -
 async def test_collection_bootstrap_is_chunked_deltas_are_incremental_and_idle_is_silent() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     report_state = SimpleNamespace(
         vulnerability_reports=[],
         caido_url=None,
@@ -398,7 +398,7 @@ async def test_collection_bootstrap_is_chunked_deltas_are_incremental_and_idle_i
 async def test_agents_collection_has_no_state_cap_and_sends_delete_and_resync() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     for index in range(40):
         controller.live_view.upsert_agent(
             f"agent-{index}",
@@ -455,7 +455,7 @@ async def test_agents_collection_has_no_state_cap_and_sends_delete_and_resync() 
 async def test_bootstrap_larger_than_64_mib_has_no_total_message_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     shared_projection = "x" * (1024 * 1024)
     items = [{"id": f"event-{index}", "content": shared_projection} for index in range(65)]
     frames: list[dict[str, Any]] = []
@@ -484,7 +484,7 @@ async def test_bootstrap_larger_than_64_mib_has_no_total_message_ceiling(
 
 @pytest.mark.asyncio
 async def test_oversized_terminal_projection_is_truncated_without_mutating_history() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     durable = "x" * (2 * 1024 * 1024)
     controller.live_view.record_user_message("agent", durable)
 
@@ -495,7 +495,7 @@ async def test_oversized_terminal_projection_is_truncated_without_mutating_histo
 
 
 def test_terminal_projection_strips_ansi_osc_and_c1_controls() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     hostile = "safe\x1b[31mred\x1b[0m\x1b]52;c;Y2xpcGJvYXJk\x07\x85tail"
     controller.live_view.record_user_message("agent", hostile)
 
@@ -510,7 +510,7 @@ def test_terminal_projection_strips_ansi_osc_and_c1_controls() -> None:
 
 
 def test_terminal_event_history_is_bounded_without_changing_durable_sessions() -> None:
-    controller = TuiController(args())
+    controller = ApplicationController(args())
     for index in range(10_050):
         controller.live_view.record_user_message("agent", f"message-{index}")
 
@@ -526,7 +526,7 @@ def test_terminal_event_history_is_bounded_without_changing_durable_sessions() -
 async def test_oversized_command_frame_is_rejected_before_payload_read() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     await start_server(server, backend, child)
     try:
         await asyncio.get_running_loop().sock_sendall(
@@ -544,7 +544,7 @@ async def test_oversized_command_frame_is_rejected_before_payload_read() -> None
 async def test_server_stops_when_peer_closes() -> None:
     backend, child = socket.socketpair()
     child.setblocking(False)  # noqa: FBT003
-    server = TuiBackendServer(TuiController(args()))
+    server = TuiBackendServer(ApplicationController(args()))
     await start_server(server, backend, child)
     child.close()
     try:

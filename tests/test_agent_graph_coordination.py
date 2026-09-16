@@ -10,13 +10,14 @@ to go asking.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from agents.tool_context import ToolContext
 
 from strix.core.agents import AgentCoordinator, AgentLimitReachedError
-from strix.report.state import ReportState, set_global_report_state
+from strix.report.state import ReportState
 from strix.tools.agents_graph.tools import agent_finish, send_message_to_agent, wait_for_agents
 
 
@@ -25,13 +26,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+_active_scan_context: list[SimpleNamespace | None] = [None]
+
+
 @pytest.fixture
 def report_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ReportState]:
     monkeypatch.chdir(tmp_path)
     state = ReportState(run_name="test-run")
-    set_global_report_state(state)
+    _active_scan_context[0] = SimpleNamespace(report_state=state)
     yield state
-    set_global_report_state(None)
+    _active_scan_context[0] = None
 
 
 async def _graph(*, interactive: bool) -> AgentCoordinator:
@@ -77,7 +81,12 @@ async def _call(
     tool: Any, coordinator: AgentCoordinator, agent_id: str, args: dict[str, Any], **extra: Any
 ) -> dict[str, Any]:
     ctx = ToolContext(
-        context={"coordinator": coordinator, "agent_id": agent_id, **extra},
+        context={
+            "coordinator": coordinator,
+            "agent_id": agent_id,
+            "scan_context": _active_scan_context[0],
+            **extra,
+        },
         tool_name=tool.name,
         tool_call_id="call-1",
         tool_arguments="{}",
@@ -277,7 +286,6 @@ async def test_agent_finish_states_explicitly_when_nothing_was_filed(
 
 @pytest.mark.asyncio
 async def test_agent_finish_without_report_state_still_completes() -> None:
-    set_global_report_state(None)
     coordinator = await _graph(interactive=False)
 
     result = await _call(

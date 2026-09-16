@@ -14,13 +14,9 @@ from typing import TYPE_CHECKING, Any, cast
 from agents import RunConfig, Runner
 from agents.exceptions import AgentsException, MaxTurnsExceeded, UserError
 from agents.sandbox.errors import ExecTransportError
-from openai import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-)
+from openai import APIError
 
-from strix.config import codex
+from strix.application.recovery import RecoveryPolicy, RecoverySituation
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -36,11 +32,13 @@ from strix.core.sessions import (
     strip_all_images_from_session,
     transform_session_items,
 )
+from strix.domain.execution import ExecutionPhase, ExecutionState
+from strix.domain.recovery import RecoveryLimits, TurnRecoveryState
 from strix.llm.compaction import is_context_overflow, maybe_compact
 from strix.llm.error_envelope import error_envelope
 from strix.llm.errors import classify_model_failure
 from strix.llm.tool_arguments import quarantine_history
-from strix.notifications import NotificationAction, notify
+from strix.notifications import NotificationAction
 from strix.resilience import full_jitter_delay, retry_after_seconds
 from strix.routing import AllRoutesUnavailableError
 from strix.tools.browser.tool import browser_lifecycle
@@ -64,6 +62,15 @@ StreamEventSink = Callable[[str, Any], None]
 _INPUT_REJECTION_CODES = frozenset({400, 404, 422})
 _MAX_COMPACTIONS_PER_CYCLE = 2
 _MAX_AGENT_CRASH_RESTARTS = 2
+
+
+def _publish_notification(publisher: Any, event_type: str, **kwargs: Any) -> None:
+    if publisher is None:
+        return
+    try:
+        publisher.publish(event_type, **kwargs)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        logger.exception("notification publication failed for %s", event_type)
 
 
 @cache
@@ -128,7 +135,7 @@ def _agent_tools_text(agent: Any) -> str:
 
 
 async def _compact_session(
-    agent: Any, session: Session, run_config: RunConfig, *, force: bool
+    agent: Any, session: Session, run_config: RunConfig, *, force: bool, notifications: Any = None
 ) -> bool:
     model = _run_config_model(run_config)
     if session is None or model is None:
@@ -141,6 +148,7 @@ async def _compact_session(
         force=force,
         model_provider=getattr(run_config, "model_provider", None),
         context_window_tokens=_run_config_context_capacity(run_config),
+        notifications=notifications,
     )
 
 
@@ -150,24 +158,10 @@ _TRANSIENT_MODEL_RETRY_MAX_DELAY_S = 30.0
 _TRANSIENT_MODEL_RETRY_MAX_ELAPSED_S = 120.0
 
 
-def _model_error_status_code(exc: BaseException) -> int | None:
-    code = getattr(exc, "status_code", None)
-    return code if isinstance(code, int) else None
-
-
 def _is_transient_model_error(exc: BaseException) -> bool:
-    if codex.is_content_guardrail_error(exc):
-        return False
-    if isinstance(
-        exc, APITimeoutError | APIConnectionError | TimeoutError | ConnectionError | OSError
-    ):
-        return True
-    code = _model_error_status_code(exc)
-    if code is not None:
-        import litellm
+    """Return whether the shared failure taxonomy considers this retryable."""
 
-        return bool(litellm._should_retry(code))
-    return isinstance(exc, APIError)
+    return classify_model_failure(exc) == "transient"
 
 
 def _transient_model_retry_delay(attempt: int, exc: BaseException | None = None) -> float:
@@ -757,17 +751,25 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     event_sink: StreamEventSink | None,
     hooks: RunHooks[dict[str, Any]] | None,
 ) -> RunResultBase | None:
-    image_strips = 0
-    compactions = 0
-    model_retries = 0
-    malformed_retries = 0
-    model_retry_started_at: float | None = None
-    crash_restarts = 0
-    routed_recoveries = 0
-    cycle_attempt = 0
+    scan_context = context.get("scan_context")
+    clock = getattr(getattr(scan_context, "services", None), "clock", None)
+    notifications = getattr(getattr(scan_context, "services", None), "notifications", None)
+    now = clock.monotonic if clock is not None else time.monotonic
+    sleep = clock.sleep if clock is not None else asyncio.sleep
+    state = ExecutionState(agent_id, TurnRecoveryState(started_at=now()))
+    if scan_context is not None:
+        scan_context.execution_states[agent_id] = state
+    policy = RecoveryPolicy(
+        RecoveryLimits(
+            compactions=_MAX_COMPACTIONS_PER_CYCLE,
+            model_retries=_MAX_TRANSIENT_MODEL_RETRIES,
+            crash_restarts=_MAX_AGENT_CRASH_RESTARTS,
+            max_elapsed_seconds=_TRANSIENT_MODEL_RETRY_MAX_ELAPSED_S,
+        )
+    )
     while True:
-        cycle_attempt += 1
         turn_id = uuid.uuid4().hex
+        cycle_attempt = state.begin_attempt(turn_id)
         stream: Any = None
         pre_run_items: list[Any] = []
         tool_output_committed = False
@@ -781,7 +783,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         {
                             "agent_id": agent_id,
                             "input_from_session": not bool(input_data),
-                            "compactions": compactions,
+                            "compactions": state.recovery.compactions,
                         },
                         turn_id=turn_id,
                         attempt=cycle_attempt,
@@ -796,7 +798,11 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 try:
                     await coordinator.set_operation(agent_id, "compacting")
                     proactively_compacted = await _compact_session(
-                        agent, session, run_config, force=False
+                        agent,
+                        session,
+                        run_config,
+                        force=False,
+                        notifications=notifications,
                     )
                     if proactively_compacted:
                         await coordinator.record_compaction(agent_id)
@@ -824,11 +830,21 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                             # Recovery budgets are per turn, not per agent
                             # lifetime. A successful model/tool boundary proves
                             # this session is healthy again.
-                            crash_restarts = 0
-                            model_retries = 0
-                            malformed_retries = 0
-                            model_retry_started_at = None
-                            routed_recoveries = 0
+                            recovered = state.recovery.attempts > 0
+                            state.checkpoint(now(), tool_completed=tool_completed)
+                            if recovered:
+                                _publish_notification(
+                                    notifications,
+                                    "model.progress",
+                                    title=f"Agent {agent_id} made progress after recovery",
+                                    detail=(
+                                        "A new model/tool checkpoint was committed; the recovery "
+                                        "incident is now resolved."
+                                    ),
+                                    severity="info",
+                                    agent_id=agent_id,
+                                    dedupe_key=f"post-recovery-progress:{agent_id}",
+                                )
                             if session is not None:
                                 with contextlib.suppress(Exception):
                                     await record_session_event(
@@ -839,6 +855,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                                         attempt=cycle_attempt,
                                     )
                         tool_output_committed = tool_output_committed or tool_completed
+                        state.tool_output_committed = tool_output_committed
                         if event_sink is not None:
                             try:
                                 event_sink(agent_id, event)
@@ -916,7 +933,8 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     ),
                     None,
                 )
-                notify(
+                _publish_notification(
+                    notifications,
                     "agent.waiting",
                     title=(
                         f"Agent {agent_id} is blocked on model configuration"
@@ -930,93 +948,136 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     dedupe_key=f"agent-route-wait:{agent_id}",
                     actions=(NotificationAction("open_agent", "View agent", agent_id),),
                 )
+                decision = policy.decide(
+                    state.recovery,
+                    RecoverySituation(
+                        failure="transient",
+                        safe_to_retry=True,
+                        interactive=interactive,
+                        has_route_pool=True,
+                        elapsed_seconds=now() - state.recovery.started_at,
+                    ),
+                )
+                if decision.action == "wait_for_route":
+                    state.recovery.record(decision.action, decision.failure)
+                state.transition(ExecutionPhase.WAITING)
                 raise
-            if (
-                image_strips < 3
-                and session is not None
-                and getattr(exc, "status_code", None) in _INPUT_REJECTION_CODES
-                and classify_model_failure(exc) != "malformed"
-            ):
-                try:
-                    stripped = await strip_all_images_from_session(session)
-                except Exception:
-                    logger.exception("image-strip recovery failed for %s", agent_id)
-                    stripped = False
-                if stripped:
-                    image_strips += 1
-                    logger.info(
-                        "Stripped images from %s session after rejection; retrying (%d)",
-                        agent_id,
-                        image_strips,
-                    )
-                    input_data = []
-                    continue
-            if (
-                compactions < _MAX_COMPACTIONS_PER_CYCLE
-                and session is not None
-                and is_context_overflow(exc)
-            ):
-                try:
-                    await coordinator.set_operation(agent_id, "compacting")
-                    compacted = await _compact_session(agent, session, run_config, force=True)
-                except Exception:
-                    logger.exception("overflow compaction recovery failed for %s", agent_id)
-                    compacted = False
-                finally:
-                    await coordinator.set_operation(agent_id, "running")
-                if compacted:
-                    compactions += 1
-                    await coordinator.record_compaction(agent_id)
-                    logger.info(
-                        "Compacted %s session after context overflow; retrying (%d)",
-                        agent_id,
-                        compactions,
-                    )
-                    input_data = []
-                    continue
-            if classify_model_failure(exc) == "malformed" and malformed_retries < 2:
-                safe = not tool_output_committed
-                if tool_output_committed and session is not None:
-                    safe = await _salvage_stream_to_session(
-                        session, pre_run_items, stream, agent_id
-                    )
-                if safe:
-                    malformed_retries += 1
-                    if session is not None:
-                        repaired = await transform_session_items(session, quarantine_history)
-                        if not repaired:
-                            await session.add_items(
-                                [
-                                    {
-                                        "role": "user",
-                                        "content": "The provider returned malformed arguments. "
-                                        "Continue from saved results using strict JSON objects. "
-                                        "Do not repeat completed tool actions.",
-                                    }
-                                ]
-                            )
-                        input_data = []
-                    notify(
-                        "model.history_recovery",
-                        title="Repairing model conversation history",
-                        detail=(
-                            f"Attempt {malformed_retries}/2; completed tool actions are preserved."
-                        ),
-                        severity="warning",
-                        agent_id=agent_id,
-                        dedupe_key=f"history-recovery:{agent_id}",
-                    )
-                    continue
+
+            failure = (
+                "policy"
+                if isinstance(exc, ProviderRefusalError)
+                else classify_model_failure(exc)
+            )
             safe_tool_state = not tool_output_committed
             if tool_output_committed and session is not None:
                 safe_tool_state = await _salvage_stream_to_session(
                     session, pre_run_items, stream, agent_id
                 )
             route_pool = context.get("route_pool")
-            if safe_tool_state and route_pool is not None and _is_transient_model_error(exc):
-                routed_recoveries += 1
+            retry_delay = _transient_model_retry_delay(
+                state.recovery.model_retries + 1,
+                exc,
+            )
+            elapsed = now() - state.recovery.started_at
+            decision = policy.decide(
+                state.recovery,
+                RecoverySituation(
+                    failure=failure,
+                    safe_to_retry=safe_tool_state,
+                    interactive=interactive,
+                    has_route_pool=route_pool is not None,
+                    can_strip_images=(
+                        session is not None
+                        and getattr(exc, "status_code", None) in _INPUT_REJECTION_CODES
+                        and failure != "malformed"
+                    ),
+                    can_compact=session is not None and is_context_overflow(exc),
+                    elapsed_seconds=(
+                        elapsed + retry_delay if failure in {"transient", "fatal"} else elapsed
+                    ),
+                    retry_delay=retry_delay,
+                ),
+            )
+            state.transition(ExecutionPhase.RECOVERING)
+
+            if decision.action == "strip_images" and session is not None:
+                state.recovery.record(decision.action, decision.failure)
+                try:
+                    stripped = await strip_all_images_from_session(session)
+                except Exception:
+                    logger.exception("image-strip recovery failed for %s", agent_id)
+                    stripped = False
+                if stripped:
+                    logger.info(
+                        "Stripped images from %s session after rejection; retrying (%d)",
+                        agent_id,
+                        state.recovery.image_strips,
+                    )
+                    input_data = []
+                    continue
+
+            if decision.action == "compact" and session is not None:
+                state.recovery.record(decision.action, decision.failure)
+                try:
+                    await coordinator.set_operation(agent_id, "compacting")
+                    compacted = await _compact_session(
+                        agent,
+                        session,
+                        run_config,
+                        force=True,
+                        notifications=notifications,
+                    )
+                except Exception:
+                    logger.exception("overflow compaction recovery failed for %s", agent_id)
+                    compacted = False
+                finally:
+                    await coordinator.set_operation(agent_id, "running")
+                if compacted:
+                    await coordinator.record_compaction(agent_id)
+                    logger.info(
+                        "Compacted %s session after context overflow; retrying (%d)",
+                        agent_id,
+                        state.recovery.compactions,
+                    )
+                    input_data = []
+                    continue
+
+            if decision.action == "repair_history":
+                state.recovery.record(decision.action, decision.failure)
+                if session is not None:
+                    repaired = await transform_session_items(session, quarantine_history)
+                    if not repaired:
+                        await session.add_items(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": "The provider returned malformed arguments. "
+                                    "Continue from saved results using strict JSON objects. "
+                                    "Do not repeat completed tool actions.",
+                                }
+                            ]
+                        )
+                    input_data = []
+                _publish_notification(
+                    notifications,
+                    "model.history_recovery",
+                    title="Repairing model conversation history",
+                    detail=(
+                        f"Attempt {state.recovery.history_repairs}/"
+                        f"{policy.limits.history_repairs}; completed tool actions are preserved."
+                    ),
+                    severity="warning",
+                    agent_id=agent_id,
+                    dedupe_key=f"history-recovery:{agent_id}",
+                )
+                continue
+
+            if decision.action == "wait_for_route" and route_pool is not None:
+                state.recovery.record(decision.action, decision.failure)
+                state.transition(ExecutionPhase.WAITING)
                 await coordinator.park_waiting(agent_id, wait_kind="provider")
-                notify(
+                _publish_notification(
+                    notifications,
                     "agent.waiting",
                     title=f"Agent {agent_id} is waiting for provider recovery",
                     detail=(
@@ -1030,60 +1091,51 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     raise AllRoutesUnavailableError(
                         "model stream interrupted; waiting for a healthy route"
                     ) from exc
-                if routed_recoveries > 2:
-                    raise AllRoutesUnavailableError(
-                        "model stream recovery budget exhausted after two resumptions"
-                    ) from exc
                 wait_for_route = getattr(route_pool, "wait_until_available", None)
                 if callable(wait_for_route):
-                    timeout = float(getattr(route_pool, "wait_timeout", None) or 600)
+                    remaining = max(
+                        0.1,
+                        policy.limits.max_elapsed_seconds
+                        - (now() - state.recovery.started_at),
+                    )
+                    timeout = min(
+                        float(getattr(route_pool, "wait_timeout", None) or 600),
+                        remaining,
+                    )
                     await asyncio.wait_for(wait_for_route(), timeout=timeout)
                     input_data = [] if session is not None else input_data
                     continue
-            if (
-                safe_tool_state
-                and route_pool is None
-                and model_retries < _MAX_TRANSIENT_MODEL_RETRIES
-                and _is_transient_model_error(exc)
-            ):
-                now = time.monotonic()
-                if model_retry_started_at is None:
-                    model_retry_started_at = now
-                model_retries += 1
-                delay = _transient_model_retry_delay(model_retries, exc)
-                elapsed = now - model_retry_started_at
-                if elapsed + delay > _TRANSIENT_MODEL_RETRY_MAX_ELAPSED_S:
-                    logger.warning(
-                        "transient model/provider retry budget exhausted for %s after %.1fs",
-                        agent_id,
-                        elapsed,
-                    )
-                    model_retries = _MAX_TRANSIENT_MODEL_RETRIES
-                else:
-                    logger.warning(
-                        "transient model/provider error for %s; replaying turn "
-                        "(attempt %d/%d, backoff %.1fs): %r",
-                        agent_id,
-                        model_retries,
-                        _MAX_TRANSIENT_MODEL_RETRIES,
-                        delay,
-                        exc,
-                    )
-                    notify(
-                        "model.retry",
-                        title=f"Retrying model in {delay:.1f}s",
-                        detail=f"Attempt {model_retries}/{_MAX_TRANSIENT_MODEL_RETRIES}",
-                        severity="warning",
-                        agent_id=agent_id,
-                        dedupe_key=f"model-retry:{context.get('scan_id', '')}:{agent_id}",
-                    )
-                    await coordinator.set_operation(agent_id, "retrying")
-                    await asyncio.sleep(delay)
-                    if session is not None:
-                        input_data = []
-                    continue
-            if session is not None:
-                await _salvage_stream_to_session(session, pre_run_items, stream, agent_id)
+
+            if decision.action == "retry_model":
+                state.recovery.record(decision.action, decision.failure)
+                delay = decision.delay_seconds
+                logger.warning(
+                    "transient model/provider error for %s; replaying turn "
+                    "(attempt %d/%d, backoff %.1fs): %r",
+                    agent_id,
+                    state.recovery.model_retries,
+                    policy.limits.model_retries,
+                    delay,
+                    exc,
+                )
+                _publish_notification(
+                    notifications,
+                    "model.retry",
+                    title=f"Retrying model in {delay:.1f}s",
+                    detail=(
+                        f"Attempt {state.recovery.model_retries}/"
+                        f"{policy.limits.model_retries}"
+                    ),
+                    severity="warning",
+                    agent_id=agent_id,
+                    dedupe_key=f"model-retry:{context.get('scan_id', '')}:{agent_id}",
+                )
+                await coordinator.set_operation(agent_id, "retrying")
+                await sleep(delay)
+                if session is not None:
+                    input_data = []
+                continue
+
             if isinstance(exc, ProviderRefusalError):
                 logger.warning("agent %s refused by the model provider: %s", agent_id, exc)
                 await coordinator.set_status(agent_id, "failed", error=str(exc))
@@ -1091,7 +1143,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 return None
             if isinstance(exc, MaxTurnsExceeded):
                 status: Status = "stopped"
-            elif classify_model_failure(exc) in {
+            elif failure in {
                 "authentication",
                 "billing",
                 "incompatible",
@@ -1101,9 +1153,10 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 status = "failed"
             else:
                 status = "crashed"
-            if status == "crashed" and crash_restarts < _MAX_AGENT_CRASH_RESTARTS:
-                crash_restarts += 1
-                notify(
+            if status == "crashed" and decision.action == "restart_agent":
+                state.recovery.record(decision.action, decision.failure)
+                _publish_notification(
+                    notifications,
                     "agent.crashed",
                     title=f"Agent {agent_id} crashed",
                     detail=str(exc) or type(exc).__name__,
@@ -1115,10 +1168,11 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 logger.exception(
                     "agent %s crashed; restarting same session (%d/%d)",
                     agent_id,
-                    crash_restarts,
-                    _MAX_AGENT_CRASH_RESTARTS,
+                    state.recovery.crash_restarts,
+                    policy.limits.crash_restarts,
                 )
-                notify(
+                _publish_notification(
+                    notifications,
                     "agent.restarted",
                     title=f"Agent {agent_id} restarted",
                     severity="warning",
@@ -1126,15 +1180,17 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     dedupe_key=f"agent-restart:{agent_id}",
                 )
                 input_data = [] if session is not None else input_data
-                await asyncio.sleep(_transient_model_retry_delay(crash_restarts))
+                await sleep(decision.delay_seconds)
                 continue
+            state.transition(ExecutionPhase.FAILED)
             logger.exception("agent run failed for %s; marking %s", agent_id, status)
             # Settle the status and wake the parent before the exception unwinds a
             # non-interactive agent's task: a child that dies still owes its parent a
             # report, and the parent would otherwise wait out its timeout on a message
             # the dead child can no longer send.
             await coordinator.set_status(agent_id, status, error=str(exc) or type(exc).__name__)
-            notify(
+            _publish_notification(
+                notifications,
                 f"agent.{status}",
                 title=f"Agent {agent_id} {status}",
                 detail=str(exc) or type(exc).__name__,

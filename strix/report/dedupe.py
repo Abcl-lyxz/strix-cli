@@ -16,7 +16,6 @@ from strix.config.models import (
     configure_sdk_model_defaults,
 )
 from strix.core.inputs import make_model_settings
-from strix.report.state import get_global_report_state
 
 
 if TYPE_CHECKING:
@@ -25,6 +24,7 @@ if TYPE_CHECKING:
     from agents.models.interface import Model
 
     from strix.config.settings import DedupeSettings
+    from strix.ports.reporting import UsageRepository
 
 
 logger = logging.getLogger(__name__)
@@ -326,7 +326,9 @@ def _extract_text(response: ModelResponse) -> str:
 
 
 async def check_duplicate(
-    candidate: dict[str, Any], existing_reports: list[dict[str, Any]]
+    candidate: dict[str, Any],
+    existing_reports: list[dict[str, Any]],
+    usage_repository: UsageRepository | None = None,
 ) -> dict[str, Any]:
     if not existing_reports:
         return {
@@ -377,9 +379,8 @@ async def check_duplicate(
             conversation_id=None,
             prompt=None,
         )
-        report_state = get_global_report_state()
-        if report_state is not None:
-            report_state.record_sdk_usage(
+        if usage_repository is not None:
+            usage_repository.record_sdk_usage(
                 agent_id="dedupe",
                 agent_name="dedupe",
                 model=resolved_model,

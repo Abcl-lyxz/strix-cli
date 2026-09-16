@@ -10,6 +10,8 @@ from typing import Any
 from agents import RunContextWrapper, function_tool
 
 from strix.core.agents import coordinator_from_context
+from strix.report.coverage import agents_from_graph, skill_coverage_gaps
+from strix.tools.coverage.tools import get_coverage_entries
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,8 @@ def _do_finish(
     technical_analysis: str,
     recommendations: str,
     agent_graph: dict[str, Any],
+    coverage_entries: list[dict[str, Any]],
+    report_state: Any | None = None,
 ) -> dict[str, Any]:
     if parent_id is not None:
         return {
@@ -46,11 +50,8 @@ def _do_finish(
         return {"success": False, "error": "Validation failed", "errors": errors}
 
     try:
-        from strix.report.state import get_global_report_state
-
-        report_state = get_global_report_state()
         if report_state is None:
-            logger.warning("No global report state; scan results not persisted")
+            logger.warning("No scan report state; scan results not persisted")
             return {
                 "success": True,
                 "scan_completed": True,
@@ -64,7 +65,7 @@ def _do_finish(
             recommendations=recommendations.strip(),
         )
         vuln_count = len(report_state.vulnerability_reports)
-        coverage_summary = _coverage_summary(agent_graph)
+        coverage_summary = _coverage_summary(agent_graph, coverage_entries)
     except (ImportError, AttributeError) as e:
         logger.exception("finish_scan persistence failed")
         return {"success": False, "error": f"Failed to complete scan: {e!s}"}
@@ -83,7 +84,9 @@ def _do_finish(
         return result
 
 
-def _coverage_summary(agent_graph: dict[str, Any]) -> dict[str, Any]:
+def _coverage_summary(
+    agent_graph: dict[str, Any], entries: list[dict[str, Any]]
+) -> dict[str, Any]:
     """Coverage counts, unresolved surfaces, and gaps the runtime can see.
 
     The gap list is derived from the agent graph rather than from the ledger,
@@ -93,10 +96,6 @@ def _coverage_summary(agent_graph: dict[str, Any]) -> dict[str, Any]:
     can still dispatch work or record the class as unresolved instead of
     letting the report imply it was clean.
     """
-    from strix.report.coverage import agents_from_graph, skill_coverage_gaps
-    from strix.tools.coverage.tools import get_coverage_entries, outcome_counts
-
-    entries = get_coverage_entries()
     if not entries:
         return {
             "coverage_recorded": 0,
@@ -107,7 +106,10 @@ def _coverage_summary(agent_graph: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
-    counts = outcome_counts()
+    counts: dict[str, int] = {}
+    for entry in entries:
+        outcome = str(entry.get("outcome", "")).lower()
+        counts[outcome] = counts.get(outcome, 0) + 1
     summary: dict[str, Any] = {
         "coverage_recorded": len(entries),
         "coverage_outcomes": counts,
@@ -312,6 +314,10 @@ async def finish_scan(
         recommendations: Prioritized, actionable remediation.
     """
     inner = ctx.context if isinstance(ctx.context, dict) else {}
+    scan_context = inner.get("scan_context")
+    coverage_entries: list[dict[str, Any]] = []
+    if scan_context is not None:
+        coverage_entries = get_coverage_entries(scan_context.artifact_store("coverage"))
     coordinator = coordinator_from_context(inner)
     me = inner.get("agent_id")
     parent_id = inner.get("parent_id")
@@ -345,6 +351,8 @@ async def finish_scan(
         technical_analysis=technical_analysis,
         recommendations=recommendations,
         agent_graph=await coordinator.snapshot() if coordinator is not None else {},
+        coverage_entries=coverage_entries,
+        report_state=getattr(scan_context, "report_state", None),
     )
     if (
         result.get("success")

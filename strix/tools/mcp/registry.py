@@ -31,8 +31,8 @@ from strix.tools.mcp.session import SupervisedMcpSession
 if TYPE_CHECKING:
     from agents.mcp import MCPServer
 
-    from strix.tools.mcp.client import ResultTransform
     from strix.tools.mcp.config import McpConnectionConfig
+    from strix.tools.mcp.transport import ResultTransform
 
 
 # The run-context key under which the runner stores the per-run registry, and

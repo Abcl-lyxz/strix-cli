@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
 
-from strix.report.state import ReportState, set_global_report_state
-from strix.tools.reporting.tool import (
-    _do_get_report,
-    _do_list_reports,
+from strix.report.state import ReportState
+from strix.tools.reporting.queries import (
+    _do_get_report as _raw_do_get_report,
+)
+from strix.tools.reporting.queries import (
+    _do_list_reports as _raw_do_list_reports,
+)
+from strix.tools.reporting.queries import (
     get_report,
     list_reports,
 )
@@ -20,11 +25,20 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.fixture
+_do_get_report = _raw_do_get_report
+_do_list_reports = _raw_do_list_reports
+
+
+@pytest.fixture(autouse=True)
 def report_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReportState:
     monkeypatch.chdir(tmp_path)
     state = ReportState(run_name="test-run")
-    set_global_report_state(state)
+    monkeypatch.setitem(
+        globals(), "_do_get_report", partial(_raw_do_get_report, report_state=state)
+    )
+    monkeypatch.setitem(
+        globals(), "_do_list_reports", partial(_raw_do_list_reports, report_state=state)
+    )
     return state
 
 
@@ -422,10 +436,14 @@ def test_list_reports_severity_counts_ordered_with_none_bucket(
 
 
 @pytest.mark.usefixtures("report_state")
-def test_list_reports_no_state_returns_warning(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("strix.report.state.get_global_report_state", lambda: None)
+def test_list_reports_no_state_returns_warning() -> None:
     result = _do_list_reports(
-        severity=None, finding_class=None, target=None, search=None, include_details=False
+        severity=None,
+        finding_class=None,
+        target=None,
+        search=None,
+        include_details=False,
+        report_state=None,
     )
     assert result["success"] is True
     assert result["reports"] == []
@@ -433,9 +451,8 @@ def test_list_reports_no_state_returns_warning(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.usefixtures("report_state")
-def test_get_report_no_state_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("strix.report.state.get_global_report_state", lambda: None)
-    result = _do_get_report("vuln-0001")
+def test_get_report_no_state_returns_error() -> None:
+    result = _do_get_report("vuln-0001", report_state=None)
     assert result["success"] is False
     assert result["report"] is None
 

@@ -1,4 +1,4 @@
-"""Tests for local-source collection and mount policy in interface.utils."""
+"""Tests for local-source collection and mount policy in interface.targets."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from strix.interface.scan_setup import attach_workspace_mount
-from strix.interface.utils import (
+from strix.interface.targets import (
     check_mountable_dir,
     collect_local_sources,
     dedupe_local_targets,

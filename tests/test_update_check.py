@@ -60,7 +60,6 @@ def _isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update_check, "_CACHE_PATH", tmp_path / "update-check.json")
     monkeypatch.setattr(update_check, "_background_thread", None)
     monkeypatch.delenv("STRIX_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr(update_check, "_active_scan", lambda: False)
     monkeypatch.setattr(update_check, "_needs_package_handoff", lambda: False)
     for key in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS_URL", "BUILDKITE", "CIRCLECI"):
         monkeypatch.delenv(key, raising=False)
@@ -448,11 +447,15 @@ def test_active_scan_blocks_update_before_download(monkeypatch: pytest.MonkeyPat
         called = True
         return True
 
-    monkeypatch.setattr(update_check, "_active_scan", lambda: True)
     monkeypatch.setattr(update_check, "_download_and_replace", download)
     monkeypatch.setattr(update_check, "notify", lambda *_args, **_kwargs: None)
 
-    assert update_check.self_update(Console(file=io.StringIO()), version="1.7.0") is False
+    assert (
+        update_check.self_update(
+            Console(file=io.StringIO()), version="1.7.0", scan_status="running"
+        )
+        is False
+    )
     assert called is False
 
 

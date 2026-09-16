@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -361,14 +362,15 @@ async def test_cleanup_removes_the_extra_file_staging_dir() -> None:
         async def delete(self, _session: Any) -> None:
             return None
 
-    session_manager._SESSION_CACHE["scan-staging-cleanup"] = {
+    scan_context = SimpleNamespace(runtime_resources={})
+    scan_context.runtime_resources["sandbox_bundle"] = {
         "client": _Client(),
         "session": object(),
         "caido_client": None,
         "extra_file_staging_dir": staging,
     }
 
-    await session_manager.cleanup("scan-staging-cleanup")
+    await session_manager.cleanup("scan-staging-cleanup", scan_context)
 
     assert not staging.exists()
 

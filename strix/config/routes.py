@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from strix.config.loader import config_path, read_config_document, write_config_document
-from strix.routing import RouteConfig
+from strix.domain.routes import RouteConfig
 from strix.security import get_secret_store
 
 
