@@ -265,7 +265,7 @@ On Windows, package updates are staged first. Strix exits so an independent inst
 Versions 1.7.0 and 1.8.0 can incorrectly look up an upstream PyPI version and then report a missing GitHub manifest. Version 1.9.0 can briefly expose a partially rebuilt uv environment if Strix is relaunched while its background installer is still running. For a Windows uv installation on any of those versions, bootstrap the fixed updater once with:
 
 ```powershell
-uv tool install --upgrade-package strix-agent --reinstall-package strix-agent https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.9.2/strix_agent-1.9.2-py3-none-win_amd64.whl
+uv tool install --upgrade-package strix-agent --reinstall-package strix-agent https://github.com/Abcl-lyxz/strix-cli/releases/download/v1.9.3/strix_agent-1.9.3-py3-none-win_amd64.whl
 strix --version
 ```
 
