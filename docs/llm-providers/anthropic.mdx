@@ -1,24 +1,8 @@
 ---
 title: "Anthropic"
-description: "Configure Strix with Claude models"
+description: "Connect Anthropic through the provider-native TUI adapter"
 ---
 
-## Setup
+Run `/connect`, choose **Anthropic**, and enter the API key. Open `/models` to inspect catalog metadata, capability verification, and enabled models.
 
-```bash
-export STRIX_LLM="anthropic/claude-sonnet-4-6"
-export LLM_API_KEY="sk-ant-..."
-```
-
-## Available Models
-
-| Model | Description |
-|-------|-------------|
-| `anthropic/claude-sonnet-4-6` | Best balance of intelligence and speed |
-| `anthropic/claude-opus-4-6` | Maximum capability for deep analysis |
-
-## Get API Key
-
-1. Go to [console.anthropic.com](https://console.anthropic.com)
-2. Navigate to API Keys
-3. Create a new key
+An `ANTHROPIC_API_KEY` environment value is a read-only detection hint, not configuration precedence.

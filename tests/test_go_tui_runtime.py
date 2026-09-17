@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import io
 import json
@@ -10,13 +9,15 @@ import socket
 import struct
 import sys
 import threading
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
+from strix.domain.app_state import LaunchState, ScanDraft
 from strix.interface.tui import runtime as go_tui
 from strix.interface.tui import sidecar
 from strix.interface.tui.backend.protocol import PROTOCOL_CAPABILITIES, PROTOCOL_VERSION
@@ -24,17 +25,23 @@ from strix.interface.tui.runtime import GoTuiRuntime
 from strix.report.state import ReportState
 
 
-def args() -> argparse.Namespace:
-    return argparse.Namespace(
+if TYPE_CHECKING:
+    import argparse
+
+
+def args() -> LaunchState:
+    return LaunchState(
+        draft=ScanDraft(
+            targets_info=[],
+            instruction=None,
+            scan_mode="deep",
+            max_budget_usd=None,
+            max_turns=DEFAULT_MAX_TURNS,
+            max_agents=DEFAULT_MAX_AGENTS,
+            scope_mode="auto",
+            diff_base=None,
+        ),
         needs_setup=True,
-        targets_info=[],
-        instruction=None,
-        scan_mode="deep",
-        max_budget_usd=None,
-        max_turns=DEFAULT_MAX_TURNS,
-        max_agents=DEFAULT_MAX_AGENTS,
-        scope_mode="auto",
-        diff_base=None,
         local_sources=[],
         diff_scope={"active": False},
         user_explicit_instruction=None,
@@ -318,11 +325,7 @@ async def test_setup_preflights_model_before_starting(
         assert model == "openrouter/test-model"
         calls.append("preflight")
 
-    monkeypatch.setattr(
-        go_tui,
-        "load_settings",
-        lambda: SimpleNamespace(llm=SimpleNamespace(model="openrouter/test-model")),
-    )
+    _setup_model(monkeypatch)
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
 
     def build(candidate: argparse.Namespace, **_: object) -> None:
@@ -370,10 +373,23 @@ async def test_setup_preflights_model_before_starting(
 def _setup_model(
     monkeypatch: pytest.MonkeyPatch, model: str | None = "openrouter/test-model"
 ) -> None:
+    if model is None:
+
+        def configured(_runtime: GoTuiRuntime) -> str:
+            raise ValueError("No eligible model configured")
+
+        monkeypatch.setattr(GoTuiRuntime, "_configured_model", configured)
+        monkeypatch.setattr(
+            GoTuiRuntime,
+            "_connection_signature",
+            lambda _runtime: ("", "", ""),
+        )
+        return
+    monkeypatch.setattr(GoTuiRuntime, "_configured_model", lambda _runtime: model)
     monkeypatch.setattr(
-        go_tui,
-        "load_settings",
-        lambda: SimpleNamespace(llm=SimpleNamespace(model=model)),
+        GoTuiRuntime,
+        "_connection_signature",
+        lambda _runtime: (model, "test-secret-digest", ""),
     )
 
 
@@ -814,7 +830,6 @@ async def test_setup_rebuild_canonicalizes_relative_local_target(
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -830,7 +845,7 @@ async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
             "original": "https://example.com",
         }
     ]
-    original_args = json.loads(json.dumps(vars(runtime_args)))
+    original_args = deepcopy(runtime_args)
     runtime = GoTuiRuntime(runtime_args)
     runtime.controller.scan_mode = "quick"
     runtime.controller.instruction = ""
@@ -849,18 +864,14 @@ async def test_setup_prepare_system_exit_is_recoverable_and_transactional(
         nonlocal telemetry_started
         telemetry_started = True
 
-    monkeypatch.setattr(
-        go_tui,
-        "load_settings",
-        lambda: SimpleNamespace(llm=SimpleNamespace(model="openrouter/test-model")),
-    )
+    _setup_model(monkeypatch)
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "prepare_run", fail_prepare)
 
     with pytest.raises(ValueError, match="invalid diff scope"):
         await runtime.start_from_setup()
 
-    assert vars(runtime.args) == original_args
+    assert runtime.args == original_args
     assert telemetry_started is False
     assert runtime.scan_task is None
 
@@ -930,23 +941,17 @@ async def test_setup_rechecks_same_model_after_credential_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = GoTuiRuntime(args())
-    connection = {
-        "model": "openai/gpt-5.4",
-        "api_key": "new-key",
-        "api_base": "https://gateway.example/v1",
-    }
+    model = "openai/gpt-5.4"
+    base_url = "https://gateway.example/v1"
     runtime.model_verified = True
-    runtime.verified_connection = (
-        connection["model"],
-        "old-key",
-        connection["api_base"],
-    )
+    runtime.verified_connection = (model, "old-revision-digest", base_url)
     checked: list[str] = []
 
+    monkeypatch.setattr(runtime, "_configured_model", lambda: model)
     monkeypatch.setattr(
-        go_tui,
-        "load_settings",
-        lambda: SimpleNamespace(llm=SimpleNamespace(**connection)),
+        runtime,
+        "_connection_signature",
+        lambda: (model, "new-revision-digest", base_url),
     )
 
     async def preflight(model: str, **_options: Any) -> None:
@@ -956,9 +961,9 @@ async def test_setup_rechecks_same_model_after_credential_change(
 
     await runtime.ensure_model_verified()
 
-    assert checked == ["openai/gpt-5.4"]
+    assert checked == [model]
     assert runtime.verified_connection == runtime._connection_signature()
-    assert "new-key" not in str(runtime.verified_connection)
+    assert "key" not in str(runtime.verified_connection)
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1039,7 @@ async def test_agent_state_sync_does_not_reopen_stopped_scan_with_active_root() 
     assert runtime.controller.scan_state == "stopped"
 
 
-def _direct_launch_args() -> argparse.Namespace:
+def _direct_launch_args() -> LaunchState:
     launch_args = args()
     launch_args.needs_setup = False
     return launch_args

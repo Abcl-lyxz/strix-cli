@@ -1,61 +1,14 @@
 ---
-title: "Doctor and VPN troubleshooting"
-description: "Diagnose Strix, Docker, model configuration, proxies, and container networking"
+title: "Doctor"
+description: "Diagnose the local Strix installation"
 ---
 
-Run the read-only doctor before a scan when installation or Docker connectivity is unclear:
+Run the only diagnostic utility available outside the TUI:
 
 ```bash
 strix doctor
-strix doctor --network
-strix doctor --network --json
 ```
 
-The base command checks the Strix/Python installation, proxy variables, Docker endpoint and
-daemon, sandbox image, and AI model configuration. `--network` additionally starts a disposable
-sandbox container and checks outbound HTTPS, which separates a Docker-daemon problem from a
-VPN, DNS, firewall, or proxy problem inside containers.
+Doctor checks the local installation and Docker prerequisites without starting a scan. Provider-specific connection diagnostics are also available from `/doctor` and `/connect` inside the TUI, where the selected AppConfig v3 connection is explicit.
 
-## Windows, WSL, and VPNs
-
-Keep Strix and Docker in the same environment. If Docker Engine is installed in Ubuntu/WSL,
-install and run Strix in that Ubuntu distribution too. It will use `/var/run/docker.sock`; do not
-expose Docker on an unauthenticated `tcp://localhost:2375` endpoint. A Docker API endpoint grants
-host-level control, and TCP endpoints are more likely to be disrupted by VPN/firewall route
-changes.
-
-```bash
-# Run inside Ubuntu/WSL
-docker version
-strix doctor --network
-strix --target ./your-app
-```
-
-If the Docker daemon passes but container HTTPS fails:
-
-1. Remove stale `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` variables, especially loopback
-   endpoints that are not running in the same environment.
-2. Check Docker's DNS configuration and the VPN's local-network/firewall setting.
-3. If you intentionally exclude Docker from the VPN, remember that its traffic will reveal your
-   normal public IP. Keeping Docker inside the VPN is the safer default.
-
-## Command not found
-
-Run `command -v strix` in the same shell where `docker version` works. If Strix is installed under
-`~/.local/bin`, ensure that directory is in `PATH`, then open a new shell:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-command -v strix
-```
-
-To launch that WSL installation directly from PowerShell, copy the included bridge to a directory
-on your Windows `PATH`:
-
-```powershell
-Copy-Item .\scripts\strix-wsl.ps1 "$HOME\.local\bin\strix.ps1"
-strix --version
-```
-
-It uses the `Ubuntu` distribution by default. Set `STRIX_WSL_DISTRO` if Docker and Strix live in a
-different WSL distribution.
+If a provider or network check fails, verify Docker, proxy/VPN routing, the adapter's credential source, and the provider's native endpoint. Do not work around a failed connection by passing removed v1 flags; they intentionally fail before scan setup.

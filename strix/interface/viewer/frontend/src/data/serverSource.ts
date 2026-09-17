@@ -138,11 +138,9 @@ export async function fetchAll(runName?: string | null): Promise<LoadedRun> {
 }
 
 // ---------------------------------------------------------------------------
-// Run history + email auth + report send
+// Run history
 //
 // These endpoints back the "Your runs" sidebar section. Auth and report-send
-// responses carry a meaningful JSON body on non-2xx statuses (an ``error``
-// code), so they read the body regardless of status rather than throwing.
 // ---------------------------------------------------------------------------
 
 export interface RunSeverityCounts {
@@ -169,26 +167,6 @@ export interface RunsPayload {
   runs: RunListEntry[];
 }
 
-async function postJson(
-  path: string,
-  body: Record<string, unknown>
-): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }> {
-  const res = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-  let data: Record<string, unknown> = {};
-  try {
-    const parsed = await res.json();
-    if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
-  } catch {
-    /* empty or non-JSON body */
-  }
-  return { ok: res.ok, status: res.status, data };
-}
-
 export async function fetchRuns(): Promise<RunsPayload> {
   const obj = (await getJson("/api/runs")) as Partial<RunsPayload>;
   return {
@@ -200,22 +178,11 @@ export async function fetchRuns(): Promise<RunsPayload> {
 
 export interface Capabilities {
   can_steer: boolean;
+  read_only?: boolean;
 }
-
-export type SteerResult = { ok: true } | { ok: false; error: string };
 
 /** GET /api/capabilities. can_steer is true only inside a live in-TUI scan. */
 export async function fetchCapabilities(): Promise<Capabilities> {
   const obj = (await getJson("/api/capabilities")) as Partial<Capabilities>;
-  return { can_steer: obj?.can_steer === true };
-}
-
-/** POST /api/agents/steer. Sends a steering instruction to a running agent. */
-export async function steerAgent(agentId: string, message: string): Promise<SteerResult> {
-  const { ok, data } = await postJson("/api/agents/steer", {
-    agent_id: agentId,
-    message,
-  });
-  if (ok && data.ok === true) return { ok: true };
-  return { ok: false, error: String(data.error ?? "unavailable") };
+  return { can_steer: false, read_only: obj?.read_only !== false };
 }

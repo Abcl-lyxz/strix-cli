@@ -1,93 +1,56 @@
 ---
 title: "Quick Start"
-description: "Install Strix and run your first security scan"
+description: "Install Strix v2 and run your first TUI-controlled scan"
 ---
 
 ## Prerequisites
 
-- Docker (running)
-- An LLM API key from any [supported provider](/llm-providers/overview) (OpenAI, Anthropic, Google, etc.)
+- Docker running
+- Python 3.12 or newer
+- Credentials for a [supported provider](/llm-providers/overview)
 
-## Installation
-
-<Tabs>
-  <Tab title="curl">
-    ```bash
-    curl -sSL https://strix.ai/install | bash
-    ```
-  </Tab>
-  <Tab title="pipx">
-    ```bash
-    pipx install strix-agent
-    ```
-  </Tab>
-</Tabs>
-
-## Configuration
-
-Start Strix and configure your provider directly in the TUI:
+## Install and open
 
 ```bash
+curl -sSL https://strix.ai/install | bash
 strix
 ```
 
-Then enter:
+Strix v2 opens the terminal TUI. It does not expose a headless scan command.
 
-```text
-/model openrouter/z-ai/glm-5.3
-/apikey
-```
+## Connect and scan
 
-Enter your key in the small masked popup. It is saved privately in
-`~/.strix/cli-config.json`. Type `/config` to inspect the non-secret settings or
-`/` to search all available commands. Environment variables are still supported
-and take precedence, which is useful for CI and headless runs.
+1. Open `/connect`, select a provider adapter, and complete its native credential fields. You do not need to pick a model at connection time.
+2. Open `/models`, discover the models available to that connection, and enable the models the automatic router may use.
+3. Add scope with `/targets add <url-or-path>` and supporting files with `/attach`.
+4. Review limits and scan defaults in `/settings`.
+5. Inspect eligible models in `/router`, then run `/start`.
 
-<Tip>
-For best results, use `openrouter/z-ai/glm-5.3` (the default pick), `openai/gpt-5.4`, `anthropic/claude-opus-4-6`, or `openai/gpt-5.2`.
-</Tip>
-
-## Run Your First Scan
-
-```bash
-strix --target ./your-app
-```
-
-You can also stay on the launch screen and use `/target ./your-app`, adjust
-`/mode`, `/budget`, `/turns`, `/agents`, and `/scope`, then run `/start`.
+Credentials detected from the environment are offered as connection sources; they never override TUI state silently. Base URL appears only for Custom OpenAI-compatible, proxy, or advanced adapters.
 
 <Note>
-First run pulls the Docker sandbox image automatically. Results are saved to `strix_runs/<run-name>`.
+The first scan may pull the Docker sandbox image. Results are saved under `strix_runs/<run-name>`.
 </Note>
 
-## Target Types
+## Utilities
 
-Strix accepts multiple target types:
+Outside the TUI, only these commands are supported:
 
 ```bash
-# Local codebase
-strix --target ./app-directory
-
-# GitHub repository
-strix --target https://github.com/org/repo
-
-# Live web application
-strix --target https://your-app.com
-
-# Multiple targets (white-box testing)
-strix -t https://github.com/org/repo -t https://your-app.com
-
-# Targets from a file, one target per non-empty, non-comment line
-strix --target-list ./targets.txt
+strix --help
+strix --version
+strix doctor
 ```
 
-## Next Steps
+Legacy v1 flags fail before a scan starts and explain which TUI command replaces them.
+
+## Next steps
 
 <CardGroup cols={2}>
-  <Card title="CLI Options" icon="terminal" href="/usage/cli">
-    Explore all command-line options.
+  <Card title="TUI reference" icon="terminal" href="/usage/cli">
+    Learn the canonical commands and clean-break behavior.
   </Card>
-  <Card title="Scan Modes" icon="gauge" href="/usage/scan-modes">
-    Choose the right scan depth.
+  <Card title="Provider connections" icon="plug" href="/llm-providers/overview">
+    Understand adapters, connections, models, and automatic routing.
   </Card>
 </CardGroup>

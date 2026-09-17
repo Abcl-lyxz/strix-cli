@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { AgentTranscript } from "./AgentTranscript";
-import { ScanPromptComposer } from "./ScanPromptComposer";
 import type { TranscriptAgent, TranscriptEvent } from "@/data/serverSource";
 
 /** Status -> the small leading dot color, matching the graph node styling. */
@@ -34,13 +33,11 @@ export function AgentDetailModal({
   open,
   agent,
   events,
-  steerable,
   onClose,
 }: {
   open: boolean;
   agent: TranscriptAgent | null;
   events: TranscriptEvent[];
-  steerable: boolean;
   onClose: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -150,15 +147,6 @@ export function AgentDetailModal({
           )}
         </div>
 
-        {steerable && (
-          <div className="border-t border-[#222] px-5 py-3">
-            <ScanPromptComposer
-              agents={[shownAgent]}
-              fixedAgentId={shownAgent.id}
-              className="mt-0"
-            />
-          </div>
-        )}
       </div>
     </div>
   );

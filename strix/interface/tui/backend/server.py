@@ -17,6 +17,9 @@ from strix.interface.tui.backend.protocol import (
     MAX_COMMAND_BYTES,
     PROTOCOL_CAPABILITIES,
     PROTOCOL_VERSION,
+    CommandError,
+    CommandRequest,
+    CommandResult,
     ProtocolHandshakeError,
     envelope,
 )
@@ -184,22 +187,23 @@ class TuiBackendServer:
             raise TypeError("invalid command envelope")
         if len(command) > 128:
             raise ValueError("command name exceeds 128 characters")
-        return request_id, command, payload
+        validated = CommandRequest.model_validate({"command": command, "payload": payload})
+        return request_id, validated.command, validated.payload
 
     @staticmethod
-    def _structured_error(exc: Exception) -> dict[str, object]:
+    def _structured_error(exc: Exception) -> CommandError:
         if isinstance(exc, OSError):
-            return {"code": "persistence_error", "message": str(exc), "retryable": True}
+            return CommandError(code="persistence_error", message=str(exc), retryable=True)
         if isinstance(exc, TypeError | ValueError | json.JSONDecodeError | UnicodeDecodeError):
-            return {"code": "invalid_request", "message": str(exc), "retryable": False}
+            return CommandError(code="invalid_request", message=str(exc), retryable=False)
         if isinstance(exc, RuntimeError):
-            return {"code": "command_failed", "message": str(exc), "retryable": False}
+            return CommandError(code="command_failed", message=str(exc), retryable=False)
         logger.exception("Unhandled TUI command error", exc_info=exc)
-        return {
-            "code": "internal_error",
-            "message": "The command failed unexpectedly",
-            "retryable": True,
-        }
+        return CommandError(
+            code="internal_error",
+            message="The command failed unexpectedly",
+            retryable=True,
+        )
 
     async def _handle_message(self, raw: bytes) -> tuple[dict[str, Any] | None, str | None]:
         request_id: str | None = None
@@ -228,9 +232,14 @@ class TuiBackendServer:
                 resync = collection
             else:
                 result = await self.controller.workspace.dispatch(command, payload, request_id)
+            response_payload = CommandResult(
+                ok=True,
+                command=command,
+                result=result,
+            ).model_dump(mode="json")
             response = envelope(
                 "command_result",
-                {"ok": True, "command": command, "result": result},
+                response_payload,
                 request_id=request_id,
             )
         except Exception as exc:  # noqa: BLE001 - command failures are protocol results
@@ -239,13 +248,14 @@ class TuiBackendServer:
                 # the reader alive and wait for the next valid command.
                 logger.warning("Ignoring uncorrelatable TUI command: %s", exc)
                 return None, None
+            response_payload = CommandResult(
+                ok=False,
+                command=command,
+                error=self._structured_error(exc),
+            ).model_dump(mode="json")
             response = envelope(
                 "command_result",
-                {
-                    "ok": False,
-                    "command": command,
-                    "error": self._structured_error(exc),
-                },
+                response_payload,
                 request_id=request_id,
             )
         return response, resync

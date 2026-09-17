@@ -21,7 +21,7 @@ const mcpIcon = "🔌 "
 // The result is deliberately not rendered, for the same reason
 // renderGenericTool leaves it out: an MCP result is whatever an outside server
 // chose to return, often multi-kilobyte JSON, and it floods the screen. The full
-// result is in the event data, the run log, and the `strix view` viewer.
+// result is in the event data, the run log, and the read-only viewer.
 func renderMcpTool(connection, toolName string, args map[string]any, status string) string {
 	var b strings.Builder
 	b.WriteString(mcpIcon + Bold(Mint).Render(toolName))

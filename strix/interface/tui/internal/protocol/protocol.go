@@ -2,7 +2,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = 7
+const Version = 8
 
 var Capabilities = []string{
 	"state-revisions",
@@ -17,6 +17,10 @@ var Capabilities = []string{
 	"workspace-forms",
 	"attachments",
 	"provider-discovery",
+	"provider-adapters-v2",
+	"automatic-task-router",
+	"read-only-viewer",
+	"typed-command-results",
 }
 
 type Envelope struct {
@@ -138,17 +142,4 @@ type CollectionDelta struct {
 	NextCursor   int                   `json:"next_cursor"`
 	Done         bool                  `json:"done"`
 	Operations   []CollectionOperation `json:"operations"`
-}
-
-type CommandError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable"`
-}
-
-type CommandResult struct {
-	OK      bool            `json:"ok"`
-	Command string          `json:"command"`
-	Result  json.RawMessage `json:"result"`
-	Error   *CommandError   `json:"error"`
 }

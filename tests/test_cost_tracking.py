@@ -76,7 +76,7 @@ def test_cost_callback_sums_usage_cost_and_upstream_inference_cost() -> None:
             "cost": 0.01,
             "is_byok": True,
             "cost_details": {"upstream_inference_cost": 0.2},
-        }
+        },
     }
 
     assert _captured_cost({}, response) == pytest.approx(0.21)
@@ -89,7 +89,7 @@ def test_cost_callback_ignores_upstream_cost_for_non_byok_responses() -> None:
             "cost": 0.05,
             "is_byok": False,
             "cost_details": {"upstream_inference_cost": 0.04},
-        }
+        },
     }
 
     assert _captured_cost({}, response) == pytest.approx(0.05)

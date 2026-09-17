@@ -16,9 +16,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings
+from strix.config import load_settings
+from strix.config.app_config import AppConfigError, get_config_service
 from strix.interface.cli_args import get_version
 from strix.interface.docker_cli import find_docker_cli
+from strix.providers import get_provider_registry
 
 
 _PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
@@ -164,44 +166,55 @@ def collect_diagnostics(
     image_present = False
     settings: Any | None = None
     try:
-        settings = load_settings()
-        model = (settings.llm.model or "").strip()
-        if not model:
+        app_config = get_config_service().load()
+        enabled_models = [model for model in app_config.models.values() if model.enabled]
+        if app_config.connections and enabled_models:
             checks.append(
                 _check(
-                    "AI model",
-                    "warn",
-                    "STRIX_LLM is not configured",
-                    fix=(
-                        "Set STRIX_LLM and LLM_API_KEY, or sign in with `strix auth login chatgpt`."
+                    "Provider routing",
+                    "pass",
+                    (
+                        f"{len(app_config.connections)} saved connection(s), "
+                        f"{len(enabled_models)} enabled model(s)"
                     ),
-                )
-            )
-        elif codex.subscription_model(model):
-            signed_in = codex.is_authenticated()
-            checks.append(
-                _check(
-                    "AI model",
-                    "pass" if signed_in else "warn",
-                    f"{model} (ChatGPT sign-in {'ready' if signed_in else 'missing'})",
-                    fix=None if signed_in else "Run `strix auth login chatgpt`.",
                 )
             )
         else:
-            credential = bool(settings.llm.api_key or settings.llm.api_base)
+            detected = {
+                definition.name
+                for definition in get_provider_registry().definitions()
+                if any(env.get(name, "").strip() for name in definition.env)
+            }
+            hint = (
+                f"; detected environment hints for {', '.join(sorted(detected))}"
+                if detected
+                else ""
+            )
             checks.append(
                 _check(
-                    "AI model",
-                    "pass" if credential else "warn",
-                    (
-                        f"{model} "
-                        f"({'credentials configured' if credential else 'no API key/base URL'})"
-                    ),
-                    fix=None if credential else "Set LLM_API_KEY for this provider.",
+                    "Provider routing",
+                    "warn",
+                    f"No complete saved connection/model route{hint}",
+                    fix="Open Strix and use /connect, then /models.",
                 )
             )
+    except AppConfigError as exc:
+        checks.append(
+            _check(
+                "Provider routing",
+                "fail",
+                str(exc),
+                fix="Repair config.json before starting a scan.",
+            )
+        )
     except Exception as exc:
-        checks.append(_check("AI model", "warn", f"configuration could not be read: {exc}"))
+        checks.append(_check("Provider routing", "warn", f"configuration could not be read: {exc}"))
+
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        settings = None
+        checks.append(_check("Runtime settings", "warn", f"could not be read: {exc}"))
 
     try:
         client = docker.from_env(environment=env)

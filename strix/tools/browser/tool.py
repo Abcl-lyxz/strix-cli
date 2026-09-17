@@ -268,10 +268,7 @@ async def browser_action(
     if not isinstance(raw_context, dict):
         return {"success": False, "error": "An agent-owned sandbox is required"}
     context = cast("dict[str, Any]", raw_context)
-    if not all(
-        context.get(k)
-        for k in ("scan_id", "agent_id", "sandbox_session", "scan_context")
-    ):
+    if not all(context.get(k) for k in ("scan_id", "agent_id", "sandbox_session", "scan_context")):
         return {"success": False, "error": "An agent-owned sandbox is required"}
     sessions = cast(
         "dict[str, BrowserSession]",

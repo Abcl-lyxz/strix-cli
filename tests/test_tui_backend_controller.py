@@ -1,16 +1,41 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
-import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from strix.config import apply_config_override, loader
+from strix.config import apply_config_override
+from strix.config.app_config import (
+    ConfigService,
+    ConnectionProfile,
+    ModelDescriptor,
+    get_config_service,
+    set_config_service,
+)
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
+from strix.domain.app_state import LaunchState, ScanDraft
 from strix.interface.tui.backend.controller import ApplicationController
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+class _MemorySecretStore:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def set(self, ref: str, value: str) -> None:
+        self.values[ref] = value
+
+    def get(self, ref: str) -> str | None:
+        return self.values.get(ref)
+
+    def delete(self, ref: str) -> None:
+        self.values.pop(ref, None)
 
 
 class _SendingCoordinator:
@@ -23,17 +48,19 @@ class _SendingCoordinator:
         return self.delivered
 
 
-def args() -> argparse.Namespace:
-    return argparse.Namespace(
+def args() -> LaunchState:
+    return LaunchState(
+        draft=ScanDraft(
+            targets_info=[],
+            instruction=None,
+            scan_mode="deep",
+            max_budget_usd=None,
+            max_turns=DEFAULT_MAX_TURNS,
+            max_agents=DEFAULT_MAX_AGENTS,
+            scope_mode="auto",
+            diff_base=None,
+        ),
         needs_setup=True,
-        targets_info=[],
-        instruction=None,
-        scan_mode="deep",
-        max_budget_usd=None,
-        max_turns=DEFAULT_MAX_TURNS,
-        max_agents=DEFAULT_MAX_AGENTS,
-        scope_mode="auto",
-        diff_base=None,
         local_sources=[],
         diff_scope={"active": False},
         user_explicit_instruction=None,
@@ -41,8 +68,32 @@ def args() -> argparse.Namespace:
     )
 
 
+def _enable_test_model() -> None:
+    service = get_config_service()
+    config = service.load()
+    config.connections["test-local"] = ConnectionProfile(
+        id="test-local",
+        provider_id="ollama",
+        name="Test local runtime",
+        auth_source="none",
+        options={"base_url": "http://127.0.0.1:11434/v1"},
+    )
+    config.models["test-local:test-model"] = ModelDescriptor(
+        id="test-local:test-model",
+        provider_id="ollama",
+        connection_id="test-local",
+        model_id="test-model",
+        adapter_id="ollama_chat",
+        enabled=True,
+        supports_tools=True,
+        context_window_tokens=128_000,
+        metadata_confidence="verified",
+    )
+    service.save(config)
+
+
 @pytest.fixture(autouse=True)
-def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for key in (
         "STRIX_LLM",
         "OPENAI_API_KEY",
@@ -66,6 +117,12 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
         monkeypatch.delenv(key.lower(), raising=False)
     apply_config_override(tmp_path / "config.json")
+    secrets = _MemorySecretStore()
+    monkeypatch.setattr("strix.config.app_config.get_secret_store", lambda: secrets)
+    monkeypatch.setattr("strix.providers.builtin.get_secret_store", lambda: secrets)
+    set_config_service(ConfigService(tmp_path / "config-v3.json"))
+    yield
+    set_config_service(None)
 
 
 @pytest.mark.asyncio
@@ -121,29 +178,18 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
     controller = ApplicationController(args())
 
     result = await controller.handle(
-        "config.update",
+        "providers.connect",
         {
-            "model": "openrouter/openai/gpt-5.4",
+            "provider_id": "openrouter",
             "api_key": "sk-do-not-echo",
-            "api_base": "https://gateway.example/v1",
-            "persist": True,
-            "reasoning_effort": "medium",
         },
     )
-
-    assert result == {
-        "saved": True,
-        "selected_route": "",
-        "model": "openrouter/openai/gpt-5.4",
-        "api_key_configured": True,
-        "api_base": "https://gateway.example/v1",
-        "reasoning_effort": "medium",
-    }
+    assert result["saved"] is True
+    assert result["connection"]["provider_id"] == "openrouter"
+    assert result["connection"]["secret_ref"]
     assert "sk-do-not-echo" not in str(result)
     snapshot = controller.snapshot()
-    assert snapshot["model"] == "openrouter/openai/gpt-5.4"
     assert snapshot["api_key_configured"] is True
-    assert snapshot["api_base"] == "https://gateway.example/v1"
     assert "sk-do-not-echo" not in str(snapshot)
 
 
@@ -151,16 +197,15 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
 async def test_tui_config_supports_runtime_model_controls() -> None:
     controller = ApplicationController(args())
 
-    await controller.handle(
-        "config.update",
-        {
-            "streaming_enabled": False,
-            "prompt_cache": False,
-            "llm_timeout": 45,
-            "max_tool_calls_per_turn": 11,
-            "max_context_images": 0,
-        },
-    )
+    for field, value in {
+        "ui.streaming_enabled": False,
+        "ui.prompt_cache": False,
+        "ui.llm_timeout_seconds": 45,
+        "ui.max_tool_calls_per_turn": 11,
+        "ui.max_context_images": 0,
+    }.items():
+        result = await controller.handle("settings.update", {"id": field, "value": value})
+        assert result["apply"] == "next_request"
 
     snapshot = controller.snapshot()
     assert "telemetry_enabled" not in snapshot
@@ -175,8 +220,15 @@ async def test_tui_config_supports_runtime_model_controls() -> None:
 async def test_tui_config_rejects_credential_in_base_url() -> None:
     controller = ApplicationController(args())
 
-    with pytest.raises(ValueError, match="must not contain credentials"):
-        await controller.handle("config.update", {"api_base": "https://secret@example.com/v1"})
+    with pytest.raises(ValueError, match="credentials"):
+        await controller.handle(
+            "providers.connect",
+            {
+                "provider_id": "custom",
+                "api_key": "secret",
+                "base_url": "https://secret@example.com/v1",
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -184,7 +236,10 @@ async def test_tui_config_rejects_multiline_api_keys() -> None:
     controller = ApplicationController(args())
 
     with pytest.raises(ValueError, match="single line"):
-        await controller.handle("config.update", {"api_key": "first\nsecond"})
+        await controller.handle(
+            "providers.connect",
+            {"provider_id": "openrouter", "api_key": "first\nsecond"},
+        )
 
 
 @pytest.mark.asyncio
@@ -286,14 +341,13 @@ async def test_large_target_list_reports_truncated_snapshot_count() -> None:
     assert len(snapshot["targets"]) == 16
 
 
-def test_state_populates_model_warning_for_non_frontier_model() -> None:
-    os.environ["STRIX_LLM"] = "openai/gpt-3.5-turbo"
-    loader._cached = None
-
-    warning = ApplicationController(args()).snapshot()["model_warning"]
-
-    assert "openai/gpt-3.5-turbo" in warning
-    assert "not a recommended frontier model" in warning
+def test_environment_model_cannot_override_tui_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_LLM", "openai/gpt-3.5-turbo")
+    snapshot = ApplicationController(args()).snapshot()
+    assert snapshot["model"] == ""
+    assert snapshot["model_warning"] == ""
 
 
 def test_setup_restores_prepared_cli_targets() -> None:
@@ -318,7 +372,7 @@ async def test_start_validates_model_before_callback() -> None:
 
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
-    with pytest.raises(ValueError, match="No model configured"):
+    with pytest.raises(ValueError, match="No eligible model"):
         await controller.handle("setup.start", {})
     assert started is False
 
@@ -331,8 +385,7 @@ async def test_start_launches_with_a_configured_model() -> None:
         nonlocal started
         started = True
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 
@@ -350,9 +403,7 @@ async def test_start_without_target_requires_mount_consent() -> None:
         nonlocal started
         started = True
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
 
     # Mounting the working directory is never silent.
@@ -372,9 +423,7 @@ async def test_target_less_start_enters_live_view_and_waits_for_the_mount() -> N
         nonlocal started
         started = True
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
 
     result = await controller.handle("setup.start", {"mount_working_dir": True})
@@ -398,9 +447,7 @@ async def test_confirming_the_mount_starts_the_scan_without_a_target() -> None:
         nonlocal started
         started = True
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -424,9 +471,7 @@ async def test_declining_the_mount_runs_without_one() -> None:
         nonlocal started
         started += 1
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -450,9 +495,7 @@ async def test_approving_the_mount_runs_with_it() -> None:
         nonlocal started
         started += 1
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -534,9 +577,7 @@ async def test_start_verifies_the_model_before_a_targeted_launch() -> None:
     async def start() -> None:
         order.append("start")
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start, on_verify=verify)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 
@@ -558,9 +599,7 @@ async def test_start_verifies_the_model_before_a_bare_prompt_leaves_setup() -> N
     async def start() -> None:
         return None
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start, on_verify=verify)
 
     await controller.handle("setup.start", {"mount_working_dir": True})
@@ -578,9 +617,7 @@ async def test_failed_model_check_keeps_the_start_screen() -> None:
     async def start() -> None:
         pytest.fail("the scan must not start when the model check fails")
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start, on_verify=verify)
 
     with pytest.raises(RuntimeError, match="Model connection failed"):
@@ -599,9 +636,7 @@ async def test_confirmed_mount_launch_failure_is_reported_in_the_live_view() -> 
     async def start() -> None:
         raise ValueError("Scan preparation failed")
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.start", {"mount_working_dir": True})
 
@@ -621,9 +656,7 @@ async def test_start_rejects_concurrent_and_repeated_submissions() -> None:
         entered.set()
         await release.wait()
 
-    os.environ["STRIX_LLM"] = "anthropic/claude-sonnet-4"
-    os.environ["ANTHROPIC_API_KEY"] = "test-key"
-    loader._cached = None
+    _enable_test_model()
     controller = ApplicationController(args(), on_start=start)
     await controller.handle("setup.add_target", {"target": "https://example.com"})
 

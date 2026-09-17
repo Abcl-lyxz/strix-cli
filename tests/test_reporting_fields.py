@@ -650,9 +650,7 @@ async def test_dependency_report_dedupe_candidate_includes_dependency_metadata(
         captured["existing"] = existing
         return {"is_duplicate": False}
 
-    monkeypatch.setattr(
-        "strix.tools.reporting.dependencies.check_duplicate", fake_check_duplicate
-    )
+    monkeypatch.setattr("strix.tools.reporting.dependencies.check_duplicate", fake_check_duplicate)
     report_state.vulnerability_reports.append(
         {
             "id": "vuln-0001",

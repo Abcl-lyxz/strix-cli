@@ -1,13 +1,13 @@
 {
-  "version": 7,
+  "version": 8,
   "envelopes": [
     {
-      "version": 7,
+      "version": 8,
       "type": "hello",
-      "payload": {"capabilities": ["state-revisions", "collection-deltas"]}
+      "payload": {"capabilities": ["provider-adapters-v2", "automatic-task-router"]}
     },
     {
-      "version": 7,
+      "version": 8,
       "type": "state",
       "payload": {
         "revision": 4,
@@ -15,7 +15,7 @@
       }
     },
     {
-      "version": 7,
+      "version": 8,
       "type": "collection_bootstrap",
       "payload": {
         "collection": "events",
@@ -23,20 +23,11 @@
         "cursor": 0,
         "next_cursor": 1,
         "done": true,
-        "items": [
-          {
-            "id": "event-1",
-            "type": "chat",
-            "agent_id": "root",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "version": 1,
-            "data": {"role": "assistant", "content": "checkpoint"}
-          }
-        ]
+        "items": [{"id": "event-1", "type": "chat", "agent_id": "root", "timestamp": "2026-01-01T00:00:00Z", "version": 1, "data": {"role": "assistant", "content": "checkpoint"}}]
       }
     },
     {
-      "version": 7,
+      "version": 8,
       "type": "collection_delta",
       "payload": {
         "collection": "events",
@@ -45,22 +36,20 @@
         "cursor": 1,
         "next_cursor": 2,
         "done": true,
-        "operations": [
-          {"op": "delete", "id": "event-1", "item": null}
-        ]
+        "operations": [{"op": "delete", "id": "event-1", "item": null}]
       }
     },
     {
-      "version": 7,
+      "version": 8,
       "type": "command",
       "request_id": "request-1",
-      "payload": {"command": "scan.retry", "payload": {"agent_id": "root"}}
+      "payload": {"command": "router.status", "payload": {}}
     },
     {
-      "version": 7,
+      "version": 8,
       "type": "command_result",
       "request_id": "request-1",
-      "payload": {"ok": true, "command": "scan.retry", "result": {}, "error": null}
+      "payload": {"ok": true, "command": "router.status", "result": {}, "error": null}
     }
   ],
   "workspace_stream": {

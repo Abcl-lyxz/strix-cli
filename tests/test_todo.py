@@ -50,7 +50,7 @@ async def test_one_bad_priority_no_longer_discards_the_batch(
             {"title": "Recon", "priority": "medium"},
             {"title": "Probe /admin", "priority": "sky-high"},
             {"title": "Report"},
-        ]
+        ],
     )
 
     assert result["success"] is True
@@ -72,7 +72,7 @@ async def test_duplicate_titles_within_a_batch_are_skipped(
             {"title": "Content discovery"},
             {"title": "Subdomain enumeration"},
             {"title": "content discovery"},
-        ]
+        ],
     )
 
     assert result["created_count"] == 2
@@ -89,9 +89,7 @@ async def test_a_title_already_on_the_list_is_not_created_again(
     todo_store: JsonArtifactStore,
 ) -> None:
     await _create(todo_store, [{"title": "Crawl with katana"}])
-    result = await _create(
-        todo_store, [{"title": "crawl with katana"}, {"title": "JS analysis"}]
-    )
+    result = await _create(todo_store, [{"title": "crawl with katana"}, {"title": "JS analysis"}])
 
     assert [c["title"] for c in result["created"]] == ["JS analysis"]
     assert [s["title"] for s in result["skipped"]] == ["crawl with katana"]
@@ -116,7 +114,7 @@ async def test_non_string_priority_does_not_fail_the_batch(
             {"title": "Recon", "priority": 2},
             {"title": "Probe", "priority": ["high"]},
             {"title": "Report"},
-        ]
+        ],
     )
 
     assert result["success"] is True

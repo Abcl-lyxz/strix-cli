@@ -130,9 +130,9 @@ def test_list_notes_filters_on_a_literal_nullish_tag(
     notes_tools._create_note_impl(note_store, "tagged", "content", tags=[tag])
     notes_tools._create_note_impl(note_store, "other", "content", tags=["auth"])
 
-    assert [
-        n["title"] for n in notes_tools._list_notes_impl(note_store, tags=[tag])["notes"]
-    ] == ["tagged"]
+    assert [n["title"] for n in notes_tools._list_notes_impl(note_store, tags=[tag])["notes"]] == [
+        "tagged"
+    ]
     mixed = notes_tools._list_notes_impl(note_store, tags=[tag, "auth"])
     assert sorted(n["title"] for n in mixed["notes"]) == ["other", "tagged"]
 

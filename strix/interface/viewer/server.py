@@ -21,7 +21,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from strix.core.paths import run_record_path
@@ -33,10 +33,6 @@ from strix.interface.viewer.transcript import (
     read_vulnerabilities,
     severity_counts,
 )
-
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 logger = logging.getLogger(__name__)
@@ -110,7 +106,6 @@ class _ViewerState:
         self,
         run_dir: Path,
         assets_dir: Path,
-        steer_handler: Callable[[str, str], bool] | None = None,
         workspace: Any = None,
     ) -> None:
         self.run_dir = run_dir
@@ -119,10 +114,6 @@ class _ViewerState:
         # The strix_runs directory that holds the launched run; used to
         # enumerate and resolve other runs for the history list.
         self.base_dir = run_dir.parent
-        # Set only when the viewer runs inside a live scan process (the TUI
-        # launcher), which can deliver a message to a running agent. Absent for
-        # standalone ``strix view`` / finished runs, so steering is unavailable.
-        self.steer_handler = steer_handler
         # Unguessable per-process capability. A short-lived nonce is opened
         # directly for the operator and exchanged for this session cookie.
         # load. It is the request-level authorization the review asked for:
@@ -183,84 +174,16 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
         def do_POST(self) -> None:
-            try:
-                self._body_remaining = max(0, int(self.headers.get("Content-Length") or 0))
-            except ValueError:
-                self._body_remaining = 0
-            path = urlsplit(self.path).path
             if not self._has_session() or not self._same_origin():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
-            try:
-                if path == "/api/attachments/upload" and state.workspace is not None:
-                    self._upload_attachment()
-                elif path == "/api/app/commands" and state.workspace is not None:
-                    body = self._read_body()
-                    result = state.workspace.command(body)
-                    self._send_json(HTTPStatus.OK, result)
-                elif path == "/api/agents/steer" and state.steer_handler is not None:
-                    body = self._read_body()
-                    message = body.get("message")
-                    agent_id = body.get("agent_id")
-                    if (
-                        not isinstance(message, str)
-                        or not message.strip()
-                        or len(message.encode()) > 262144
-                    ):
-                        raise ValueError("Message must be between 1 byte and 256 KiB")  # noqa: TRY301
-                    if not isinstance(agent_id, str) or not agent_id.strip():
-                        raise ValueError("Select an agent")  # noqa: TRY301
-                    self._send_json(HTTPStatus.OK, {"ok": state.steer_handler(agent_id, message)})
-                else:
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except (ValueError, TypeError, RuntimeError, OSError) as exc:
-                from strix.security.secrets import redact_secrets
-
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": redact_secrets(str(exc))})
-            except Exception:
-                logger.exception("Local workspace command failed")
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": "Command failed; see local diagnostics"},
-                )
-
-        def _upload_attachment(self) -> None:
-            from uuid import uuid4
-
-            from strix.interface.attachments import MAX_ATTACHMENT_BYTES
-
-            size = int(self.headers.get("Content-Length") or 0)
-            if size < 0 or size > MAX_ATTACHMENT_BYTES:
-                raise ValueError("Attachment exceeds 250 MiB")
-            name = unquote(self.headers.get("X-File-Name") or "attachment")
-            if not name or name in {".", ".."} or any(c in name for c in "/\\\0\r\n:"):
-                raise ValueError("Use a filename without directories")
-            destination = state.base_dir / ".uploads" / uuid4().hex / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                self.connection.settimeout(60)
-                remaining = size
-                with destination.open("xb") as output:
-                    while remaining:
-                        chunk = self.rfile.read(min(remaining, 1024 * 1024))
-                        if not chunk:
-                            raise ValueError("Upload interrupted; no attachment was added")  # noqa: TRY301
-                        output.write(chunk)
-                        remaining -= len(chunk)
-                        self._body_remaining = remaining
-                result = state.workspace.command(
-                    {
-                        "command": "attachments.add",
-                        "payload": {"path": str(destination), "role": "context"},
-                        "request_id": uuid4().hex,
-                    }
-                )
-            except BaseException:
-                destination.unlink(missing_ok=True)
-                raise
-            self._send_json(HTTPStatus.OK, result)
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", "GET")
+            self.send_header("Content-Type", "application/json")
+            body = b'{"error":"viewer is read-only"}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _same_origin(self) -> bool:
             if self.headers.get("Sec-Fetch-Site") == "cross-site":
@@ -270,17 +193,6 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return True
             parsed = urlsplit(origin)
             return parsed.scheme in {"http", "https"} and parsed.netloc == self.headers.get("Host")
-
-        def _read_body(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length < 0 or length > 2 * 1024 * 1024:
-                raise ValueError("Request exceeds the 2 MiB limit")
-            raw = self.rfile.read(length)
-            self._body_remaining = max(0, length - len(raw))
-            body = json.loads(raw or b"{}")
-            if not isinstance(body, dict):
-                raise TypeError("Expected a JSON object")
-            return cast("dict[str, Any]", body)
 
         def _handle_api(  # noqa: PLR0911, PLR0912, PLR0915 - one authenticated endpoint dispatch
             self, path: str, query: dict[str, list[str]]
@@ -295,8 +207,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(
                     HTTPStatus.OK,
                     {
-                        "can_steer": state.workspace is not None or state.steer_handler is not None,
+                        "can_steer": False,
                         "workspace": state.workspace is not None,
+                        "read_only": True,
                         "initial_run": getattr(state.workspace, "initial_run", None),
                     },
                 )
@@ -546,7 +459,6 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 0,
     open_browser: bool = True,
-    steer_handler: Callable[[str, str], bool] | None = None,
     workspace: Any = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
@@ -555,17 +467,14 @@ def serve(
     never printed by the bundled clients.
 
     Binds an ephemeral port by default. If a fixed ``port`` is requested but in
-    use, falls back to an ephemeral port. Reused by both the ``strix view``
-    command and the in-TUI launcher; callers own the server's lifetime.
+    use, falls back to an ephemeral port. The in-TUI launcher owns the server's
+    lifetime.
 
-    ``steer_handler`` is supplied only by the in-TUI launcher, which runs inside
-    the live scan process and can forward a message to a running agent. Left
-    ``None`` (standalone ``strix view``), steering is reported unavailable.
+    The browser surface is read-only. ``workspace`` may expose live snapshots,
+    but no browser request can dispatch a command or upload data.
     """
     assets_dir = bundle_dir()
-    state = _ViewerState(
-        run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler, workspace=workspace
-    )
+    state = _ViewerState(run_dir=run_dir, assets_dir=assets_dir, workspace=workspace)
     handler = _make_handler(state)
 
     try:

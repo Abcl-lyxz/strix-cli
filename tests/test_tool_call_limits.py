@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -21,7 +22,7 @@ from agents.run import RunConfig
 from openai import AsyncOpenAI
 
 from strix.config import loader
-from strix.config.loader import load_settings
+from strix.config.app_config import AppConfig
 from strix.config.models import StrixProvider, _NonStreamingModel, _TurnGuardModel
 
 
@@ -181,8 +182,10 @@ class _DummyModel(Model):
 
 def test_cap_is_configurable(monkeypatch: pytest.MonkeyPatch, _reset_settings: None) -> None:
     monkeypatch.setattr("strix.config.models.MultiProvider.get_model", lambda *_: _DummyModel())
-    monkeypatch.setenv("LLM_MAX_TOOL_CALLS_PER_TURN", "7")
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(load=lambda: AppConfig(ui={"max_tool_calls_per_turn": 7})),
+    )
 
     model = StrixProvider().get_model("openai/gpt-4o-mini")
     assert isinstance(model, _TurnGuardModel)

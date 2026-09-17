@@ -1,76 +1,80 @@
-"""One validated settings form contract for terminal and browser clients."""
+"""Typed settings contract backed exclusively by ``ConfigService``."""
 
 from __future__ import annotations
 
-import os
-from typing import Any, cast
+from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel
+from pydantic import BaseModel
 
-from strix.config import loader
+from strix.config.app_config import AppConfig, get_config_service
+
+
+_SCOPES: dict[str, Literal["immediate", "next_request", "next_scan", "restart"]] = {
+    "router": "next_request",
+    "scan_defaults": "next_scan",
+    "ui.reasoning_effort": "next_request",
+    "ui.streaming_enabled": "next_request",
+    "ui.prompt_cache": "next_request",
+    "ui.llm_timeout_seconds": "next_request",
+    "ui.stream_idle_timeout_seconds": "next_request",
+    "ui.max_tool_calls_per_turn": "next_request",
+    "ui.max_context_images": "next_request",
+    "ui.external_editor": "restart",
+}
+
+
+def _field_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    return "text"
 
 
 def settings_fields() -> list[dict[str, Any]]:
-    settings = loader.load_settings()
+    config = get_config_service().load()
     result: list[dict[str, Any]] = []
-    saved = loader.read_config_document().get("env", {})
-    for section in ("llm", "dedupe", "runtime", "context", "routing", "integrations", "keyboard"):
-        model = cast("BaseModel", getattr(settings, section))
-        for name, field in type(model).model_fields.items():
-            alias = field.validation_alias or field.alias or name
-            aliases = (
-                [str(item) for item in alias.choices if isinstance(item, str)]
-                if isinstance(alias, AliasChoices)
-                else [str(alias)]
-            )
-            alias = str(aliases[0])
+    for section in ("router", "scan_defaults", "ui"):
+        model = getattr(config, section)
+        assert isinstance(model, BaseModel)
+        for name in type(model).model_fields:
             value = getattr(model, name)
-            secret = any(word in name for word in ("key", "headers"))
+            identifier = f"{section}.{name}"
+            scope = _SCOPES.get(identifier, _SCOPES.get(section, "immediate"))
             result.append(
                 {
-                    "id": f"{section}.{name}",
+                    "id": identifier,
                     "label": name.replace("_", " ").capitalize(),
                     "section": section,
-                    "alias": alias,
-                    "secret": secret,
-                    "value": "" if secret else value,
-                    "configured": bool(value),
-                    "type": "secret"
-                    if secret
-                    else "boolean"
-                    if isinstance(value, bool)
-                    else "number"
-                    if isinstance(value, int)
-                    else "text",
-                    "source": "session"
-                    if name in loader.session_fields().get(section, {})
-                    else "environment"
-                    if any(a in os.environ for a in aliases)
-                    else "saved"
-                    if any(a in saved for a in aliases)
-                    else "default",
-                    "apply": "next scan"
-                    if section in {"runtime", "integrations"}
-                    else "next request",
+                    "value": value,
+                    "configured": True,
+                    "type": _field_type(value),
+                    "source": "app_config_v3",
+                    "apply": scope,
                 }
             )
     return result
 
 
-def update_setting(field_id: str, value: Any, *, persist: bool = False) -> dict[str, Any]:
-    field = next((f for f in settings_fields() if f["id"] == field_id), None)
-    if field is None:
+def update_setting(field_id: str, value: Any, *, persist: bool = True) -> dict[str, Any]:
+    """Validate and atomically save one setting; v3 settings always persist."""
+
+    del persist
+    if "." not in field_id:
         raise ValueError("Unknown setting")
     section, name = field_id.split(".", 1)
-    current = cast("BaseModel", getattr(loader.load_settings(), section))
-    # Validate through the existing model, rather than a second UI-specific schema.
-    updated = type(current).model_validate({**current.model_dump(), name: value})
-    value = getattr(updated, name)
-    if persist:
-        loader.persist_overrides({field["alias"]: value})
-    loader.set_session_field(section, name, value)
-    if section in {"llm", "routing"}:
-        from strix.config import routes  # noqa: PLC0415
+    if section not in {"router", "scan_defaults", "ui"}:
+        raise ValueError("Unknown setting")
+    service = get_config_service()
+    current = service.load()
+    model = getattr(current, section)
+    if name not in type(model).model_fields:
+        raise ValueError("Unknown setting")
+    validated = type(model).model_validate({**model.model_dump(), name: value})
+    updated = current.model_copy(update={section: validated})
+    saved: AppConfig = service.save(updated)
+    scope = _SCOPES.get(field_id, _SCOPES.get(section, "immediate"))
+    return {"saved": True, "apply": scope, "revision": saved.revision, "fields": settings_fields()}
 
-        routes.invalidate_session_routes()
-    return {"saved": persist, "apply": field["apply"], "fields": settings_fields()}
+
+__all__ = ["settings_fields", "update_setting"]

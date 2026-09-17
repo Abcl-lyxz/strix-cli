@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from pathlib import Path
-from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import httpx
@@ -17,15 +16,14 @@ from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.retry import ModelRetryNormalizedError, RetryPolicyContext
 from openai import AsyncOpenAI
 
-from strix.config import loader
+from strix.config.app_config import get_config_service
 from strix.config.models import (
     DEFAULT_MODEL_RETRY,
     _configure_litellm_compatibility,
     _NonStreamingModel,
     _TurnGuardModel,
 )
-from strix.config.providers import connect_provider, discover_models, update_route_options
-from strix.config.routes import list_saved_routes, load_routes
+from strix.config.runtime_routes import load_app_routes
 from strix.core import agents, execution
 from strix.core.agents import AgentCoordinator
 from strix.core.ownership import RunLease
@@ -36,8 +34,13 @@ from strix.interface.output import WorkspaceOutput
 from strix.interface.viewer.server import authorized_url, serve
 from strix.interface.viewer.transcript import read_run_summary
 from strix.llm.tool_arguments import parse_tool_arguments
+from strix.providers import get_provider_registry
 from strix.security import get_secret_store
 from strix.utils.atomic import atomic_write_text
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_dependency_analytics_are_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,74 +237,52 @@ def test_abandoned_run_is_interrupted_and_live_lease_is_respected(tmp_path: Path
     assert read_run_summary(tmp_path)["status"] == "interrupted"
 
 
-def test_session_provider_overrides_environment_without_mutating_defaults(
+def test_environment_model_cannot_override_empty_v3_router(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("STRIX_LLM", "openai/old")
-    connect_provider(
+    with pytest.raises(ValueError, match="No enabled Strix v2 models"):
+        load_app_routes()
+    assert get_config_service().load().connections == {}
+
+
+def test_connection_is_saved_without_requiring_a_model() -> None:
+    adapter = get_provider_registry().adapter("custom")
+    connection = adapter.connect(
         {
-            "provider_id": "tokenrouter",
-            "model_id": "vendor/exact.model:free",
+            "connection_id": "gateway",
+            "base_url": "https://gateway.invalid/v1",
             "api_key": "fixture-key",
         }
     )
-    route = load_routes(loader.load_settings())[0]
-    assert route.provider_id == "tokenrouter"
-    assert route.model == "openai/vendor/exact.model:free"
-    assert route.model_id == "vendor/exact.model:free"
-    assert list_saved_routes() == []
+    config = get_config_service().load()
+    assert connection.id == "gateway"
+    assert config.connections["gateway"].options["base_url"] == ("https://gateway.invalid/v1")
+    assert config.models == {}
 
 
-def test_discovery_uses_configured_fallback_for_malformed_endpoint_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    connect_provider(
-        {"provider_id": "custom", "base_url": "https://gateway.invalid/v1", "model_id": "exact/id"}
-    )
-    monkeypatch.setattr(
-        "strix.config.providers.requests.get",
-        lambda *_a, **_k: SimpleNamespace(raise_for_status=lambda: None, json=list),
-    )
-    result = discover_models("custom", base_url="https://gateway.invalid/v1", refresh=True)
-    assert result["source"] == "configured" and result["models"][0]["id"] == "exact/id"
-
-
-def test_session_key_and_advanced_options_do_not_replace_saved_defaults() -> None:
-    payload = {
-        "provider_id": "custom",
-        "name": "gateway",
-        "base_url": "https://gateway.invalid/v1",
-        "model_id": "exact-id",
-    }
-    connect_provider({**payload, "api_key": "fixture-original", "persist": True})
-    original = list_saved_routes()[0]
-    connect_provider({**payload, "api_key": "fixture-session"})
-    update_route_options({"name": "gateway", "max_concurrency": 5, "rpm": 12})
-    selected = load_routes(loader.load_settings())[0]
-    assert selected.api_key_ref != original.api_key_ref
-    assert get_secret_store().get(original.api_key_ref) == "fixture-original"
-    assert get_secret_store().get(selected.api_key_ref) == "fixture-session"
-    assert selected.max_concurrency == 5 and selected.rpm == 12
-    assert list_saved_routes()[0].max_concurrency == original.max_concurrency
-    with pytest.raises(ValueError, match="whole number"):
-        update_route_options({"name": "gateway", "max_concurrency": 1.5})
+def test_connection_key_rotation_deletes_the_old_reference() -> None:
+    adapter = get_provider_registry().adapter("openrouter")
+    first = adapter.connect({"connection_id": "gateway", "api_key": "fixture-original"})
+    second = adapter.connect({"connection_id": "gateway", "api_key": "fixture-replacement"})
+    assert first.secret_ref != second.secret_ref
+    assert get_secret_store().get(first.secret_ref or "") is None
+    assert get_secret_store().get(second.secret_ref or "") == "fixture-replacement"
 
 
 @pytest.mark.asyncio
-async def test_unsaved_provider_is_visible_in_the_shared_readiness_snapshot() -> None:
+async def test_connected_provider_is_visible_without_selecting_a_global_model() -> None:
     runtime = WorkspaceRuntime(parse_arguments([]))
     try:
         await runtime.controller.workspace.dispatch(
             "providers.connect",
-            {"provider_id": "tokenrouter", "model_id": "vendor/exact-id", "api_key": "fixture-key"},
+            {"provider_id": "openrouter", "api_key": "fixture-key"},
             "session-connection",
         )
         state = runtime.controller.snapshot()
-        assert state["model"] == "openai/vendor/exact-id"
+        assert state["model"] == ""
         assert state["api_key_configured"] is True
-        assert state["selected_route"] == "tokenrouter"
-        assert "tokenrouter.com" in state["api_base"]
-        assert not list_saved_routes()
+        assert get_config_service().load().models == {}
     finally:
         await runtime.quit()
         runtime.controller.close()
@@ -362,17 +343,8 @@ def test_output_redacts_secrets_without_losing_long_lines() -> None:
     assert "private-token" not in emitted[-1]
 
 
-def test_authenticated_upload_and_origin_boundary(tmp_path: Path) -> None:
-    received = []
-
-    class Bridge:
-        def command(self, body: dict) -> dict:
-            received.append(body)
-            path = Path(body["payload"]["path"])
-            assert path.read_bytes() == b"\0binary\xff"
-            return {"attached": True}
-
-    httpd, url, token = serve(tmp_path / "workspace", open_browser=False, workspace=Bridge())
+def test_authenticated_viewer_remains_read_only(tmp_path: Path) -> None:
+    httpd, url, token = serve(tmp_path / "workspace", open_browser=False)
     try:
         with httpx.Client() as client:
             assert client.post(url + "/api/attachments/upload", content=b"x").status_code == 403
@@ -390,15 +362,15 @@ def test_authenticated_upload_and_origin_boundary(tmp_path: Path) -> None:
                 headers={"X-File-Name": "fixture.bin"},
                 content=b"\0binary\xff",
             )
-            assert response.status_code == 200
-            assert len(received) == 1
+            assert response.status_code == 405
+            assert response.json() == {"error": "viewer is read-only"}
             assert (
                 client.post(
                     url + "/api/attachments/upload",
                     headers={"X-File-Name": "..%2Fbad"},
                     content=b"x",
                 ).status_code
-                == 400
+                == 405
             )
     finally:
         httpd.shutdown()

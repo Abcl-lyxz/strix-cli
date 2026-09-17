@@ -10,30 +10,7 @@ import (
 	"github.com/usestrix/strix/tui/internal/protocol"
 )
 
-func TestAPIKeyCommandIsMaskedInComposerAndConfigView(t *testing.T) {
-	model := New(nil)
-	model.width, model.height = 100, 35
-	model.showSplash, model.ready = false, true
-	model.snapshot = protocol.Snapshot{SetupMode: true, APIKeyConfigured: true}
-	model.input.SetValue("/apikey sk-super-secret")
-	model.resizeViewport()
-
-	view := ansi.Strip(model.View())
-	if strings.Contains(view, "sk-super-secret") {
-		t.Fatal("API key leaked in the rendered composer")
-	}
-	if !strings.Contains(view, "/apikey ") || !strings.Contains(view, "••••") {
-		t.Fatalf("masked API key command is missing: %s", view)
-	}
-
-	model.openModal(modalConfig)
-	config := ansi.Strip(model.modalView())
-	if !strings.Contains(config, "configured (hidden)") || strings.Contains(config, "sk-super-secret") {
-		t.Fatalf("config modal did not keep the key write-only: %s", config)
-	}
-}
-
-func TestBareAPIKeyCommandOpensSecureModalAndSubmitsWriteOnlyValue(t *testing.T) {
+func TestLegacyAPIKeyCommandFailsWithoutDispatch(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.width, model.height = 100, 35
@@ -42,73 +19,69 @@ func TestBareAPIKeyCommandOpensSecureModalAndSubmitsWriteOnlyValue(t *testing.T)
 
 	updated, cmd, handled := model.submitSlashCommand("/apikey")
 	model = updated.(Model)
-	if !handled || cmd != nil || model.modal != modalAPIKey {
-		t.Fatalf("bare /apikey did not open secure modal: handled=%v cmd=%v modal=%v", handled, cmd, model.modal)
-	}
-	model.apiKeyInput.SetValue("sk-modal-secret")
-	if view := ansi.Strip(model.modalView()); strings.Contains(view, "sk-modal-secret") || !strings.Contains(view, "••••") {
-		t.Fatalf("secure modal leaked or failed to mask the key: %s", view)
-	}
-
-	updated, cmd = model.updateModal(tea.KeyMsg{Type: tea.KeyEnter})
-	model = updated.(Model)
-	if cmd == nil || model.modal != modalNone || model.apiKeyInput.Value() != "" {
-		t.Fatalf("secure modal did not clear after submit: modal=%v value=%q", model.modal, model.apiKeyInput.Value())
-	}
-	envelope := commandFromCmd(t, cmd, connection)
-	if envelope.Type != "config.update" {
-		t.Fatalf("command type = %q, want config.update", envelope.Type)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["api_key"] != "sk-modal-secret" {
-		t.Fatalf("API key payload = %#v", payload)
+	if !handled || cmd != nil || connection.Len() != 0 {
+		t.Fatalf("legacy /apikey dispatched work: handled=%v cmd=%v", handled, cmd)
 	}
 }
 
-func TestSlashModelSendsInteractiveConfigCommand(t *testing.T) {
+func TestSlashModelsOpensProviderModelWorkspace(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.snapshot = protocol.Snapshot{SetupMode: true}
 
-	_, cmd, handled := model.submitSlashCommand("/model openrouter/openai/gpt-5.4")
+	_, cmd, handled := model.submitSlashCommand("/models")
 	if !handled || cmd == nil {
-		t.Fatal("model command was not handled")
+		t.Fatal("models command was not handled")
 	}
 	envelope := commandFromCmd(t, cmd, connection)
-	if envelope.Type != "config.update" {
-		t.Fatalf("command type = %q, want config.update", envelope.Type)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["model"] != "openrouter/openai/gpt-5.4" {
-		t.Fatalf("model payload = %#v", payload)
+	if envelope.Type != "providers.list" {
+		t.Fatalf("command type = %q, want providers.list", envelope.Type)
 	}
 }
 
-func TestSlashScanControlsSendSetupConfiguration(t *testing.T) {
+func TestUpdateCommandAndNotificationActionUseTheSameUpdater(t *testing.T) {
+	commandModel, commandConnection := newCommandTestModel(t)
+	_, command, handled := commandModel.submitSlashCommand("/update")
+	if !handled || command == nil {
+		t.Fatal("update command was not handled")
+	}
+	commandEnvelope := commandFromCmd(t, command, commandConnection)
+
+	actionModel, actionConnection := newCommandTestModel(t)
+	actionModel.modal = modalWorkspace
+	actionModel.dialog = workspaceDialog{Kind: "notifications"}
+	action := handleCommandResult(t, &actionModel, "notifications.manage", map[string]any{
+		"action": "start_update",
+	})
+	if action == nil {
+		t.Fatal("notification update action did not dispatch")
+	}
+	actionEnvelope := commandFromCmd(t, action, actionConnection)
+
+	if commandEnvelope.Type != "update.start" || actionEnvelope.Type != commandEnvelope.Type {
+		t.Fatalf("updater mismatch: command=%q notification=%q", commandEnvelope.Type, actionEnvelope.Type)
+	}
+}
+
+func TestSlashAgentsStopUsesTypedAgentCommand(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.snapshot = protocol.Snapshot{SetupMode: true}
 
-	_, cmd, handled := model.submitSlashCommand("/agents 7")
+	_, cmd, handled := model.submitSlashCommand("/agents stop child-1")
 	if !handled || cmd == nil {
 		t.Fatal("agents command was not handled")
 	}
 	envelope := commandFromCmd(t, cmd, connection)
-	if envelope.Type != "setup.configure" {
-		t.Fatalf("command type = %q, want setup.configure", envelope.Type)
+	if envelope.Type != "agent.stop" {
+		t.Fatalf("command type = %q, want agent.stop", envelope.Type)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["max_agents"] != float64(7) {
-		t.Fatalf("max_agents payload = %#v", payload)
+	if payload["agent_id"] != "child-1" {
+		t.Fatalf("agent payload = %#v", payload)
 	}
 }
 
@@ -164,11 +137,11 @@ func TestTabCompletesSlashCommandBeforeChangingFocus(t *testing.T) {
 	model := New(nil)
 	model.showSplash, model.ready, model.focus = false, true, focusInput
 	model.snapshot = protocol.Snapshot{SetupMode: true}
-	model.input.SetValue("/reas")
+	model.input.SetValue("/rou")
 
 	updated, cmd := model.updateMain(tea.KeyMsg{Type: tea.KeyTab})
 	result := updated.(Model)
-	if cmd != nil || result.input.Value() != "/reasoning " || result.focus != focusInput {
+	if cmd != nil || result.input.Value() != "/router " || result.focus != focusInput {
 		t.Fatalf("tab completion failed: value=%q focus=%v cmd=%v", result.input.Value(), result.focus, cmd)
 	}
 }
@@ -185,10 +158,10 @@ func TestMissingCommandArgumentOpensForm(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(&Client{conn: connection})
 	model.snapshot = protocol.Snapshot{SetupMode: true}
-	updated, cmd, handled := model.submitSlashCommand("/target")
+	updated, cmd, handled := model.submitSlashCommand("/attach")
 	result := updated.(Model)
-	if !handled || cmd != nil || connection.Len() != 0 || result.modal != modalWorkspace || result.dialog.Command != "setup.add_target" {
-		t.Fatalf("target did not open a local form: %#v", result.dialog)
+	if !handled || cmd != nil || connection.Len() != 0 || result.modal != modalWorkspace || result.dialog.Command != "attachments.add" {
+		t.Fatalf("attach did not open a local form: %#v", result.dialog)
 	}
 }
 

@@ -47,9 +47,6 @@
           {
             "group": "Integrations",
             "pages": [
-              "integrations/github-actions",
-              "integrations/ci-cd",
-              "integrations/coding-agents",
               "integrations/mcp"
             ]
           },

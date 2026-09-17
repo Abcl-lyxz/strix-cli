@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from strix.ports.notifications import NotificationPublisher
 
 
-
 def create_app_services() -> AppServices:
     return AppServices(
         events=EventBus(),

@@ -520,8 +520,7 @@ async def maybe_compact(
                 "context.compacted",
                 title="Agent context was compacted",
                 detail=(
-                    f"Preserved {len(recent)} recent items and journaled "
-                    f"{len(head)} older items."
+                    f"Preserved {len(recent)} recent items and journaled {len(head)} older items."
                 ),
                 severity="info",
                 agent_id=str(getattr(session, "session_id", "")) or None,

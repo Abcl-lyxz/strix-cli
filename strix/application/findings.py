@@ -18,18 +18,14 @@ logger = logging.getLogger(__name__)
 class FindingService:
     """Own deduplication and persistence independently of SDK tool schemas."""
 
-    def __init__(
-        self, repository: ReportRepository, duplicate_detector: DuplicateDetector
-    ) -> None:
+    def __init__(self, repository: ReportRepository, duplicate_detector: DuplicateDetector) -> None:
         self.repository = repository
         self.duplicate_detector = duplicate_detector
 
     async def create(self, command: CreateFinding) -> FindingMutation:
         try:
             existing = self.repository.get_existing_vulnerabilities()
-            duplicate = await self.duplicate_detector(
-                command.candidate, existing, self.repository
-            )
+            duplicate = await self.duplicate_detector(command.candidate, existing, self.repository)
             if duplicate.get("is_duplicate"):
                 duplicate_id = str(duplicate.get("duplicate_id") or "")
                 duplicate_title = next(
@@ -74,12 +70,8 @@ class FindingService:
             logger.exception("finding revision failed")
             return FindingMutation(status="failed", report_id=command.report_id, error=str(exc))
         if updated is not None:
-            return FindingMutation(
-                status="updated", report_id=command.report_id, finding=updated
-            )
-        known = {
-            str(item.get("id")) for item in self.repository.get_existing_vulnerabilities()
-        }
+            return FindingMutation(status="updated", report_id=command.report_id, finding=updated)
+        known = {str(item.get("id")) for item in self.repository.get_existing_vulnerabilities()}
         return FindingMutation(
             status="unchanged" if command.report_id in known else "missing",
             report_id=command.report_id,

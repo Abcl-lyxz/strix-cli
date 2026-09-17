@@ -18,17 +18,11 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[ReportState, JsonArtifactStore]:
+def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ReportState, JsonArtifactStore]:
     monkeypatch.chdir(tmp_path)
     report_state = ReportState(run_name="run-1")
-    store = JsonArtifactStore(
-        runtime_state_dir(report_state.get_run_dir()) / "coverage.json"
-    )
-    report_state.set_coverage_entries_provider(
-        lambda: store.snapshot_entries("entry_id")
-    )
+    store = JsonArtifactStore(runtime_state_dir(report_state.get_run_dir()) / "coverage.json")
+    report_state.set_coverage_entries_provider(lambda: store.snapshot_entries("entry_id"))
     return report_state, store
 
 
@@ -67,9 +61,7 @@ def test_cleared_surfaces_reach_sarif(
 
     report_state._save_artifacts()
 
-    sarif = json.loads(
-        (report_state.get_run_dir() / "findings.sarif").read_text(encoding="utf-8")
-    )
+    sarif = json.loads((report_state.get_run_dir() / "findings.sarif").read_text(encoding="utf-8"))
     results = sarif["runs"][0]["results"]
     assert [result["kind"] for result in results] == ["pass"]
 

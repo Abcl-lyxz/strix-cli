@@ -1,10 +1,8 @@
-"""Scan bootstrap shared by the CLI entry point and the TUI setup flow.
+"""Scan bootstrap owned by the TUI setup flow.
 
 Target resolution, run preparation, model preflight, and start-of-run
-telemetry live here so ``strix.interface.main`` (the CLI) and
-``strix.interface.tui.runtime`` (interactive setup) depend on one module
-instead of each other. Everything raises ordinary exceptions; rendering
-errors and exiting the process is the caller's job.
+telemetry live here. Everything raises ordinary exceptions; rendering errors
+is the caller's job.
 """
 
 from __future__ import annotations
@@ -14,7 +12,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from strix.config import Settings, codex, load_settings
+from strix.config import Settings, load_settings
 from strix.core.paths import run_dir_for
 from strix.interface.diff_scope import resolve_diff_scope_context
 from strix.interface.presentation import generate_run_name
@@ -41,7 +39,7 @@ from strix.utils.api_spec import (
 
 
 if TYPE_CHECKING:
-    import argparse
+    from strix.domain.app_state import LaunchState
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +54,7 @@ class ModelConnectionError(RuntimeError):
         self.model_name = model_name
 
 
-async def preflight_model_connection(
+async def preflight_model_connection(  # noqa: PLR0915
     model_name: str,
     *,
     settings: Settings | None = None,
@@ -67,43 +65,38 @@ async def preflight_model_connection(
     from agents.model_settings import ModelSettings
     from agents.models.interface import ModelTracing
 
-    from strix.config.models import StrixProvider, configure_sdk_model_defaults
-    from strix.config.routes import load_routes
+    from strix.config.app_config import get_config_service
+    from strix.config.runtime_routes import load_app_routes
     from strix.core.inputs import make_model_settings
     from strix.routing import RoutedModel, RoutePool
 
-    resolved_settings = load_settings() if settings is None else settings
-    configure_sdk_model_defaults(resolved_settings)
+    del settings
+    app_config = get_config_service().load()
     route_pool = None
-    try:
-        routes = load_routes(resolved_settings, selected=selected_routes)
-    except (AttributeError, TypeError, ValueError):
-        # Tests and embedders may pass a minimal settings object with no route
-        # section. The direct single-model preflight remains supported.
-        routes = []
+    del selected_routes
+    routes = load_app_routes()
     matching = [route for route in routes if not model_name or route.model == model_name]
     if matching:
+        policy = app_config.router
+        model_name = matching[0].model
         route_pool = RoutePool(
             matching,
-            wait_timeout=min(float(resolved_settings.llm.timeout), 45.0),
-            stream_idle_timeout=float(getattr(resolved_settings.llm, "stream_idle_timeout", 300)),
-            max_attempts_per_route=int(
-                getattr(
-                    getattr(resolved_settings, "routing", None),
-                    "max_attempts_per_route",
-                    2,
-                )
-            ),
+            wait_timeout=min(float(app_config.ui.llm_timeout_seconds), 45.0),
+            stream_idle_timeout=float(app_config.ui.stream_idle_timeout_seconds),
+            max_attempts_per_turn=policy.max_attempts_per_turn,
+            max_consecutive_failed_turns=policy.max_consecutive_failed_turns,
+            max_retry_input_multiplier=policy.max_retry_input_multiplier,
+            allow_unknown_capabilities=policy.allow_unknown_capabilities,
         )
-    model = (
-        RoutedModel(route_pool) if route_pool is not None else StrixProvider().get_model(model_name)
-    )
+    if route_pool is None:
+        raise ValueError("No eligible model configured. Use /connect, then /models.")
+    model = RoutedModel(route_pool)
     request_settings = make_model_settings(
         None,
         model_name=model_name,
-        request_timeout=resolved_settings.llm.timeout,
+        request_timeout=app_config.ui.llm_timeout_seconds,
         prompt_cache=False,
-        extra_headers=resolved_settings.llm.extra_headers,
+        extra_headers=None,
         has_tools=False,
     ).resolve(ModelSettings(max_tokens=32))
     request: dict[str, Any] = {
@@ -156,7 +149,7 @@ async def preflight_model_connection(
                 observed_tool = parse_tool_arguments(output.arguments).get("ok") is True
 
     async def perform_check() -> None:
-        if resolved_settings.llm.disable_streaming:
+        if not app_config.ui.streaming_enabled:
             observe(await model.get_response(**request))
             return
         # Match the transport used by a normal scan. Some OpenAI-compatible
@@ -167,7 +160,7 @@ async def preflight_model_connection(
             if getattr(event, "type", "") == "response.completed":
                 observe(getattr(event, "response", None))
 
-    timeout = min(float(resolved_settings.llm.timeout), 45.0)
+    timeout = min(float(app_config.ui.llm_timeout_seconds), 45.0)
     try:
         try:
             await asyncio.wait_for(perform_check(), timeout=timeout)
@@ -183,7 +176,7 @@ async def preflight_model_connection(
             await route_pool.close()
 
 
-def build_targets_info(args: argparse.Namespace) -> None:
+def build_targets_info(args: LaunchState) -> None:
     """Populate ``args.targets_info`` from target/target-list inputs.
 
     Raises :class:`ValueError` with a user-facing message on any bad input so
@@ -247,18 +240,20 @@ def _resolve_api_spec(target: str, details: dict[str, Any]) -> None:
     details["base_urls"] = base_urls
 
 
-def prepare_run(args: argparse.Namespace) -> None:
+def prepare_run(args: LaunchState) -> None:
     """Resolve the run name, clone repos, compute diff-scope, and persist state.
 
-    Shared by the CLI startup path and the interactive TUI setup phase (once the
-    user has supplied a target via ``/target``). Mutates *args* in place and
-    raises :class:`ValueError` on any preparation failure.
+    Called by the interactive TUI after the user has supplied targets through
+    ``/targets``. Mutates *args* in place and raises :class:`ValueError` on any
+    preparation failure.
     """
     from strix.runtime.profiles import preflight_profile
 
     args.sandbox_preflight = preflight_profile()
     logger.info("Sandbox preflight: %s", args.sandbox_preflight)
     args.run_name = args.resume or generate_run_name(args.targets_info)
+    if args.run_name is None:
+        raise RuntimeError("run name generation failed")
 
     if args.resume:
         return
@@ -298,7 +293,7 @@ def prepare_run(args: argparse.Namespace) -> None:
     _persist_run_record(args)
 
 
-def attach_workspace_mount(args: argparse.Namespace) -> None:
+def attach_workspace_mount(args: LaunchState) -> None:
     """Expose ``args.workspace_mount`` to the sandbox without making it a target.
 
     A workspace mount is a directory the agent works in, not something to test:
@@ -321,18 +316,21 @@ def attach_workspace_mount(args: argparse.Namespace) -> None:
     args.local_sources = local_sources
 
 
-def _persist_run_record(args: argparse.Namespace) -> None:
+def _persist_run_record(args: LaunchState) -> None:
     from strix.report.writer import write_run_record
 
+    if args.run_name is None:
+        raise RuntimeError("cannot persist a run before it has a name")
     run_dir = run_dir_for(args.run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
     run_record = {
+        "schema_version": 2,
         "run_id": args.run_name,
         "run_name": args.run_name,
         "status": "running",
         "start_time": datetime.now(UTC).isoformat(),
         "end_time": None,
-        "auth_mode": codex.auth_mode(load_settings().llm.model),
+        "auth_mode": "metered",
         "targets_info": args.targets_info,
         "scan_mode": args.scan_mode,
         "sandbox_profile": args.sandbox_profile,
@@ -346,11 +344,10 @@ def _persist_run_record(args: argparse.Namespace) -> None:
         # Kept apart from instruction, which carries the diff-scope preamble: the
         # transcript replays this as the user's opening message.
         "user_instruction": getattr(args, "user_instruction", None),
-        "non_interactive": args.non_interactive,
         "local_sources": getattr(args, "local_sources", []),
-        # Persisted so --resume places the same workspace files again.
+        # Persisted so a TUI resume places the same workspace files again.
         "workspace_files": getattr(args, "workspace_files", []),
-        # Persisted so --resume can remount the workspace: it is not a target,
+        # Persisted so a TUI resume can remount the workspace: it is not a target,
         # so it cannot be rebuilt from targets_info.
         "workspace_mount": getattr(args, "workspace_mount", None),
         "diff_scope": getattr(args, "diff_scope", {"active": False}),

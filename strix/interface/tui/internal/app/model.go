@@ -8,7 +8,6 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -66,9 +65,7 @@ const (
 	modalStop
 	modalConfirmMount
 	modalVulnerability
-	modalConfig
 	modalWorkspaceSearch
-	modalAPIKey
 	modalWorkspace
 	modalExpanded
 )
@@ -210,20 +207,6 @@ func newChatInput() textarea.Model {
 	return input
 }
 
-func newAPIKeyInput() textinput.Model {
-	input := textinput.New()
-	input.Prompt = "› "
-	input.Placeholder = "Paste API key"
-	input.CharLimit = 32 * 1024
-	input.Width = 44
-	input.EchoMode = textinput.EchoPassword
-	input.EchoCharacter = '•'
-	input.PromptStyle = lipgloss.NewStyle().Foreground(green)
-	input.TextStyle = lipgloss.NewStyle().Foreground(white)
-	input.Cursor.Style = lipgloss.NewStyle().Foreground(brightGreen)
-	return input
-}
-
 // composerBounds returns the floor and ceiling row counts for the composer at
 // the current terminal height. A short terminal shrinks the ceiling so a long
 // prompt cannot crowd out everything above it.
@@ -294,12 +277,11 @@ func composerHeight(input textarea.Model) int {
 
 func New(client *Client) Model {
 	input := newChatInput()
-	apiKeyInput := newAPIKeyInput()
 	input.Placeholder = setupPlaceholder
 	input.Focus()
 	return Model{
 		client:       client,
-		setupFeature: setupFeature{input: input, apiKeyInput: apiKeyInput},
+		setupFeature: setupFeature{input: input},
 		transcriptFeature: transcriptFeature{
 			viewport: viewport.New(80, 20), expandedEvents: map[string]bool{},
 			blockCache: map[string]renderedBlock{}, followOutput: true,

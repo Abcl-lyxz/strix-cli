@@ -27,7 +27,7 @@ func statusIcon(status string) (string, lipgloss.Style) {
 // deliberately not rendered: a generic result (e.g. a multi-kilobyte JSON
 // payload from a database query tool) is noise on screen, and the agent narrates
 // what it got in its next message. The full result still lives in the event
-// data, the run log, and the `strix view` viewer.
+// data, the run log, and the read-only viewer.
 func renderGenericTool(name string, args map[string]any, status string) string {
 	var b strings.Builder
 	b.WriteString(Dim().Render("→ Using tool ") + Bold(Blue).Render(name) + "\n")

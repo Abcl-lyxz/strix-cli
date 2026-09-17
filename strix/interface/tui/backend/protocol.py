@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION: Literal[8] = 8
 PROTOCOL_CAPABILITIES = (
     "state-revisions",
     "collection-deltas",
@@ -19,6 +21,10 @@ PROTOCOL_CAPABILITIES = (
     "workspace-forms",
     "attachments",
     "provider-discovery",
+    "provider-adapters-v2",
+    "automatic-task-router",
+    "read-only-viewer",
+    "typed-command-results",
 )
 
 # Commands and control messages are intentionally small. Event and finding
@@ -30,6 +36,59 @@ MAX_COLLECTION_FRAME_BYTES = 4 * 1024 * 1024
 
 class ProtocolHandshakeError(RuntimeError):
     """Raised before the Go TUI is activated when protocol negotiation fails."""
+
+
+class CommandRequest(BaseModel):
+    """Source-of-truth schema for a TUI command request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(min_length=1, max_length=128)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class CommandError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal[
+        "invalid_request",
+        "persistence_error",
+        "command_failed",
+        "protocol_error",
+        "internal_error",
+        "result_too_large",
+    ]
+    message: str
+    retryable: bool = False
+
+
+class CommandResult(BaseModel):
+    """Source-of-truth schema for every Python-to-Go command result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    command: str
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: CommandError | None = None
+
+
+class ProtocolEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[8] = PROTOCOL_VERSION
+    type: str
+    request_id: str | None = None
+    payload: dict[str, Any]
+
+
+def protocol_json_schema() -> dict[str, Any]:
+    return ProtocolEnvelope.model_json_schema(
+        ref_template="#/$defs/{model}",
+    ) | {
+        "x-command-request": CommandRequest.model_json_schema(),
+        "x-command-result": CommandResult.model_json_schema(),
+    }
 
 
 def envelope(

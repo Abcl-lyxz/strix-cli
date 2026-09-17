@@ -1,6 +1,4 @@
-import { isRecord, type WorkspaceRow } from "./contracts";
-
-export const requestId = () => crypto.randomUUID();
+import { isRecord } from "./contracts";
 
 export async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, { cache: "no-store", ...options });
@@ -12,16 +10,4 @@ export async function requestJson<T>(path: string, options?: RequestInit): Promi
     throw new Error(message);
   }
   return value as T;
-}
-
-export function sendCommand<T = WorkspaceRow>(
-  name: string,
-  payload: WorkspaceRow = {},
-  id: string = requestId(),
-): Promise<T> {
-  return requestJson<T>("/api/app/commands", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command: name, payload, request_id: id }),
-  });
 }

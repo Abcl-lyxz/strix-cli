@@ -1,4 +1,4 @@
-.PHONY: help install dev-install format lint type-check security check-all clean pre-commit setup-dev dev viewer wheel tui-build tui-test tui-lint
+.PHONY: help install dev-install format lint type-check security test protocol-check frontend-check check-all clean pre-commit setup-dev dev viewer wheel tui-build tui-test tui-lint
 
 TUI_BINARY := build/sidecar/strix-tui$(if $(filter Windows_NT,$(OS)),.exe)
 
@@ -11,7 +11,7 @@ help:
 	@echo "Code Quality:"
 	@echo "  format        - Format code with ruff"
 	@echo "  lint          - Lint code with ruff"
-	@echo "  type-check    - Run type checking with mypy and pyright"
+	@echo "  type-check    - Run the official Python type checker (mypy)"
 	@echo "  security      - Run security checks with bandit"
 	@echo "  check-all     - Run all code quality checks"
 	@echo ""
@@ -37,19 +37,18 @@ setup-dev: dev-install
 
 format:
 	@echo "🎨 Formatting code with ruff..."
-	uv run ruff format .
+	uv run ruff format strix tests scripts
 	@echo "✅ Code formatting complete!"
 
 lint:
 	@echo "🔍 Linting code with ruff..."
-	uv run ruff check . --fix
+	uv run ruff check strix tests scripts
+	uv run ruff format --check strix tests scripts
 	@echo "✅ Linting complete!"
 
 type-check:
 	@echo "🔍 Type checking with mypy..."
 	uv run mypy strix/
-	@echo "🔍 Type checking with pyright..."
-	uv run pyright strix/
 	@echo "✅ Type checking complete!"
 
 security:
@@ -57,7 +56,16 @@ security:
 	uv run bandit -r strix/ -c pyproject.toml
 	@echo "✅ Security checks complete!"
 
-check-all: format lint type-check security
+test:
+	uv run pytest
+
+protocol-check:
+	uv run python scripts/generate_tui_protocol.py --check
+
+frontend-check:
+	cd strix/interface/viewer/frontend && npm run type-check && npm test && npm run build
+
+check-all: lint type-check security test tui-lint tui-test frontend-check protocol-check
 	@echo "✅ All code quality checks passed!"
 
 pre-commit:

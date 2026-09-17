@@ -44,13 +44,11 @@ func (m Model) sendComposer() (tea.Model, tea.Cmd) {
 		cmd := m.showToast("Waiting for message acknowledgement")
 		return m, cmd
 	}
-	if !strings.HasPrefix(strings.TrimSpace(value), "/apikey") {
-		m.draftHistory = append(m.draftHistory, value)
-		if len(m.draftHistory) > 50 {
-			m.draftHistory = m.draftHistory[1:]
-		}
-		m.draftIndex = len(m.draftHistory)
+	m.draftHistory = append(m.draftHistory, value)
+	if len(m.draftHistory) > 50 {
+		m.draftHistory = m.draftHistory[1:]
 	}
+	m.draftIndex = len(m.draftHistory)
 	m.input.SetValue("")
 	m.resizeViewport()
 	pasted := m.pastedDraft
@@ -104,15 +102,15 @@ func (m *Model) openForm(title, command string, payload map[string]any, fields .
 
 func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 	switch result.Command {
-	case "settings.list", "providers.list", "providers.discover", "sessions.list", "attachments.list", "paths.complete":
+	case "settings.list", "providers.list", "models.list", "models.discover", "router.status", "sessions.list", "attachments.list", "paths.complete":
 		var data map[string]any
 		if err := json.Unmarshal(result.Result, &data); err != nil {
 			m.dialog.Error = err.Error()
 			return nil, true
 		}
-		key := map[string]string{"settings.list": "fields", "providers.list": "providers", "providers.discover": "models", "sessions.list": "runs", "attachments.list": "attachments", "paths.complete": "paths"}[result.Command]
-		if result.Command == "providers.list" && m.dialog.Kind == "routing" {
-			key = "profiles"
+		key := map[string]string{"settings.list": "fields", "providers.list": "providers", "models.list": "models", "models.discover": "models", "router.status": "routes", "sessions.list": "runs", "attachments.list": "attachments", "paths.complete": "paths"}[result.Command]
+		if result.Command == "providers.list" && m.dialog.Kind == "model_connections" {
+			key = "connections"
 		}
 		m.dialog.Rows = nil
 		if values, ok := data[key].([]any); ok {
@@ -122,7 +120,7 @@ func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 				}
 			}
 		}
-		if result.Command == "providers.discover" {
+		if result.Command == "models.discover" {
 			m.dialog.Kind = "models"
 		}
 		m.dialog.Index = 0
@@ -158,6 +156,9 @@ func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 				return m.openWorkspace("providers", "Providers", "providers.list"), true
 			case "retry_route_test":
 				return send(m.client, "providers.test", map[string]any{}), true
+			case "start_update":
+				m.closeModal()
+				return send(m.client, "update.start", map[string]any{}), true
 			case "dismiss":
 				return send(m.client, "notifications.manage", map[string]any{"operation": "dismiss", "id": target}), true
 			default:
@@ -178,9 +179,17 @@ func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 		}
 		m.dialog.Index = min(m.dialog.Index, max(0, len(m.dialog.Rows)-1))
 		return nil, true
-	case "mcp.update", "notifications.preferences", "settings.update", "providers.connect", "providers.advanced", "providers.test", "attachments.add", "attachments.remove", "scan.new", "scan.resume":
+	case "mcp.update", "notifications.preferences", "settings.update", "providers.connect", "providers.disconnect", "models.toggle", "providers.test", "attachments.add", "attachments.remove", "scan.new", "scan.resume":
 		m.closeModal()
 		return m.showToast("Updated successfully"), true
+	case "update.start", "doctor.run":
+		var data map[string]any
+		_ = json.Unmarshal(result.Result, &data)
+		message := fmt.Sprint(data["message"])
+		if message == "<nil>" || message == "" {
+			message = "Completed"
+		}
+		return m.showToast(message), true
 	}
 	return nil, false
 }
@@ -221,10 +230,7 @@ func (m Model) workspaceView() string {
 			f.Input.Width = max(10, width-6)
 			lines = append(lines, marker+f.Label, f.Input.View())
 		}
-		lines = append(lines, "", "Tab next · Ctrl+S apply · Ctrl+D detect models · Esc cancel")
-		if m.dialog.Command == "settings.update" || m.dialog.Command == "providers.connect" || m.dialog.Command == "providers.advanced" {
-			lines = append(lines, fmt.Sprintf("Ctrl+P save as default: %t", m.dialog.Persist))
-		}
+		lines = append(lines, "", "Tab next · Ctrl+S apply · Esc cancel")
 	} else {
 		lines = append(lines, "Search: "+m.dialog.Filter)
 		rows := m.filteredWorkspaceRows()
@@ -279,16 +285,6 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.dialog.Index = clampCycle(m.dialog.Index+delta, len(m.dialog.Fields))
 			return m, m.dialog.Fields[m.dialog.Index].Input.Focus()
-		case "ctrl+p":
-			m.dialog.Persist = !m.dialog.Persist
-			return m, nil
-		case "ctrl+d":
-			if m.dialog.Command == "providers.connect" {
-				for _, f := range m.dialog.Fields {
-					m.dialog.Payload[f.Key] = f.Input.Value()
-				}
-				return m, send(m.client, "providers.discover", m.dialog.Payload)
-			}
 		case "ctrl+s":
 			payload := map[string]any{}
 			for k, v := range m.dialog.Payload {
@@ -317,9 +313,6 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					value = b
 				}
 				payload[f.Key] = value
-			}
-			if m.dialog.Command == "settings.update" || m.dialog.Command == "providers.connect" || m.dialog.Command == "providers.advanced" {
-				payload["persist"] = m.dialog.Persist
 			}
 			return m, send(m.client, m.dialog.Command, payload)
 		}
@@ -374,8 +367,8 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			payload := map[string]any{"operation": "action", "id": m.dialog.Payload["id"], "index": row["index"]}
 			m.dialog.Kind = "notifications"
 			return m, send(m.client, "notifications.manage", payload)
-		case "routing":
-			m.openForm("Advanced routing · "+rowLabel(row), "providers.advanced", map[string]any{"name": row["name"]}, inputField("priority", "Priority", "number", row["priority"]), inputField("max_concurrency", "Concurrent requests", "number", row["max_concurrency"]), inputField("rpm", "Requests per minute (blank for unlimited)", "number", row["rpm"]), inputField("tpm", "Tokens per minute (blank for unlimited)", "number", row["tpm"]), inputField("enabled", "Enabled", "boolean", row["enabled"]))
+		case "router":
+			m.dialog.Error = fmt.Sprintf("%v · %v", row["model"], row["health"])
 		case "commands":
 			m.closeModal()
 			return m.submit(fmt.Sprint(row["name"]))
@@ -386,15 +379,28 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.openForm(rowLabel(row)+" · "+fmt.Sprint(row["source"])+" · "+fmt.Sprint(row["apply"]), "settings.update", map[string]any{"id": row["id"]}, inputField("value", rowLabel(row), kind, row["value"]))
 		case "providers":
-			m.openForm("Connect "+rowLabel(row), "providers.connect", map[string]any{"provider_id": row["id"]}, inputField("name", "Connection name", "text", row["id"]), inputField("base_url", "Base URL", "text", row["base_url"]), inputField("api_key", "API key", "secret", ""), inputField("model_id", "Model ID (Ctrl+D detects models)", "text", ""))
-		case "models":
-			m.dialog.Payload["model_id"] = row["id"]
-			m.dialog.Kind = "form"
-			for i := range m.dialog.Fields {
-				if m.dialog.Fields[i].Key == "model_id" {
-					m.dialog.Fields[i].Input.SetValue(fmt.Sprint(row["id"]))
+			fields := []formField{inputField("name", "Connection name", "text", row["id"])}
+			if methods, ok := row["auth_methods"].([]any); ok && len(methods) > 0 {
+				fields = append(fields, inputField("auth_method", "Authentication method", "text", methods[0]))
+			}
+			if specs, ok := row["fields"].([]any); ok {
+				for _, raw := range specs {
+					if spec, ok := raw.(map[string]any); ok {
+						kind := fmt.Sprint(spec["kind"])
+						if kind == "choice" {
+							kind = "text"
+						}
+						fields = append(fields, inputField(fmt.Sprint(spec["id"]), fmt.Sprint(spec["label"]), kind, ""))
+					}
 				}
 			}
+			m.openForm("Connect "+rowLabel(row), "providers.connect", map[string]any{"provider_id": row["id"]}, fields...)
+		case "model_connections":
+			m.dialog = workspaceDialog{Kind: "models", Title: "Models · " + rowLabel(row), Command: "models.discover", Payload: map[string]any{"connection_id": row["id"]}}
+			return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"]})
+		case "models":
+			enabled, _ := row["enabled"].(bool)
+			return m, send(m.client, "models.toggle", map[string]any{"model_id": row["id"], "enabled": !enabled})
 		case "sessions":
 			return m, send(m.client, "scan.resume", map[string]any{"run": row["name"]})
 		case "paths":

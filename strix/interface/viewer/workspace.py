@@ -1,4 +1,4 @@
-"""Thread-safe transport adapter for the shared local application."""
+"""Thread-safe, read-only live snapshot adapter for the browser viewer."""
 
 from __future__ import annotations
 
@@ -30,22 +30,6 @@ class BrowserWorkspace:
         self.loop = loop
         self.closed = False
         self.initial_run = initial_run
-
-    def command(self, body: dict[str, Any]) -> dict[str, Any]:
-        command = body.get("command")
-        payload = body.get("payload", {})
-        request_id = body.get("request_id")
-        if not isinstance(command, str) or not isinstance(payload, dict):
-            raise TypeError("A command and object payload are required")
-        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
-            raise ValueError("A request ID of at most 128 characters is required")
-        if command == "app.quit":
-            raise ValueError("Use Stop to stop the active scan")
-        future = asyncio.run_coroutine_threadsafe(
-            self.controller.workspace.dispatch(command, payload, request_id), self.loop
-        )
-        # A timed-out client may retry this request ID; dispatch deduplicates it.
-        return cast("dict[str, Any]", public_value(future.result(timeout=120)))
 
     def run_dir(self) -> Path | None:
         report = self.controller.report_state

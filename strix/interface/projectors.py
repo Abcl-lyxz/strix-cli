@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from strix.config import load_settings
-from strix.config.models import is_recommended_or_frontier_model
-from strix.config.routes import load_routes
+from strix.config.app_config import get_config_service
+from strix.config.runtime_routes import load_app_routes
 from strix.interface.presentation import is_subscription_run
 from strix.interface.tui.backend.projection import (
     MAX_TERMINAL_EVENTS,
@@ -18,21 +16,6 @@ from strix.interface.tui.backend.projection import (
     bounded_state_projection,
     collection_item_projection,
     terminal_projection,
-)
-
-
-_LLM_ENV_ALIASES = frozenset(
-    {
-        "STRIX_LLM",
-        "LLM_API_KEY",
-        "OPENAI_API_KEY",
-        "LLM_API_BASE",
-        "OPENAI_API_BASE",
-        "OPENAI_BASE_URL",
-        "LITELLM_BASE_URL",
-        "OLLAMA_API_BASE",
-        "STRIX_REASONING_EFFORT",
-    }
 )
 
 
@@ -54,7 +37,7 @@ def display_api_base(value: str) -> str:
 
 
 class WorkspaceProjector:
-    """Normalize mutable application state into protocol-v7 read models."""
+    """Normalize mutable application state into protocol-v8 read models."""
 
     def snapshot(self, source: Any) -> dict[str, Any]:
         model = ""
@@ -68,30 +51,21 @@ class WorkspaceProjector:
         max_context_images = 3
         editor_command = ""
         with contextlib.suppress(Exception):
-            settings = load_settings()
-            editor_command = (
-                getattr(getattr(settings, "keyboard", None), "external_editor", None) or ""
+            app_config = get_config_service().load()
+            editor_command = app_config.ui.external_editor
+            reasoning_effort = app_config.ui.reasoning_effort
+            streaming_enabled = app_config.ui.streaming_enabled
+            prompt_cache = app_config.ui.prompt_cache
+            llm_timeout = app_config.ui.llm_timeout_seconds
+            max_tool_calls_per_turn = app_config.ui.max_tool_calls_per_turn
+            max_context_images = app_config.ui.max_context_images
+            api_key_configured = any(
+                connection.secret_ref or connection.auth_source != "none"
+                for connection in app_config.connections.values()
             )
-            model = (settings.llm.model or "").strip()
-            api_key_configured = bool((settings.llm.api_key or "").strip())
-            api_base = display_api_base((settings.llm.api_base or "").strip())
-            reasoning_effort = settings.llm.reasoning_effort
-            streaming_enabled = not settings.llm.disable_streaming
-            prompt_cache = settings.llm.prompt_cache
-            llm_timeout = settings.llm.timeout
-            max_tool_calls_per_turn = settings.llm.max_tool_calls_per_turn
-            max_context_images = settings.runtime.max_context_images
-            routes = load_routes(
-                settings,
-                selected=[source.selected_route] if source.selected_route else None,
-            )
+            routes = load_app_routes()
             if routes:
-                selected = routes[0]
-                model = selected.model
-                api_key_configured = bool(
-                    selected.api_key_ref or selected.api_key_env or settings.llm.api_key
-                )
-                api_base = display_api_base(selected.base_url or "")
+                model = f"automatic · {len(routes)} eligible model(s)"
         usage = (
             dict(source.report_state.get_total_llm_usage())
             if source.report_state is not None
@@ -101,15 +75,14 @@ class WorkspaceProjector:
         with contextlib.suppress(Exception):
             subscription = is_subscription_run(source.report_state)
         model_warning = ""
-        if model and not is_recommended_or_frontier_model(model):
-            model_warning = (
-                f"{model} is not a recommended frontier model. Pentest quality could be degraded."
-            )
         route_health: list[dict[str, Any]] = []
         route_pool = source.scan_context.route_pool if source.scan_context is not None else None
         if route_pool is not None:
             with contextlib.suppress(Exception):
                 route_health = route_pool.public_status()[:32]
+                decision = route_pool.last_decision
+                if decision is not None:
+                    source.selected_route = decision.route_id
         state = {
             "setup_mode": source.setup_mode,
             "scan_started": source.scan_started,
@@ -138,7 +111,7 @@ class WorkspaceProjector:
             "llm_timeout": llm_timeout,
             "max_tool_calls_per_turn": max_tool_calls_per_turn,
             "max_context_images": max_context_images,
-            "config_env_override": any(alias in os.environ for alias in _LLM_ENV_ALIASES),
+            "config_env_override": False,
             "selected_route": terminal_projection(source.selected_route, max_string=128),
             "notification_unread": source.notification_service.unread_count(),
             "caido_url": terminal_projection(
@@ -204,9 +177,7 @@ class WorkspaceProjector:
             return [collection_item_projection(event) for event in source.live_view.events]
         if name == "vulnerabilities":
             reports = (
-                source.report_state.vulnerability_reports
-                if source.report_state is not None
-                else []
+                source.report_state.vulnerability_reports if source.report_state is not None else []
             )[-MAX_TERMINAL_VULNERABILITIES:]
             result: list[dict[str, Any]] = []
             for index, report in enumerate(reports):

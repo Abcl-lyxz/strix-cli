@@ -1,50 +1,34 @@
 # Strix — Agent Guide
 
-Strix is an open-source autonomous AI pentesting tool. This file is for AI coding agents that want to **use** Strix (run security scans) or **contribute** to it.
+Strix v2 is an open-source autonomous AI pentesting tool with a terminal-only control plane.
 
-## Using Strix from an agent
+## Using Strix
 
-Install the agent skills for step-by-step workflows:
+Only test targets the user owns or is authorized to assess.
 
 ```bash
-npx skills add usestrix/strix
+strix
 ```
 
-- `penetration-testing-with-strix` — run a headless pentest against code, URLs, domains, or IPs and read results
-- `fix-security-vulnerabilities-with-strix` — remediate findings and re-run Strix to verify
-- `ci-security-scanning-with-strix` — add PR scanning to CI/CD (self-hosted CLI)
+The user completes provider connection, model enablement, targets, settings, and scan launch inside the TUI. External automation must not try to bypass the TUI: v2 has no headless or CI scanning entry point.
 
-Target-specific workflows built on the same engine:
+The only utility commands outside the TUI are:
 
-- `application-security-testing` — whole-product AppSec review: pick the right test per asset, then rank the results
-- `web-app-penetration-testing` — black-box pentest of a live web app or staging site
-- `api-security-testing` — REST/GraphQL APIs and the OWASP API Security Top 10 (BOLA/IDOR, authz)
-- `owasp-top-10-testing` — systematic OWASP Top 10 assessment with honest per-category coverage
-- `find-security-vulnerabilities-in-code` — white-box review of a repo or working tree
+```bash
+strix --help
+strix --version
+strix doctor
+```
 
-**Run locally with your model provider:**
+Use `/connect` for provider credentials, `/models` for discovery and enablement, `/targets` for scope, `/settings` for typed scan limits, `/router` for route eligibility and decisions, and `/start` to create the immutable run configuration. `/viewer` is read-only.
 
-- **Open-source CLI (self-hosted):** free, fully local, BYO LLM key, needs Docker. Best for local dev loops, air-gapped/offline, and full control.
-  ```bash
-  curl -sSL https://strix.ai/install | bash        # install
-  export STRIX_LLM="openrouter/z-ai/glm-5.3"        # any LiteLLM model id
-  export LLM_API_KEY="<key>"
-  strix -n -t ./ --scan-mode quick --max-budget 10  # headless scan; always use -n
-  ```
-  - Requires Docker running. Scans take minutes (`quick`) to hours (`deep`) — run in the background.
-  - Diagnose installation, Docker/VPN/proxy routing, model setup, and container HTTPS with `strix doctor --network`.
-  - Bound agent expansion with `--max-agents N` (default `12`, including the root); completed/stopped agents free slots.
-  - Exit codes (headless): `0` clean, `1` fatal error, `2` vulnerabilities found. A `0` only covers what was analyzed — check `run.json` (`status`, `llm_usage.cost` vs the budget) before calling a run clean.
-  - Artifacts in `strix_runs/<run-name>/`: `penetration_test_report.md`, `vulnerabilities/*.md`, `vulnerabilities.json`, `findings.sarif` (SARIF 2.1.0), `run.json`.
+## Contributing
 
-- CLI docs index for LLMs: https://docs.strix.ai/llms.txt (full: https://docs.strix.ai/llms-full.txt).
-- Only scan targets the user is authorized to test.
-
-## Contributing to this repo
-
-- Python 3.12+, managed with `uv`. Install dev deps: `make dev-install`.
-- Lint/format/type-check/security, all in one: `make check-all` (ruff, mypy, bandit).
-- Tests: `uv run pytest`.
-- Run from source: `uv run strix --target <target>`.
-- Layout: `strix/agents` (agent graph + prompts), `strix/tools` (proxy, browser, terminal, scanners), `strix/runtime` (Docker sandbox), `strix/report` (findings, SARIF), `strix/skills` (internal knowledge packs the pentest agents load — different from the consumer skills in `skills/`), `strix/interface` (CLI/TUI), `containers/` (sandbox image).
-- Pre-commit hooks: `make pre-commit` (or `uv run pre-commit install`).
+- Python 3.12+, managed with `uv`; install with `make dev-install`.
+- Format explicitly with `make format`.
+- Run the full non-mutating gate with `make check-all`.
+- Run from source with `uv run strix`.
+- Layout: `strix/agents` (agent graph and prompts), `strix/providers` (ProviderAdapter v2 registry), `strix/tools` (proxy, browser, terminal, scanners), `strix/runtime` (Docker sandbox), `strix/report` (findings and SARIF), `strix/skills` (internal knowledge packs), `strix/interface` (TUI and read-only viewer), and `containers/` (sandbox image).
+- Provider plugins register through the `strix.providers` entry-point group and must declare `api_version = 2`.
+- The Pydantic protocol v8 models are the source of truth. Run `make protocol-check` after protocol changes.
+- Do not add scan/setup flags, environment precedence over TUI state, browser mutations, or a second configuration owner.

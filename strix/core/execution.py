@@ -40,7 +40,11 @@ from strix.llm.errors import classify_model_failure
 from strix.llm.tool_arguments import quarantine_history
 from strix.notifications import NotificationAction
 from strix.resilience import full_jitter_delay, retry_after_seconds
-from strix.routing import AllRoutesUnavailableError
+from strix.routing import (
+    AllRoutesUnavailableError,
+    reset_routing_context,
+    set_routing_context,
+)
 from strix.tools.browser.tool import browser_lifecycle
 
 
@@ -62,6 +66,19 @@ StreamEventSink = Callable[[str, Any], None]
 _INPUT_REJECTION_CODES = frozenset({400, 404, 422})
 _MAX_COMPACTIONS_PER_CYCLE = 2
 _MAX_AGENT_CRASH_RESTARTS = 2
+
+
+def _task_kind_for_role(role: str) -> str:
+    normalized = role.casefold()
+    if any(token in normalized for token in ("code", "exploit", "remedi", "review")):
+        return "coding"
+    if any(token in normalized for token in ("vision", "image", "screenshot")):
+        return "vision"
+    if any(token in normalized for token in ("report", "synth", "long-context")):
+        return "long_context"
+    if any(token in normalized for token in ("recon", "enumer", "discover", "scan")):
+        return "recon"
+    return "general"
 
 
 def _publish_notification(publisher: Any, event_type: str, **kwargs: Any) -> None:
@@ -228,7 +245,7 @@ async def _seed_and_prepare_first_input(
 
 
 @browser_lifecycle
-async def run_agent_loop(  # noqa: PLR0912
+async def run_agent_loop(  # noqa: PLR0912, PLR0915
     *,
     agent: Any,
     initial_input: Any,
@@ -286,6 +303,7 @@ async def run_agent_loop(  # noqa: PLR0912
     if not interactive:
         return result
 
+    automatic_route_resumes = 0
     while True:
         timeout = await _plain_waiting_timeout(coordinator, agent_id)
         try:
@@ -307,12 +325,26 @@ async def run_agent_loop(  # noqa: PLR0912
             raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
         if route_ready:
-            logger.info("model route recovered; auto-resuming agent %s", agent_id)
+            if automatic_route_resumes >= 1:
+                await coordinator.park_waiting(agent_id, wait_kind="blocked")
+                _publish_notification(
+                    context.get("notifications"),
+                    "agent.waiting",
+                    title=f"Agent {agent_id} needs provider attention",
+                    detail="Automatic resume was already used for this checkpoint.",
+                    severity="warning",
+                    agent_id=agent_id,
+                    dedupe_key=f"route-resume-exhausted:{agent_id}",
+                )
+                continue
+            automatic_route_resumes += 1
+            logger.info("model route became eligible; resuming agent %s", agent_id)
         elif woke:
             # Real input is real progress, so the nudge budget starts over. A bare
             # auto-resume is not: it must not hand a wedged agent a fresh budget.
             await coordinator.reset_recovery(agent_id)
             await coordinator.reset_idle_resumes(agent_id)
+            automatic_route_resumes = 0
         else:
             idle_resumes = await coordinator.record_idle_resume(agent_id)
             if idle_resumes >= _MAX_IDLE_AUTO_RESUMES:
@@ -354,6 +386,8 @@ async def run_agent_loop(  # noqa: PLR0912
                 event_sink=event_sink,
                 hooks=hooks,
             )
+            if result is not None:
+                automatic_route_resumes = 0
 
 
 async def _wait_for_resume(
@@ -812,16 +846,39 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     await coordinator.set_operation(agent_id, "running")
                 with contextlib.suppress(Exception):
                     pre_run_items = list(await session.get_items())
-            stream = Runner.run_streamed(
-                agent,
-                input=input_data,
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                hooks=hooks,
+            role = str(getattr(agent, "name", None) or context.get("agent_role") or agent_id)
+            task_kind = str(context.get("task_kind") or _task_kind_for_role(role))
+            budget_limit = context.get("max_budget_usd")
+            spent = (
+                scan_context.report_state.get_total_llm_cost()
+                if scan_context is not None and budget_limit is not None
+                else 0.0
             )
-            await coordinator.attach_stream(agent_id, stream)
+            routing_token = set_routing_context(
+                agent_role=role,
+                scan_phase=str(context.get("scan_mode") or "analysis"),
+                task_kind=task_kind,
+                prefers_reasoning=task_kind == "coding",
+                budget_remaining_usd=(
+                    max(0.0, float(budget_limit) - float(spent))
+                    if isinstance(budget_limit, int | float)
+                    else None
+                ),
+            )
+            try:
+                stream = Runner.run_streamed(
+                    agent,
+                    input=input_data,
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    hooks=hooks,
+                )
+                await coordinator.attach_stream(agent_id, stream)
+            except BaseException:
+                reset_routing_context(routing_token)
+                raise
             try:
                 try:
                     async for event in stream.stream_events():
@@ -884,6 +941,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
             finally:
                 await coordinator.detach_stream(agent_id, stream)
+                reset_routing_context(routing_token)
         except BudgetPausedError as exc:
             logger.info("agent %s paused at the scan budget limit: %s", agent_id, exc)
             await coordinator.pause_for_budget(agent_id)
@@ -964,9 +1022,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 raise
 
             failure = (
-                "policy"
-                if isinstance(exc, ProviderRefusalError)
-                else classify_model_failure(exc)
+                "policy" if isinstance(exc, ProviderRefusalError) else classify_model_failure(exc)
             )
             safe_tool_state = not tool_output_committed
             if tool_output_committed and session is not None:
@@ -1095,8 +1151,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 if callable(wait_for_route):
                     remaining = max(
                         0.1,
-                        policy.limits.max_elapsed_seconds
-                        - (now() - state.recovery.started_at),
+                        policy.limits.max_elapsed_seconds - (now() - state.recovery.started_at),
                     )
                     timeout = min(
                         float(getattr(route_pool, "wait_timeout", None) or 600),
@@ -1123,8 +1178,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     "model.retry",
                     title=f"Retrying model in {delay:.1f}s",
                     detail=(
-                        f"Attempt {state.recovery.model_retries}/"
-                        f"{policy.limits.model_retries}"
+                        f"Attempt {state.recovery.model_retries}/{policy.limits.model_retries}"
                     ),
                     severity="warning",
                     agent_id=agent_id,

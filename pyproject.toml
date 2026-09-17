@@ -1,6 +1,6 @@
 [project]
 name = "strix-agent"
-version = "1.9.4"
+version = "2.0.0"
 description = "Open-source AI Hackers for your apps"
 readme = "README.md"
 license = "Apache-2.0"
@@ -63,7 +63,6 @@ strix = "strix.interface.main:main"
 dev = [
   "mypy>=1.16.0",
   "ruff>=0.11.13",
-  "pyright>=1.1.401",
   "bandit>=1.8.3",
   "pre-commit>=4.2.0",
   "pyinstaller>=6.17.0; python_version >= '3.12' and python_version < '3.15'",
@@ -155,7 +154,9 @@ line-length = 100
 extend-exclude = [
     ".git",
     ".mypy_cache",
+    ".pytest-tmp-*",
     ".ruff_cache",
+    ".tmp",
     "__pycache__",
     "build",
     "dist",
@@ -328,36 +329,6 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
-
-# ============================================================================
-# PyRight Configuration (Alternative type checker)
-# ============================================================================
-
-[tool.pyright]
-include = ["strix"]
-exclude = ["**/__pycache__", "build", "dist"]
-pythonVersion = "3.12"
-pythonPlatform = "Linux"
-
-typeCheckingMode = "strict"
-reportMissingImports = true
-reportMissingTypeStubs = false
-reportGeneralTypeIssues = true
-reportPropertyTypeMismatch = true
-reportFunctionMemberAccess = true
-reportMissingParameterType = true
-reportMissingTypeArgument = true
-reportIncompatibleMethodOverride = true
-reportIncompatibleVariableOverride = true
-reportInconsistentConstructor = true
-reportOverlappingOverload = true
-reportConstantRedefinition = true
-reportImportCycles = true
-reportUnusedImport = true
-reportUnusedClass = true
-reportUnusedFunction = true
-reportUnusedVariable = true
-reportDuplicateImport = true
 
 # ============================================================================
 # Black Configuration (Code Formatter)

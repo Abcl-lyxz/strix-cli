@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 )
 
@@ -14,10 +13,8 @@ import (
 // becoming the source of truth for every panel.
 type setupFeature struct {
 	input         textarea.Model
-	apiKeyInput   textinput.Model
 	setupLog      []string
 	pendingPrompt string
-	apiKeyError   string
 }
 
 type transcriptFeature struct {

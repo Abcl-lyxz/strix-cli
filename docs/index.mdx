@@ -1,101 +1,30 @@
 ---
-title: "Introduction"
-description: "Open-source AI hackers to secure your apps"
+title: "Strix v2"
+description: "Autonomous AI pentesting with one terminal control plane"
 ---
 
-Strix are autonomous AI agents that act like real hackers—they run your code dynamically, find vulnerabilities, and validate them with proof-of-concepts. Built for developers and security teams who need fast, accurate security testing without the overhead of manual pentesting or the false positives of static analysis tools.
+Strix coordinates autonomous security agents inside a Docker sandbox and reports validated findings with evidence. Version 2 replaces CLI configuration and headless execution with one typed terminal TUI.
 
-<Frame>
-  <img src="/images/screenshot.png" alt="Strix Demo" />
-</Frame>
-
-<CardGroup cols={2}>
-  <Card title="Quick Start" icon="rocket" href="/quickstart">
-    Install and run your first scan in minutes.
-  </Card>
-  <Card title="CLI Reference" icon="terminal" href="/usage/cli">
-    Learn all command-line options.
-  </Card>
-  <Card title="Tools" icon="wrench" href="/tools/overview">
-    Explore the security testing toolkit.
-  </Card>
-  <Card title="GitHub Actions" icon="github" href="/integrations/github-actions">
-    Integrate into your CI/CD pipeline.
-  </Card>
-</CardGroup>
-
-## Use Cases
-
-- **Application Security Testing** — Detect and validate critical vulnerabilities in your applications
-- **Rapid Penetration Testing** — Get penetration tests done in hours, not weeks
-- **Bug Bounty Automation** — Automate research and generate PoCs for faster reporting
-- **CI/CD Integration** — Block vulnerabilities before they reach production
-
-## Key Capabilities
-
-- **Full hacker toolkit** — Browser automation, HTTP proxy, terminal, Python runtime
-- **Real validation** — PoCs, not false positives
-- **Multi-agent orchestration** — Specialized agents collaborate on complex targets
-- **Developer-first CLI** — Interactive TUI or headless mode for automation
-
-## Security Tools
-
-Strix agents come equipped with a comprehensive toolkit:
-
-| Tool | Purpose |
-|------|---------|
-| HTTP Proxy | Full request/response manipulation and analysis |
-| Browser Automation | Multi-tab browser for XSS, CSRF, auth flow testing |
-| Terminal | Interactive shells for command execution |
-| Python Runtime | Custom exploit development and validation |
-| Reconnaissance | Automated OSINT and attack surface mapping |
-| Code Analysis | Static and dynamic analysis capabilities |
-
-## Vulnerability Coverage
-
-| Category | Examples |
-|----------|----------|
-| Access Control | IDOR, privilege escalation, auth bypass |
-| Injection | SQL, NoSQL, command injection |
-| Server-Side | SSRF, XXE, deserialization |
-| Client-Side | XSS, prototype pollution, DOM vulnerabilities |
-| Business Logic | Race conditions, workflow manipulation |
-| Authentication | JWT vulnerabilities, session management |
-| Infrastructure | Misconfigurations, exposed services |
-
-## Multi-Agent Architecture
-
-Strix uses a graph of specialized agents for comprehensive security testing:
-
-- **Distributed Workflows** — Specialized agents for different attacks and assets
-- **Scalable Testing** — Parallel execution for fast comprehensive coverage
-- **Dynamic Coordination** — Agents collaborate and share discoveries
-
-## Quick Example
+## Start
 
 ```bash
-# Install
 curl -sSL https://strix.ai/install | bash
-
-# Configure
-export STRIX_LLM="openrouter/z-ai/glm-5.3"
-export LLM_API_KEY="your-api-key"
-
-# Scan
-strix --target ./your-app
+strix
 ```
 
-## Community
+Use `/connect`, `/models`, `/targets`, `/settings`, `/router`, and `/start`. The browser viewer is read-only, environment credentials are detection hints only, and removed v1 flags fail before a run begins.
+
+## Why the v2 boundary matters
+
+- One `AppConfig v3` owns provider connections, router policy, scan defaults, MCP, notifications, and UI preferences.
+- Provider adapters declare their own authentication and model discovery contract.
+- The router chooses per logical task using capability, quality, reliability, cost, and latency metadata.
+- Recovery is bounded to three distinct routes and never replays after output or a side effect.
+- Protocol v8 keeps Python and Go command/result types generated from one schema.
 
 <CardGroup cols={2}>
-  <Card title="Discord" icon="discord" href="https://discord.gg/strix-ai">
-    Join the community for help and discussion.
-  </Card>
-  <Card title="GitHub" icon="github" href="https://github.com/usestrix/strix">
-    Star the repo and contribute.
-  </Card>
+  <Card title="Quick start" icon="rocket" href="/quickstart">Run the first TUI-controlled scan.</Card>
+  <Card title="Provider connections" icon="plug" href="/llm-providers/overview">Connect providers and enable models.</Card>
+  <Card title="TUI reference" icon="terminal" href="/usage/cli">See all canonical commands.</Card>
+  <Card title="Read-only viewer" icon="eye" href="/usage/viewer">Observe transcript, findings, and artifacts.</Card>
 </CardGroup>
-
-<Warning>
-Only test applications you own or have explicit permission to test.
-</Warning>

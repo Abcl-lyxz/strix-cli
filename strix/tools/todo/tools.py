@@ -36,9 +36,7 @@ def _agent_id_from(ctx: RunContextWrapper) -> str:
     return str(inner.get("agent_id") or "default")
 
 
-def _get_agent_todos(
-    store: ArtifactRepository, agent_id: str
-) -> dict[str, dict[str, Any]]:
+def _get_agent_todos(store: ArtifactRepository, agent_id: str) -> dict[str, dict[str, Any]]:
     todos = store.data.setdefault(agent_id, {})
     if not isinstance(todos, dict):
         todos = {}
@@ -62,8 +60,7 @@ def _coerce_priority(priority: str | None, default: str = "normal") -> str:
 
 def _sorted_todos(store: ArtifactRepository, agent_id: str) -> list[dict[str, Any]]:
     todos_list = [
-        {**todo, "todo_id": todo_id}
-        for todo_id, todo in _get_agent_todos(store, agent_id).items()
+        {**todo, "todo_id": todo_id} for todo_id, todo in _get_agent_todos(store, agent_id).items()
     ]
     todos_list.sort(key=_todo_sort_key)
     return todos_list
@@ -437,9 +434,7 @@ async def update_todo(ctx: RunContextWrapper, updates: str) -> str:
     return json.dumps(response, ensure_ascii=False, default=str)
 
 
-def _mark(
-    *, store: ArtifactRepository, agent_id: str, todo_ids: str, new_status: str
-) -> str:
+def _mark(*, store: ArtifactRepository, agent_id: str, todo_ids: str, new_status: str) -> str:
     try:
         agent_todos = _get_agent_todos(store, agent_id)
         ids = _normalize_todo_ids(todo_ids)

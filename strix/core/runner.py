@@ -7,7 +7,6 @@ import contextlib
 import io
 import json
 import logging
-import os
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
@@ -22,14 +21,10 @@ from strix.adapters.artifacts import JsonArtifactStore
 from strix.agents.factory import build_strix_agent, make_child_factory
 from strix.agents.prompt import render_system_prompt
 from strix.bootstrap import create_scan_context
-from strix.config import config_path, load_settings
-from strix.config import routes as route_config
-from strix.config.models import (
-    configure_sdk_model_defaults,
-    supports_strict_tool_schemas,
-    uses_chat_completions_tool_schema,
-)
-from strix.config.routes import load_routes
+from strix.config import load_settings
+from strix.config.app_config import get_config_service
+from strix.config.models import supports_strict_tool_schemas, uses_chat_completions_tool_schema
+from strix.config.runtime_routes import app_route_revision, load_app_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.core.agents import AgentCoordinator
 from strix.core.execution import (
@@ -49,7 +44,6 @@ from strix.core.inputs import (
 from strix.core.ownership import owned_run
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.core.sessions import open_agent_session
-from strix.domain.routes import RouteConfig
 from strix.report.state import ReportState
 from strix.routing import (
     AllRoutesUnavailableError,
@@ -76,6 +70,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultBase
 
     from strix.application.context import ScanContext
+    from strix.domain.routes import RouteConfig
     from strix.runtime.status import StatusSink
 
 
@@ -92,32 +87,12 @@ StreamEventSink = Callable[[str, Any], None]
 McpStatusSink = Callable[[list[dict[str, Any]]], None]
 
 
-def _route_reloader(
-    selected: object,
-) -> Callable[[], tuple[object, list[RouteConfig]]]:
-    """Build a non-secret route snapshot watched by parked interactive agents."""
-    selected_names = (
-        [str(name) for name in selected]
-        if isinstance(selected, list) and all(isinstance(name, str) for name in selected)
-        else None
-    )
+def _route_reloader() -> Callable[[], tuple[object, list[RouteConfig]]]:
+    """Watch only the v3 ConfigService revision for next-request switching."""
 
     def reload() -> tuple[object, list[RouteConfig]]:
-        route_file = os.environ.get("STRIX_ROUTES_FILE", "").strip()
-        source = Path(route_file) if route_file else config_path()
-        try:
-            stat_result = source.stat()
-            revision: object = (
-                str(source),
-                stat_result.st_mtime_ns,
-                stat_result.st_ctime_ns,
-                stat_result.st_size,
-            )
-        except OSError:
-            revision = (str(source), None)
-        return (revision, route_config.session_revision()), load_routes(
-            load_settings(), selected=selected_names
-        )
+        service = get_config_service()
+        return app_route_revision(service), load_app_routes(service)
 
     return reload
 
@@ -312,19 +287,22 @@ async def run_strix_scan(
     )
 
     settings = load_settings()
-    configure_sdk_model_defaults(settings)
-    routes = (
-        [
-            RouteConfig(
-                name="override",
-                model=model.strip(),
-                base_url=settings.llm.api_base,
-            )
-        ]
-        if model and model.strip()
-        else load_routes(settings, selected=scan_config.get("routes"))
-    )
-    resolved_model = min(routes, key=lambda route: (route.priority, route.name)).model
+    if model and model.strip():
+        raise ValueError(
+            "Per-run model overrides were removed in Strix v2. Enable models in /models; "
+            "the automatic router selects one for each task."
+        )
+    config_service = get_config_service()
+    app_config = config_service.load()
+    routes = load_app_routes(config_service)
+    quality_rank = {"frontier": 0, "strong": 1, "standard": 2, "economy": 3, "unknown": 4}
+    resolved_model = min(
+        routes,
+        key=lambda route: (
+            quality_rank.get(route.quality_tier, quality_rank["unknown"]),
+            route.name,
+        ),
+    ).model
     logger.info(
         "LLM route pool resolved: %d route(s), primary model=%s",
         len(routes),
@@ -343,17 +321,17 @@ async def run_strix_scan(
 
     route_pool = RoutePool(
         routes,
-        wait_timeout=(
-            None
-            if interactive
-            else float(getattr(getattr(settings, "routing", None), "outage_timeout", 600))
+        wait_timeout=min(
+            120.0,
+            float(getattr(getattr(settings, "routing", None), "outage_timeout", 600)),
         ),
         health_path=state_dir / "routes.json",
-        route_reloader=_route_reloader(scan_config.get("routes")),
-        stream_idle_timeout=float(getattr(settings.llm, "stream_idle_timeout", 300)),
-        max_attempts_per_route=int(
-            getattr(getattr(settings, "routing", None), "max_attempts_per_route", 2)
-        ),
+        route_reloader=_route_reloader(),
+        stream_idle_timeout=float(app_config.ui.stream_idle_timeout_seconds),
+        max_attempts_per_turn=app_config.router.max_attempts_per_turn,
+        max_consecutive_failed_turns=app_config.router.max_consecutive_failed_turns,
+        max_retry_input_multiplier=app_config.router.max_retry_input_multiplier,
+        allow_unknown_capabilities=app_config.router.allow_unknown_capabilities,
         notifications=scan_context.services.notifications,
     )
     scan_context.route_pool = route_pool
@@ -378,9 +356,7 @@ async def run_strix_scan(
         }
     )
     coverage_store = scan_context.artifact_store("coverage")
-    report_state.set_coverage_entries_provider(
-        lambda: coverage_store.snapshot_entries("entry_id")
-    )
+    report_state.set_coverage_entries_provider(lambda: coverage_store.snapshot_entries("entry_id"))
 
     root_id: str | None = None
     if is_resume:
@@ -465,12 +441,12 @@ async def run_strix_scan(
         skills = list(scan_config.get("skills") or [])
         root_task = build_root_task(scan_config)
         model_settings = make_model_settings(
-            settings.llm.reasoning_effort,
+            app_config.ui.reasoning_effort,
             model_name=resolved_model,
             force_required_tool_choice=settings.llm.force_required_tool_choice,
-            request_timeout=settings.llm.timeout,
-            prompt_cache=settings.llm.prompt_cache,
-            extra_headers=settings.llm.extra_headers,
+            request_timeout=app_config.ui.llm_timeout_seconds,
+            prompt_cache=app_config.ui.prompt_cache,
+            extra_headers=None,
         )
         # The shared route pool owns request retries and circuit breaking.  If
         # the SDK also retries the RoutedModel, a single route failure expands
@@ -629,7 +605,6 @@ async def run_strix_scan(
                 **kwargs,
             )
 
-        runtime_settings = getattr(settings, "runtime", None)
         scan_context.mcp_registry = mcp_registry
         context: dict[str, Any] = scan_context.tool_context(
             coordinator=coordinator,
@@ -642,13 +617,14 @@ async def run_strix_scan(
             spawn_child_agent=spawn_child_agent,
             scan_id=scan_id,
             scan_targets=build_scan_targets(scan_config),
-            max_context_images=getattr(runtime_settings, "max_context_images", 3),
+            max_context_images=app_config.ui.max_context_images,
+            max_budget_usd=max_budget_usd,
             route_pool=route_pool,
-            sandbox_profile=getattr(runtime_settings, "sandbox_profile", "web"),
-            tool_pack=getattr(runtime_settings, "tool_pack", "auto"),
-            scope_cidr=getattr(runtime_settings, "scope_cidr", None),
-            network_interface=getattr(runtime_settings, "network_interface", None),
-            packet_rate_limit=getattr(runtime_settings, "packet_rate_limit", None),
+            sandbox_profile=scan_config.get("sandbox_profile", "web"),
+            tool_pack=scan_config.get("tool_pack", "auto"),
+            scope_cidr=scan_config.get("scope_cidr"),
+            network_interface=scan_config.get("network_interface"),
+            packet_rate_limit=scan_config.get("packet_rate_limit"),
         )
 
         root_session = open_agent_session(root_id, agents_db)

@@ -298,7 +298,7 @@ func TestSetupOffersSearchableSlashCommands(t *testing.T) {
 	model.showSplash = false
 	model.handleEnvelope(stateEnvelope(t, 1, protocol.Snapshot{SetupMode: true, ScanState: "setup"}))
 
-	for _, want := range []string{"/target", "/model", "/apikey", "/routes", "/notifications", "/storage", "/help"} {
+	for _, want := range []string{"/connect", "/models", "/router", "/targets", "/notifications", "/update", "/help"} {
 		model.input.SetValue(want)
 		model.resizeViewport()
 		view := ansi.Strip(model.View())

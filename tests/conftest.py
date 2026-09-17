@@ -8,13 +8,14 @@ import pytest
 
 from strix import notifications as notification_module
 from strix.config import loader as config_loader
-from strix.config import routes as route_config
+from strix.config.app_config import ConfigService, set_config_service
 from strix.security import SecretStore
 from strix.security import secrets as secret_module
 from strix.tools.mcp import loader as mcp_loader
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 
@@ -37,13 +38,10 @@ class _MemorySecretBackend:
 
 @pytest.fixture(autouse=True)
 def _isolate_global_strix_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Keep tests away from the developer's routes and notification inbox."""
+    """Keep tests away from legacy settings and the notification inbox."""
     monkeypatch.setattr(config_loader, "_override", tmp_path / "cli-config.json")
     monkeypatch.setattr(config_loader, "_cached", None)
     monkeypatch.setattr(config_loader, "_session_fields", {})
-    monkeypatch.setattr(route_config, "_session_routes", {})
-    monkeypatch.setattr(route_config, "_session_selected", None)
-    monkeypatch.setattr(route_config, "_session_revision", 0)
     monkeypatch.setattr(mcp_loader, "_session_configs", {})
     monkeypatch.setattr(secret_module, "_known_values", set())
     monkeypatch.setattr(notification_module, "_DEFAULT_PATH", tmp_path / "state.db")
@@ -57,9 +55,28 @@ def _isolate_global_strix_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         "OPENAI_BASE_URL",
         "LITELLM_BASE_URL",
         "OLLAMA_API_BASE",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "TOKENROUTER_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "TOGETHERAI_API_KEY",
+        "FIREWORKS_AI_API_KEY",
         "LLM_EXTRA_HEADERS",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_app_config_v3(tmp_path: Path) -> Iterator[None]:
+    """Never read or mutate the developer's v3 provider and router state."""
+
+    set_config_service(ConfigService(tmp_path / "config.json"))
+    yield
+    set_config_service(None)
 
 
 @pytest.fixture(autouse=True)

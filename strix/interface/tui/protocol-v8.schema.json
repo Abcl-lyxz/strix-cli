@@ -1,0 +1,130 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "request_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Request Id"
+    },
+    "type": {
+      "title": "Type",
+      "type": "string"
+    },
+    "version": {
+      "const": 8,
+      "default": 8,
+      "title": "Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "ProtocolEnvelope",
+  "type": "object",
+  "x-command-request": {
+    "additionalProperties": false,
+    "description": "Source-of-truth schema for a TUI command request.",
+    "properties": {
+      "command": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Command",
+        "type": "string"
+      },
+      "payload": {
+        "additionalProperties": true,
+        "title": "Payload",
+        "type": "object"
+      }
+    },
+    "required": [
+      "command"
+    ],
+    "title": "CommandRequest",
+    "type": "object"
+  },
+  "x-command-result": {
+    "$defs": {
+      "CommandError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "invalid_request",
+              "persistence_error",
+              "command_failed",
+              "protocol_error",
+              "internal_error",
+              "result_too_large"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "CommandError",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "description": "Source-of-truth schema for every Python-to-Go command result.",
+    "properties": {
+      "command": {
+        "title": "Command",
+        "type": "string"
+      },
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/CommandError"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "ok": {
+        "title": "Ok",
+        "type": "boolean"
+      },
+      "result": {
+        "additionalProperties": true,
+        "title": "Result",
+        "type": "object"
+      }
+    },
+    "required": [
+      "ok",
+      "command"
+    ],
+    "title": "CommandResult",
+    "type": "object"
+  }
+}

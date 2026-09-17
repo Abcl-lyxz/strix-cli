@@ -54,17 +54,38 @@ jobs:
           cache-dependency-path: strix/interface/viewer/frontend/package-lock.json
       - name: Validate release source
         run: |
+          test -z "$(git status --porcelain)"
           uv sync --frozen
-          uv run ruff check .
+          uv run ruff check strix tests scripts
+          uv run ruff format --check strix tests scripts
           uv run mypy strix
           uv run bandit -c pyproject.toml -r strix
+          uv run python scripts/generate_tui_protocol.py --check
           uv run pytest
-          cd strix/interface/tui && go test -race ./...
+          cd strix/interface/tui
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
           cd ../viewer/frontend
           npm ci
           npm run type-check
           npm test
           npm run build
+          cd ../../../..
+          git diff --exit-code
+
+      - name: Real two-provider switching gate
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_ref, 'v')
+        env:
+          STRIX_RELEASE_PROVIDER_A_ID: ${{ secrets.STRIX_RELEASE_PROVIDER_A_ID }}
+          STRIX_RELEASE_PROVIDER_A_MODEL: ${{ secrets.STRIX_RELEASE_PROVIDER_A_MODEL }}
+          STRIX_RELEASE_PROVIDER_A_BASE_URL: ${{ secrets.STRIX_RELEASE_PROVIDER_A_BASE_URL }}
+          STRIX_RELEASE_PROVIDER_A_API_KEY: ${{ secrets.STRIX_RELEASE_PROVIDER_A_API_KEY }}
+          STRIX_RELEASE_PROVIDER_B_ID: ${{ secrets.STRIX_RELEASE_PROVIDER_B_ID }}
+          STRIX_RELEASE_PROVIDER_B_MODEL: ${{ secrets.STRIX_RELEASE_PROVIDER_B_MODEL }}
+          STRIX_RELEASE_PROVIDER_B_BASE_URL: ${{ secrets.STRIX_RELEASE_PROVIDER_B_BASE_URL }}
+          STRIX_RELEASE_PROVIDER_B_API_KEY: ${{ secrets.STRIX_RELEASE_PROVIDER_B_API_KEY }}
+        run: uv run python scripts/verify_real_provider_switch.py
 
   build:
     needs: validate
@@ -118,16 +139,29 @@ jobs:
           uv build --wheel
           uv run python -c 'import glob, os, sys, zipfile; wheels = glob.glob("dist/*.whl"); assert len(wheels) == 1, wheels; archive = zipfile.ZipFile(wheels[0]); tui = "strix/bin/strix-tui.exe" if sys.platform == "win32" else "strix/bin/strix-tui"; assert tui in archive.namelist(); metadata = archive.read(next(name for name in archive.namelist() if name.endswith(".dist-info/WHEEL"))).decode(); assert "Root-Is-Purelib: false" in metadata; assert "Tag: py3-none-" + os.environ["STRIX_WHEEL_PLATFORM_TAG"] in metadata'
 
+          uv venv .release-smoke
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            uv pip install --python .release-smoke/Scripts/python.exe dist/*.whl
+            .release-smoke/Scripts/strix.exe --version
+            .release-smoke/Scripts/strix.exe --help
+          else
+            uv pip install --python .release-smoke/bin/python dist/*.whl
+            .release-smoke/bin/strix --version
+            .release-smoke/bin/strix --help
+          fi
+
           uv run pyinstaller strix.spec --noconfirm
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             PYI_BINARY="dist/strix.exe"
             TUI_NAME="strix-tui.exe"
             dist/strix.exe --version
+            dist/strix.exe --help
           else
             PYI_BINARY="dist/strix"
             TUI_NAME="strix-tui"
             dist/strix --version
+            dist/strix --help
           fi
           uv run pyi-archive_viewer -l "$PYI_BINARY" | grep -E "strix[/\\]+bin[/\\]+$TUI_NAME" >/dev/null
 

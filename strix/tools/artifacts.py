@@ -20,7 +20,5 @@ def scan_context_from_tool(ctx: RunContextWrapper[Any]) -> ScanContext:
     return cast("ScanContext", scan_context)
 
 
-def artifact_store_from_tool(
-    ctx: RunContextWrapper[Any], name: str
-) -> ArtifactRepository:
+def artifact_store_from_tool(ctx: RunContextWrapper[Any], name: str) -> ArtifactRepository:
     return scan_context_from_tool(ctx).artifact_store(name)

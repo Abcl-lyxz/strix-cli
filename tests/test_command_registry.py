@@ -17,10 +17,10 @@ async def test_exact_command_wins_over_namespace_without_mutating_payload() -> N
     async def namespace(command: Command) -> dict[str, Any]:
         return {"handler": "namespace", "command": command.name}
 
-    registry.register("scan.retry", exact)
+    registry.register("router.status", exact)
     registry.register_namespace("scan", namespace)
     payload = {"agent_id": "root"}
-    result = await registry.dispatch(Command("scan.retry", payload))
+    result = await registry.dispatch(Command("router.status", payload))
     assert result == {"handler": "exact", "payload": payload}
     assert payload == {"agent_id": "root"}
 

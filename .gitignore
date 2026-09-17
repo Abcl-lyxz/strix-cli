@@ -6,6 +6,9 @@ strix/interface/viewer/frontend/.vite/
 
 # Python
 __pycache__/
+.pytest-tmp-*/
+/.tmp/
+/.test-tmp-check/
 *.py[cod]
 *$py.class
 *.so

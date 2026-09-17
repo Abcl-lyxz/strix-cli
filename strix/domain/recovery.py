@@ -30,7 +30,7 @@ class RecoveryLimits:
     image_strips: int = 3
     compactions: int = 2
     history_repairs: int = 2
-    route_resumptions: int = 2
+    route_resumptions: int = 1
     model_retries: int = 2
     crash_restarts: int = 2
     max_elapsed_seconds: float = 120.0

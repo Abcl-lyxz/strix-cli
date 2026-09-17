@@ -146,9 +146,7 @@ async def _bound_result(ctx: Any, result: Any) -> Any:
     scan_context = inner.get("scan_context")
     resources = getattr(scan_context, "runtime_resources", None)
     writer = resources.get("spill_writer") if isinstance(resources, dict) else None
-    return await bound_and_store(
-        result, max_lines=max_lines, max_bytes=max_bytes, writer=writer
-    )
+    return await bound_and_store(result, max_lines=max_lines, max_bytes=max_bytes, writer=writer)
 
 
 def _format_tool_error(exc: Exception) -> str:

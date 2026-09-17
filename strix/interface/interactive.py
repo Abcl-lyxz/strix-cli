@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    import argparse
-
+    from strix.domain.app_state import LaunchState
     from strix.report.state import ReportState
 
 
@@ -19,7 +18,7 @@ class InteractiveSetupUnavailableError(RuntimeError):
     """Raised when the interactive TUI cannot be launched."""
 
 
-async def run_tui(args: argparse.Namespace) -> ReportState | None:
+async def run_tui(args: LaunchState) -> ReportState | None:
     """Run the Bubble Tea TUI."""
     from strix.interface.tui.runtime import (
         GoTuiPreActivationError,

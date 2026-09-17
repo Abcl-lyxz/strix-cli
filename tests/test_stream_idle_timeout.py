@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -22,7 +23,7 @@ from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from openai import AsyncOpenAI
 
 from strix.config import loader
-from strix.config.loader import load_settings
+from strix.config.app_config import AppConfig
 from strix.config.models import StrixProvider, _TurnGuardModel, _with_idle_timeout
 
 
@@ -150,8 +151,10 @@ def test_idle_timeout_is_configurable(
     monkeypatch: pytest.MonkeyPatch, _reset_settings: None
 ) -> None:
     monkeypatch.setattr("strix.config.models.MultiProvider.get_model", lambda *_: _DummyModel())
-    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT", "45")
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(load=lambda: AppConfig(ui={"stream_idle_timeout_seconds": 45})),
+    )
 
     model = StrixProvider().get_model("openai/gpt-4o-mini")
     assert isinstance(model, _TurnGuardModel)
@@ -164,9 +167,14 @@ def test_idle_timeout_is_off_without_streaming(
     # LLM_DISABLE_STREAMING turns the whole request into one event, so an idle
     # gap would just be the request duration — the request timeout bounds that.
     monkeypatch.setattr("strix.config.models.MultiProvider.get_model", lambda *_: _DummyModel())
-    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT", "45")
-    monkeypatch.setenv("LLM_DISABLE_STREAMING", "true")
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(
+            load=lambda: AppConfig(
+                ui={"stream_idle_timeout_seconds": 45, "streaming_enabled": False}
+            )
+        ),
+    )
 
     model = StrixProvider().get_model("openai/gpt-4o-mini")
     assert isinstance(model, _TurnGuardModel)

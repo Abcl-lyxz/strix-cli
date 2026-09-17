@@ -186,9 +186,7 @@ def _list_notes_impl(
 ) -> dict[str, Any]:
     with store.lock:
         try:
-            filtered = _filter_notes(
-                store, category=category, tags=tags, search_query=search
-            )
+            filtered = _filter_notes(store, category=category, tags=tags, search_query=search)
             notes = [
                 _to_note_listing_entry(
                     n, include_content=include_content, caller_agent_id=caller_agent_id

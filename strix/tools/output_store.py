@@ -33,6 +33,7 @@ _SAMPLE_WORKSPACE_PATH = f"{WORKSPACE_SPILL_DIR}/{'0' * 32}.txt"
 if TYPE_CHECKING:
     SpillWriter = Callable[[str, str], Awaitable[str | None]]
 
+
 def _byte_len(text: str) -> int:
     return len(text.encode("utf-8"))
 

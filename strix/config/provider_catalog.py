@@ -200,6 +200,18 @@ def model_metadata(model: str) -> dict[str, Any]:
             or 32_768,
             "max_output_tokens": int(info.get("max_output_tokens") or 0) or 8_192,
             "supports_tools": info.get("supports_function_calling"),
+            "supports_vision": info.get("supports_vision"),
+            "supports_reasoning": info.get("supports_reasoning"),
+            "input_cost_per_million": (
+                float(info["input_cost_per_token"]) * 1_000_000
+                if isinstance(info.get("input_cost_per_token"), int | float)
+                else None
+            ),
+            "output_cost_per_million": (
+                float(info["output_cost_per_token"]) * 1_000_000
+                if isinstance(info.get("output_cost_per_token"), int | float)
+                else None
+            ),
             "source": "litellm",
             "confidence": "catalog",
         }
@@ -220,8 +232,8 @@ def model_metadata(model: str) -> dict[str, Any]:
             "confidence": "catalog",
         }
     return {
-        "context_window_tokens": 32_768,
-        "max_output_tokens": 8_192,
+        "context_window_tokens": None,
+        "max_output_tokens": None,
         "supports_tools": None,
         "source": "conservative-default",
         "confidence": "unknown",

@@ -1,113 +1,31 @@
 ---
 title: "Contributing"
-description: "Contribute to Strix development"
+description: "Build and validate Strix v2"
 ---
 
-## Development Setup
-
-### Prerequisites
-
-- Python 3.12+
-- Latest Go 1.24.x patch (only for Bubble Tea TUI development and release artifacts)
-- Docker (running)
-- [uv](https://docs.astral.sh/uv/)
-- Git
-
-### Local Development
-
-<Steps>
-  <Step title="Clone the repository">
-    ```bash
-    git clone https://github.com/usestrix/strix.git
-    cd strix
-    ```
-  </Step>
-  <Step title="Install dependencies">
-    ```bash
-    make setup-dev
-
-    # or manually:
-    uv sync
-    uv run pre-commit install
-    ```
-  </Step>
-  <Step title="Configure LLM">
-    ```bash
-    export STRIX_LLM="openrouter/z-ai/glm-5.3"
-    export LLM_API_KEY="your-api-key"
-    ```
-  </Step>
-  <Step title="Run Strix">
-    ```bash
-    uv run strix --target https://example.com
-    ```
-  </Step>
-</Steps>
-
-## Contributing Skills
-
-Skills are specialized knowledge packages that enhance agent capabilities. They live in `strix/skills/`
-
-### Creating a Skill
-
-1. Choose the right category
-2. Create a `.md` file with YAML frontmatter (`name` and `description` fields)
-3. Include practical examples—working payloads, commands, test cases
-4. Provide validation methods to confirm findings
-5. Submit via PR
-
-## Contributing Code
-
-### Pull Request Process
-
-1. **Create an issue first** — Describe the problem or feature
-2. **Fork and branch** — Work from `main`
-3. **Make changes** — Follow existing code style
-4. **Write tests** — Ensure coverage for new features
-5. **Run checks** — `make check-all` should pass
-6. **Submit PR** — Link to issue and provide context
-
-### Code Style
-
-- PEP 8 with 100-character line limit
-- Type hints for all functions
-- Docstrings for public methods
-- Small, focused functions
-- Meaningful variable names
-
-## Package Builds
-
-Editable installs do not require Go; they run the TUI from source (`go run`).
-
-Wheels are intentionally strict: they always bundle the matching Go sidecar and
-are platform-specific.
+## Setup
 
 ```bash
-make wheel
+git clone https://github.com/usestrix/strix
+cd strix
+make dev-install
 ```
 
-The build hook (`scripts/tui_sidecar_hook.py`) requires Go 1.24.x or newer, embeds
-the sidecar as `strix/bin/strix-tui`, and assigns the current platform tag.
-Frozen releases built by `scripts/build.sh` and `strix.spec` also require the
-sidecar.
+Run the application from source with `uv run strix`. Configure test providers inside `/connect`; do not add local keys to the repository or process arguments.
 
-## Reporting Issues
+## Validation
 
-Include:
+```bash
+make format
+make check-all
+```
 
-- Python version and OS
-- Strix version (`strix --version`)
-- LLM being used
-- Full error traceback
-- Steps to reproduce
+Formatting is intentionally separate. `make check-all` is non-mutating and runs Python lint/format-check, mypy, Bandit, pytest, Go format/vet/race tests, frontend checks/build, and the protocol v8 drift check.
 
-## Community
+When editing commands or results, change the Pydantic source models and regenerate the JSON Schema and Go structs. When adding a provider, implement `ProviderAdapter` v2 and register it through the `strix.providers` entry-point group.
 
-<CardGroup cols={2}>
-  <Card title="Discord" icon="discord" href="https://discord.gg/strix-ai">
-    Join the community for help and discussion.
-  </Card>
-  <Card title="GitHub Issues" icon="github" href="https://github.com/usestrix/strix/issues">
-    Report bugs and request features.
-  </Card>
-</CardGroup>
+Do not restore scan flags, headless execution, browser mutations, or environment precedence over AppConfig v3.
+
+## Release gate
+
+Tag builds additionally require two real, distinct provider accounts. Configure repository secrets named `STRIX_RELEASE_PROVIDER_A_ID`, `STRIX_RELEASE_PROVIDER_A_MODEL`, `STRIX_RELEASE_PROVIDER_A_API_KEY` and the matching `B` values. `STRIX_RELEASE_PROVIDER_A_BASE_URL` and `STRIX_RELEASE_PROVIDER_B_BASE_URL` are optional for compatible gateways. The gate sends one minimal response request to each provider and verifies that the router revision moves the second logical turn to provider B; it never prints keys, endpoints, prompts, or responses.

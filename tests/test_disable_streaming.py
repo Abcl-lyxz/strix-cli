@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -30,7 +31,7 @@ from openai.types.responses import (
 )
 
 from strix.config import codex, loader
-from strix.config.loader import load_settings
+from strix.config.app_config import AppConfig
 from strix.config.models import StrixProvider, _NonStreamingModel, _TurnGuardModel
 
 
@@ -295,8 +296,10 @@ def test_get_model_wraps_when_disabled(
 ) -> None:
     inner = _DummyModel()
     monkeypatch.setattr("strix.config.models.MultiProvider.get_model", lambda *_: inner)
-    monkeypatch.setenv("LLM_DISABLE_STREAMING", "true")
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(load=lambda: AppConfig(ui={"streaming_enabled": False})),
+    )
 
     model = StrixProvider().get_model("openai/gpt-4o-mini")
     assert isinstance(model, _TurnGuardModel)
@@ -308,7 +311,10 @@ def test_get_model_keeps_streaming_by_default(
 ) -> None:
     inner = _DummyModel()
     monkeypatch.setattr("strix.config.models.MultiProvider.get_model", lambda *_: inner)
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(load=AppConfig),
+    )
 
     model = StrixProvider().get_model("openai/gpt-4o-mini")
     assert isinstance(model, _TurnGuardModel)
@@ -323,7 +329,10 @@ def test_get_model_guards_subscription_model_but_keeps_it_streaming(
     monkeypatch.setattr(codex, "subscription_model", lambda *_: "gpt-5.5")
     monkeypatch.setattr(codex, "get_subscription_client", lambda: AsyncOpenAI(api_key="x"))
     monkeypatch.setenv("LLM_DISABLE_STREAMING", "true")
-    load_settings()
+    monkeypatch.setattr(
+        "strix.config.app_config.get_config_service",
+        lambda: SimpleNamespace(load=AppConfig),
+    )
 
     model = StrixProvider().get_model("gpt-5.5")
     assert isinstance(model, _TurnGuardModel)

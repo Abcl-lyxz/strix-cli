@@ -1,0 +1,13 @@
+{
+  "payload": {
+    "version": 1,
+    "models": {
+      "openai/gpt-5.4": {"quality_tier": "frontier"},
+      "anthropic/claude-opus-4-1": {"quality_tier": "frontier"},
+      "anthropic/claude-sonnet-4": {"quality_tier": "strong"},
+      "gemini/gemini-2.5-pro": {"quality_tier": "strong"},
+      "openrouter/openai/gpt-5.4": {"quality_tier": "frontier"}
+    }
+  },
+  "signature": "dPR+TleXZpwWz2bJ9Uj3NWSJMUxnLwcB4uDiA1hFWaDgqLv/vbM24AjrUpmM83FrbeMVg7OWU4tQ5jo6hjBkCw=="
+}

@@ -381,6 +381,7 @@ class SupervisedMcpSession:
         is unavailable. A call rejection keeps the connection usable because the
         provider rejected the request, not the session.
         """
+
         async def job(server: MCPServer) -> Any:
             return await mcp_transport.dispatch_mcp_call(
                 server,

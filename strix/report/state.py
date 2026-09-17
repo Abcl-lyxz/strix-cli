@@ -9,8 +9,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from strix.config import codex
-from strix.config.loader import load_settings
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.notifications import NotificationAction
 from strix.ports.notifications import NotificationPublisher
@@ -190,15 +188,13 @@ class ReportState:
 
         self._llm_usage = LLMUsageLedger()
         self._telemetry_llm_usage_baseline: dict[str, Any] = {}
-        auth_mode = codex.auth_mode(load_settings().llm.model)
-        self._llm_usage.zero_cost = auth_mode == "subscription"
         self.run_record: dict[str, Any] = {
             "run_id": self.run_id,
             "run_name": self.run_name,
             "start_time": self.start_time,
             "end_time": None,
             "status": "running",
-            "auth_mode": auth_mode,
+            "auth_mode": "metered",
             "targets_info": [],
             "llm_usage": self._build_llm_usage_record(),
         }
@@ -229,9 +225,7 @@ class ReportState:
         except (OSError, RuntimeError, TypeError, ValueError):
             logger.exception("notification publication failed for %s", event_type)
 
-    def set_coverage_entries_provider(
-        self, provider: Callable[[], list[dict[str, Any]]]
-    ) -> None:
+    def set_coverage_entries_provider(self, provider: Callable[[], list[dict[str, Any]]]) -> None:
         """Inject the scan-owned coverage query without importing tool code."""
 
         self._coverage_entries = provider

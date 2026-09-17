@@ -131,29 +131,6 @@ export interface WorkspaceStreamEnvelope {
   attachments?: WorkspaceRow[];
 }
 
-export interface WorkspaceDialog {
-  title: string;
-  command?: string;
-  payload?: WorkspaceRow;
-  fields?: WorkspaceFormField[];
-  rows?: WorkspaceDialogRow[];
-  kind?: string;
-  error?: string;
-}
-
-export interface WorkspaceFormField extends WorkspaceRow {
-  id: string;
-  label: string;
-  value?: string | number | boolean | null;
-  type?: string;
-  options?: string[];
-  suggestions?: string[];
-}
-
-export interface WorkspaceDialogRow extends WorkspaceRow {
-  run?: () => void;
-}
-
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

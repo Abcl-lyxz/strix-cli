@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 from agents import ModelSettings
 
+from strix.config.app_config import AppConfig
 from strix.core import runner
 from strix.core.agents import AgentCoordinator
+from strix.domain.routes import RouteConfig
 from strix.runtime import session_manager
 
 
@@ -30,7 +32,20 @@ def _wire_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         runtime=types.SimpleNamespace(max_context_images=3),
     )
     monkeypatch.setattr(runner, "load_settings", lambda: settings)
-    monkeypatch.setattr(runner, "configure_sdk_model_defaults", lambda _settings: None)
+    service = types.SimpleNamespace(load=AppConfig)
+    monkeypatch.setattr(runner, "get_config_service", lambda: service)
+    monkeypatch.setattr(
+        runner,
+        "load_app_routes",
+        lambda _service=None: [
+            RouteConfig(
+                name="test",
+                model="openai/gpt-4o",
+                supports_tools=True,
+                context_window_tokens=128_000,
+            )
+        ],
+    )
     monkeypatch.setattr(
         runner, "uses_chat_completions_tool_schema", lambda _model, _settings: False
     )

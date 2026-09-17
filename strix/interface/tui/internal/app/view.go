@@ -850,7 +850,7 @@ func (m Model) statusView(width int) string {
 			} else if agent.WaitKind == "agents" {
 				left = lipgloss.NewStyle().Foreground(dim).Render("Waiting for other agents")
 			} else if agent.WaitKind == "stalled" {
-				left = lipgloss.NewStyle().Foreground(amber).Render("Recovery paused · /retry or /stop")
+				left = lipgloss.NewStyle().Foreground(amber).Render("Recovery paused · /connect or /quit")
 			}
 			if msg := agent.ErrorMessage; msg != "" {
 				left = statusMessage(msg, red, " · Send message to resume", width)

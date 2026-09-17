@@ -9,8 +9,7 @@ import pytest
 
 from strix.config.loader import set_session_field
 from strix.config.provider_catalog import model_metadata, refresh_provider_catalog
-from strix.config.providers import connect_provider
-from strix.config.routes import session_routes
+from strix.providers import get_provider_registry
 from strix.runtime import profiles
 from strix.tools.proxy.tools import _repair_httpql, _validate_httpql
 from strix.tools.security_jobs.tool import _validate_network_arguments
@@ -41,7 +40,7 @@ def test_unknown_model_uses_conservative_context_limit(
 
     metadata = model_metadata("custom/never-before-seen")
 
-    assert metadata["context_window_tokens"] == 32_768
+    assert metadata["context_window_tokens"] is None
     assert metadata["confidence"] == "unknown"
 
 
@@ -63,34 +62,10 @@ def test_catalog_refresh_is_atomic_and_keeps_release_recommendations(
     assert stored["recommended_models"]
 
 
-def test_endpointless_runtime_adapter_can_be_connected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("strix.config.providers.adapter_models", lambda _provider: [])
-    monkeypatch.setattr(
-        "strix.config.providers.model_metadata",
-        lambda _model: {
-            "context_window_tokens": 32_768,
-            "max_output_tokens": 8_192,
-            "source": "conservative-default",
-            "confidence": "unknown",
-        },
-    )
-
-    connect_provider(
-        {
-            "provider_id": "bedrock",
-            "model_id": "vendor.opaque-model:v1",
-            "name": "aws-runtime",
-            "persist": False,
-        }
-    )
-    route = session_routes()["aws-runtime"]
-
-    assert route.base_url is None
-    assert route.provider_id == "bedrock"
-    assert route.model_id == "vendor.opaque-model:v1"
-    assert route.model == "bedrock/vendor.opaque-model:v1"
+def test_provider_without_a_complete_adapter_is_not_exposed() -> None:
+    provider_ids = {item.id for item in get_provider_registry().definitions()}
+    assert "bedrock" not in provider_ids
+    assert "custom" in provider_ids
 
 
 def test_web_profile_is_read_only_and_drops_capabilities() -> None:

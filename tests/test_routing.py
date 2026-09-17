@@ -18,6 +18,7 @@ from strix.routing import (
     AllRoutesUnavailableError,
     RouteContextOverflowError,
     RoutePool,
+    RoutingRequest,
     classify_route_failure,
 )
 
@@ -119,7 +120,7 @@ def _pool(
         (ConnectionError("offline"), "transient"),
         (ProviderError("server", status_code=501), "transient"),
         (ProviderError("unauthorized", status_code=401), "authentication"),
-        (ProviderError("payment", status_code=402), "authentication"),
+        (ProviderError("payment", status_code=402), "billing"),
         (ProviderError("maximum context length exceeded", status_code=400), "context"),
         (ProviderError("unsupported tool schema", status_code=400), "incompatible"),
         (
@@ -135,19 +136,24 @@ def test_classify_route_failures(error: BaseException, expected: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_priority_then_least_loaded_selection() -> None:
+async def test_stable_id_breaks_equal_policy_scores_until_capacity_is_full() -> None:
     routes = [
-        RouteConfig(name="a", model="model-a", priority=1, max_concurrency=2),
-        RouteConfig(name="b", model="model-b", priority=1, max_concurrency=2),
-        RouteConfig(name="fallback", model="model-c", priority=2),
+        RouteConfig(
+            name="a", model="model-a", priority=1, max_concurrency=2, context_window_tokens=64_000
+        ),
+        RouteConfig(
+            name="b", model="model-b", priority=1, max_concurrency=2, context_window_tokens=64_000
+        ),
+        RouteConfig(name="fallback", model="model-c", priority=2, context_window_tokens=64_000),
     ]
     pool = _pool(routes, {route.name: FakeModel() for route in routes})
 
-    first = await pool._acquire(input_tokens=1, output_tokens=1)
-    second = await pool._acquire(input_tokens=1, output_tokens=1)
-    third = await pool._acquire(input_tokens=1, output_tokens=1)
+    request = RoutingRequest(estimated_input_tokens=1, estimated_output_tokens=1)
+    first = await pool._acquire(request=request)
+    second = await pool._acquire(request=request)
+    third = await pool._acquire(request=request)
 
-    assert [first.config.name, second.config.name, third.config.name] == ["a", "b", "a"]
+    assert [first.config.name, second.config.name, third.config.name] == ["a", "a", "b"]
     await pool._release(first)
     await pool._release(second)
     await pool._release(third)
@@ -161,8 +167,8 @@ async def test_transient_failure_honors_cooldown_and_fails_over(
     primary = FakeModel([ProviderError("busy", status_code=429, retry_after="2")])
     backup = FakeModel([_response()])
     routes = [
-        RouteConfig(name="primary", model="model-a", priority=1),
-        RouteConfig(name="backup", model="model-b", priority=2),
+        RouteConfig(name="primary", model="model-a", quality_tier="frontier"),
+        RouteConfig(name="backup", model="model-b", quality_tier="strong"),
     ]
     pool = _pool(routes, {"primary": primary, "backup": backup})
 
@@ -174,7 +180,7 @@ async def test_transient_failure_honors_cooldown_and_fails_over(
 
 
 @pytest.mark.asyncio
-async def test_headless_route_wait_uses_one_bounded_outage_window(
+async def test_logical_turn_does_not_retry_the_same_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(routing, "full_jitter_delay", lambda *_args, **_kwargs: 0.02)
@@ -182,14 +188,14 @@ async def test_headless_route_wait_uses_one_bounded_outage_window(
     route = RouteConfig(name="only", model="model-a")
     pool = _pool([route], {"only": model}, wait_timeout=0.3)
 
-    response = await pool.get_response(input="hello")
+    with pytest.raises(AllRoutesUnavailableError, match="after 1 attempts"):
+        await pool.get_response(input="hello")
 
-    assert response._strix_route_name == "only"
-    assert model.calls == 2
+    assert model.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_headless_outage_exits_after_configured_deadline(
+async def test_outage_exits_after_the_route_attempt_is_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(routing, "full_jitter_delay", lambda *_args, **_kwargs: 0.01)
@@ -199,7 +205,7 @@ async def test_headless_outage_exits_after_configured_deadline(
         {"only": model},
         wait_timeout=0.06,
     )
-    with pytest.raises(AllRoutesUnavailableError, match="0s"):
+    with pytest.raises(AllRoutesUnavailableError, match="after 1 attempts"):
         await asyncio.wait_for(pool.get_response(input="hello"), timeout=2.0)
 
     assert model.calls >= 1
@@ -222,8 +228,8 @@ async def test_authentication_failure_blocks_only_affected_route() -> None:
     primary = FakeModel([ProviderError("bad key", status_code=401)])
     backup = FakeModel([_response()])
     routes = [
-        RouteConfig(name="primary", model="model-a", priority=1),
-        RouteConfig(name="backup", model="model-b", priority=2),
+        RouteConfig(name="primary", model="model-a", quality_tier="frontier"),
+        RouteConfig(name="backup", model="model-b", quality_tier="strong"),
     ]
     pool = _pool(routes, {"primary": primary, "backup": backup})
 
@@ -312,8 +318,8 @@ async def test_policy_refusal_is_not_sent_to_another_route() -> None:
     primary = FakeModel([ProviderError("content policy refusal", status_code=400)])
     backup = FakeModel([_response()])
     routes = [
-        RouteConfig(name="primary", model="model-a", priority=1),
-        RouteConfig(name="backup", model="model-b", priority=2),
+        RouteConfig(name="primary", model="model-a", quality_tier="frontier"),
+        RouteConfig(name="backup", model="model-b", quality_tier="strong"),
     ]
     pool = _pool(routes, {"primary": primary, "backup": backup})
 
@@ -329,8 +335,8 @@ async def test_partially_streamed_turn_is_never_replayed_to_fallback() -> None:
     primary = FakeModel([[event, ProviderError("stream reset", status_code=503)]])
     backup = FakeModel([[event]])
     routes = [
-        RouteConfig(name="primary", model="model-a", priority=1),
-        RouteConfig(name="backup", model="model-b", priority=2),
+        RouteConfig(name="primary", model="model-a", quality_tier="frontier"),
+        RouteConfig(name="backup", model="model-b", quality_tier="strong"),
     ]
     pool = _pool(routes, {"primary": primary, "backup": backup})
 
@@ -356,8 +362,8 @@ async def test_idle_stream_is_recovered_before_any_side_effect_is_emitted() -> N
     primary = IdleModel()
     backup = FakeModel([[event]])
     routes = [
-        RouteConfig(name="primary", model="model-a", priority=1),
-        RouteConfig(name="backup", model="model-b", priority=2),
+        RouteConfig(name="primary", model="model-a", quality_tier="frontier"),
+        RouteConfig(name="backup", model="model-b", quality_tier="strong"),
     ]
     pool = _pool(
         routes,

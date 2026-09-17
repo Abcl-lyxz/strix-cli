@@ -199,12 +199,8 @@ func (m Model) modalView() string {
 	switch m.modal {
 	case modalHelp:
 		return m.commandHelpView()
-	case modalConfig:
-		return m.configurationView()
 	case modalWorkspaceSearch:
 		return m.workspaceSearchView()
-	case modalAPIKey:
-		return m.apiKeyCredentialView()
 	case modalQuit:
 		// #quit_dialog: width 24, border round #333333, title #d4d4d4.
 		return m.confirmView("Quit Strix?", 24, dark, textColor)

@@ -26,7 +26,7 @@ def _module_assignments(path: Path) -> set[str]:
     for node in tree.body:
         target = node.target if isinstance(node, ast.AnnAssign) else None
         targets = node.targets if isinstance(node, ast.Assign) else []
-        for candidate in ([target] if target is not None else targets):
+        for candidate in [target] if target is not None else targets:
             if isinstance(candidate, ast.Name):
                 names.add(candidate.id)
     return names

@@ -37,7 +37,6 @@ from openai.types.responses.response_usage import ResponseUsage
 from openai.types.shared import Reasoning
 
 from strix.config import codex
-from strix.config.loader import load_settings
 from strix.config.provider_catalog import recommended_models
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
 from strix.config.tool_call_limits import TurnToolCallLimiter
@@ -531,9 +530,11 @@ class StrixProvider(MultiProvider):
         return self._get_fallback_provider("litellm"), original_model_name
 
     def get_model(self, model_name: str | None) -> Model:
-        llm = load_settings().llm
+        from strix.config.app_config import get_config_service
+
+        ui = get_config_service().load().ui
         slug = codex.subscription_model(model_name)
-        idle_timeout = float(llm.stream_idle_timeout)
+        idle_timeout = float(ui.stream_idle_timeout_seconds)
         if slug:
             # The ChatGPT subscription backend is always streamed; it has no
             # non-streaming mode to fall back to, so LLM_DISABLE_STREAMING
@@ -541,11 +542,11 @@ class StrixProvider(MultiProvider):
             model: Model = _CodexResponsesModel(
                 slug,
                 codex.get_subscription_client(),
-                reasoning_effort=llm.reasoning_effort,
+                reasoning_effort=ui.reasoning_effort,
             )
         else:
             model = super().get_model(model_name)
-            if llm.disable_streaming:
+            if not ui.streaming_enabled:
                 model = _NonStreamingModel(model)
                 # The wrapper emits its single event only once the whole request
                 # is done, so an idle gap is meaningless here; the request
@@ -553,7 +554,7 @@ class StrixProvider(MultiProvider):
                 idle_timeout = 0.0
         return _TurnGuardModel(
             model,
-            max_tool_calls_per_turn=llm.max_tool_calls_per_turn,
+            max_tool_calls_per_turn=ui.max_tool_calls_per_turn,
             stream_idle_timeout=idle_timeout,
         )
 

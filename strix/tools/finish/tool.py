@@ -84,9 +84,7 @@ def _do_finish(
         return result
 
 
-def _coverage_summary(
-    agent_graph: dict[str, Any], entries: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _coverage_summary(agent_graph: dict[str, Any], entries: list[dict[str, Any]]) -> dict[str, Any]:
     """Coverage counts, unresolved surfaces, and gaps the runtime can see.
 
     The gap list is derived from the agent graph rather than from the ledger,

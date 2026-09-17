@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -22,53 +21,36 @@ type slashCommand struct {
 // The launch palette shows a short prefix of this list; F1 shows the complete
 // reference. Commands that mutate setup are rejected after the scan starts.
 var slashCommands = []slashCommand{
-	{"connect", "", "connect a provider and discover models"},
-	{"models", "", "choose a model connection"},
-	{"routing", "", "advanced route priorities and request limits"},
-	{"mcp", "", "configure MCP connections for the next scan"},
-	{"notify-settings", "", "set notification severity and alert preferences"},
-	{"settings", "", "edit all settings in forms"},
+	{"connect", "", "connect or disconnect a provider"},
+	{"models", "", "discover and enable provider models"},
+	{"router", "", "inspect automatic routing decisions and health"},
+	{"settings", "", "edit typed application and scan settings"},
+	{"targets", "[add|remove|clear]", "manage scan targets"},
 	{"attach", "[path]", "attach a local file or folder"},
+	{"mcp", "", "configure MCP connections for the next scan"},
 	{"sessions", "", "browse and resume local runs"},
-	{"retry", "", "retry the interrupted turn using saved results"},
-	{"new", "", "start a new session"},
-	{"editor", "", "compose in your external editor"},
-
-	{"help", "", "show every command and shortcut"},
-	{"config", "[clear]", "show configuration or clear model credentials"},
-	{"model", "<provider/model>", "set the model route"},
-	{"apikey", "[key|clear]", "open secure input, save, or remove the API key"},
-	{"baseurl", "<url|clear>", "set a custom OpenAI-compatible API URL"},
-	{"routes", "[select <name>]", "list model routes or select one to edit"},
 	{"notifications", "[unread|read <id>|dismiss <id>|clear]", "open the notification inbox"},
-	{"storage", "", "show exact run and global storage paths"},
-	{"reasoning", "<level>", "none|minimal|low|medium|high|xhigh|max"},
-	{"target", "<url|repo|path>", "add a scan target"},
-	{"untarget", "<target|all>", "remove one or all targets"},
-	{"targets", "", "show queued targets"},
-	{"find", "<text>", "search local workspace without an AI turn"},
-	{"instruction", "<text|clear>", "set the scan instruction"},
-	{"mode", "<quick|standard|deep>", "set scan depth"},
-	{"budget", "<usd|off>", "set or remove the cost limit"},
-	{"turns", "<n>", "set maximum turns per agent"},
-	{"agents", "[n]", "set the setup limit or focus live agents"},
-	{"scope", "<auto|diff|full>", "set repository scope"},
-	{"diff-base", "<ref|clear>", "set the base ref for diff scope"},
-	{"streaming", "<on|off>", "toggle streamed model responses"},
-	{"cache", "<on|off>", "toggle model prompt caching"},
-	{"timeout", "<seconds>", "set the model request timeout"},
-	{"toolcalls", "<n>", "set maximum tool calls per turn"},
-	{"images", "<n>", "set images retained in agent context"},
+	{"update", "", "check and install a verified update"},
+	{"doctor", "", "run installation and provider diagnostics"},
 	{"start", "", "launch with the current setup"},
-	{"status", "", "show model and run status"},
-	{"viewer", "", "open the live report viewer"},
-	{"agent", "<id|name>", "select a live agent"},
+	{"status", "", "show model, router, and run status"},
+	{"agents", "[stop <id>]", "focus or stop live agents"},
 	{"findings", "", "focus the findings panel"},
 	{"trace", "", "focus the agent trace"},
-	{"follow", "<on|off>", "toggle automatic trace scrolling"},
-	{"stop", "", "stop the selected agent"},
-	{"clear", "", "clear local notices"},
+	{"viewer", "", "open the read-only live report viewer"},
+	{"find", "<text>", "search local workspace without an AI turn"},
+	{"editor", "", "compose in your external editor"},
+	{"new", "", "start a new session"},
+	{"help", "", "show every command and shortcut"},
 	{"quit", "", "quit Strix"},
+}
+
+var removedSlashCommands = map[string]bool{
+	"model": true, "apikey": true, "baseurl": true, "routes": true, "routing": true,
+	"config": true, "retry": true, "target": true, "untarget": true, "mode": true,
+	"budget": true, "turns": true, "scope": true, "diff-base": true, "streaming": true,
+	"cache": true, "timeout": true, "toolcalls": true, "images": true, "agent": true,
+	"stop": true, "follow": true, "clear": true, "notify-settings": true,
 }
 
 func slashParts(value string) (name, argument string, ok bool) {
@@ -90,6 +72,9 @@ func slashParts(value string) (name, argument string, ok bool) {
 		if command.name == name {
 			return name, argument, true
 		}
+	}
+	if removedSlashCommands[name] {
+		return "_removed", name, true
 	}
 	for _, command := range slashCommands {
 		if strings.HasPrefix(command.name, name) {
@@ -163,19 +148,8 @@ func (m *Model) completeSlashCommand() bool {
 	return true
 }
 
-// inputView masks credentials while retaining the real value only in the
-// textarea model until submission. No snapshot or command result contains it.
 func (m Model) inputView() string {
-	value := m.input.Value()
-	lower := strings.ToLower(value)
-	const prefix = "/apikey "
-	if !strings.HasPrefix(lower, prefix) || len(value) <= len(prefix) {
-		return m.input.View()
-	}
-	masked := m.input
-	masked.SetValue(value[:len(prefix)] + strings.Repeat("•", utf8.RuneCountInString(value[len(prefix):])))
-	masked.CursorEnd()
-	return masked.View()
+	return m.input.View()
 }
 
 func (m *Model) slashError(message string) tea.Cmd {
@@ -221,162 +195,78 @@ func parseToggle(argument string) (bool, bool) {
 	}
 }
 
-func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //nolint:gocyclo
+func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) {
 	name, argument, known := slashParts(value)
 	if !known {
 		return m, nil, false
 	}
-
-	if strings.TrimSpace(argument) == "" {
-		switch name {
-		case "connect", "models", "model":
-			cmd := m.openWorkspace("providers", "Providers", "providers.list")
-			return m, cmd, true
-		case "routing":
-			cmd := m.openWorkspace("routing", "Advanced routing", "providers.list")
-			return m, cmd, true
-		case "config", "settings", "reasoning", "streaming", "timeout", "cache", "toolcalls", "images":
-			cmd := m.openWorkspace("settings", "Settings", "settings.list")
-			return m, cmd, true
-		case "baseurl":
-			m.openForm("Provider endpoint", "config.update", map[string]any{}, inputField("api_base", "Base URL", "text", m.snapshot.APIBase))
-			return m, nil, true
-		case "retry":
-			return m, send(m.client, "scan.retry", map[string]any{}), true
-		case "sessions":
-			cmd := m.openWorkspace("sessions", "Local sessions", "sessions.list")
-			return m, cmd, true
-		case "notifications":
-			cmd := m.openWorkspace("notifications", "Notifications", "notifications.manage")
-			return m, cmd, true
-		case "new":
-			return m, send(m.client, "scan.new", map[string]any{}), true
-		case "editor":
-			return m, m.externalEditor(), true
-		case "mcp":
-			m.openForm("MCP connection · next scan", "mcp.update", map[string]any{}, inputField("name", "Name", "text", ""), inputField("transport", "Transport: http or stdio", "text", "http"), inputField("url", "HTTP endpoint", "text", ""), inputField("command", "Executable (stdio)", "text", ""), inputField("args", "Arguments (JSON array)", "text", "[]"), inputField("token", "Bearer token (optional)", "secret", ""), inputField("persist", "Save as default: true or false", "boolean", false))
-			return m, nil, true
-		case "notify-settings":
-			m.openForm("Notification preferences", "notifications.preferences", map[string]any{}, inputField("category", "Category: runtime, security, model, scan, storage", "text", "runtime"), inputField("minimum_severity", "Minimum: info, warning, error, critical", "text", "warning"), inputField("immediate", "Show alerts: true or false", "boolean", true))
-			return m, nil, true
-		case "attach":
-			m.openForm("Attach a file or folder", "attachments.add", map[string]any{}, inputField("path", "Local path", "text", ""), inputField("role", "Role: context or target", "text", "context"))
-			return m, nil, true
-		case "target":
-			m.openForm("Add a target", "setup.add_target", map[string]any{}, inputField("target", "URL, repository, or local path", "text", ""))
-			return m, nil, true
-		case "mode", "budget", "turns", "agents", "scope", "diff-base":
-			field := map[string]string{"mode": "scan_mode", "budget": "max_budget_usd", "turns": "max_turns", "agents": "max_agents", "scope": "scope_mode", "diff-base": "diff_base"}[name]
-			kind := "text"
-			if name == "budget" || name == "turns" || name == "agents" {
-				kind = "number"
-			}
-			m.openForm("Scan "+name, "setup.configure", map[string]any{}, inputField(field, name, kind, ""))
-			return m, nil, true
-		}
+	if name == "_removed" {
+		return m, m.slashError("/" + argument + " was removed in Strix v2; use /help for the canonical workflow"), true
 	}
-	if name == "attach" {
-		return m, send(m.client, "attachments.add", map[string]any{"path": argument, "role": "context"}), true
-	}
-	switch name {
-	case "_partial":
+	if name == "_partial" {
 		m.input.SetValue("/" + argument)
 		m.input.CursorEnd()
 		return m, m.slashError("Incomplete command; press Tab to complete it"), true
-	case "help":
-		m.openModal(modalHelp)
-		return m, nil, true
-	case "config":
-		if strings.EqualFold(argument, "clear") {
-			if cmd := m.requireSetup(name); cmd != nil {
-				return m, cmd, true
+	}
+	return m.submitCanonicalCommand(name, argument)
+}
+
+func (m Model) submitCanonicalCommand(name, argument string) (tea.Model, tea.Cmd, bool) { //nolint:gocyclo
+	argument = strings.TrimSpace(argument)
+	switch name {
+	case "connect":
+		return m, m.openWorkspace("providers", "Provider connections", "providers.list"), true
+	case "models":
+		return m, m.openWorkspace("model_connections", "Choose a connection", "providers.list"), true
+	case "router":
+		return m, m.openWorkspace("router", "Automatic router", "router.status"), true
+	case "settings":
+		return m, m.openWorkspace("settings", "Settings", "settings.list"), true
+	case "targets":
+		if argument == "" {
+			if len(m.snapshot.Targets) == 0 {
+				return m, m.slashInfo("No targets queued"), true
 			}
-			return m, send(m.client, "config.update", map[string]any{"model": nil, "api_key": nil, "api_base": nil}), true
+			return m, m.slashInfo(fmt.Sprintf("%d target(s): %s", m.snapshot.TargetCount, strings.Join(m.snapshot.Targets, ", "))), true
 		}
-		if argument != "" {
-			return m, m.slashError("Usage: /config [clear]"), true
+		parts := strings.SplitN(argument, " ", 2)
+		action := strings.ToLower(parts[0])
+		if action == "clear" && len(parts) == 1 {
+			return m, send(m.client, "setup.clear_targets", map[string]any{}), true
 		}
-		m.openModal(modalConfig)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return m, m.slashError("Usage: /targets add <target> | remove <target> | clear"), true
+		}
+		if action == "add" {
+			return m, send(m.client, "setup.add_target", map[string]any{"target": strings.TrimSpace(parts[1])}), true
+		}
+		if action == "remove" {
+			return m, send(m.client, "setup.remove_target", map[string]any{"target": strings.TrimSpace(parts[1])}), true
+		}
+		return m, m.slashError("Usage: /targets add <target> | remove <target> | clear"), true
+	case "attach":
+		if argument == "" {
+			m.openForm("Attach a file or folder", "attachments.add", map[string]any{}, inputField("path", "Local path", "text", ""), inputField("role", "Role: context or target", "text", "context"))
+			return m, nil, true
+		}
+		return m, send(m.client, "attachments.add", map[string]any{"path": argument, "role": "context"}), true
+	case "mcp":
+		m.openForm("MCP connection · next scan", "mcp.update", map[string]any{}, inputField("name", "Name", "text", ""), inputField("transport", "Transport: http or stdio", "text", "http"), inputField("url", "HTTP endpoint", "text", ""), inputField("command", "Executable (stdio)", "text", ""), inputField("args", "Arguments (JSON array)", "text", "[]"), inputField("token", "Bearer token (optional)", "secret", ""))
 		return m, nil, true
-	case "model", "apikey", "baseurl", "reasoning", "streaming", "cache", "timeout", "toolcalls", "images":
-		return m.submitConfigCommand(name, argument)
-	case "routes":
-		parts := strings.Fields(argument)
-		if len(parts) == 0 {
-			return m, send(m.client, "routes.manage", map[string]any{"operation": "list"}), true
-		}
-		if len(parts) == 2 && strings.EqualFold(parts[0], "select") {
-			return m, send(m.client, "routes.manage", map[string]any{"operation": "select", "name": parts[1]}), true
-		}
-		return m, m.slashError("Usage: /routes [select <name>]"), true
+	case "sessions":
+		return m, m.openWorkspace("sessions", "Local sessions", "sessions.list"), true
 	case "notifications":
 		payload, err := notificationCommandPayload(argument)
 		if err != "" {
 			return m, m.slashError(err), true
 		}
+		m.modal = modalWorkspace
+		m.dialog = workspaceDialog{Kind: "notifications", Title: "Notifications", Command: "notifications.manage", Payload: payload}
 		return m, send(m.client, "notifications.manage", payload), true
-	case "storage":
-		if strings.TrimSpace(argument) != "" {
-			return m, m.slashError("Usage: /storage"), true
-		}
-		return m, send(m.client, "storage.show", map[string]any{}), true
-	case "target":
-		if cmd := m.requireSetup(name); cmd != nil {
-			return m, cmd, true
-		}
-		argument, cmd, ok := requiredArgument(&m, name, argument, "<url|repo|path>")
-		if !ok {
-			return m, cmd, true
-		}
-		return m, send(m.client, "setup.add_target", map[string]any{"target": argument}), true
-	case "untarget":
-		if cmd := m.requireSetup(name); cmd != nil {
-			return m, cmd, true
-		}
-		argument, cmd, ok := requiredArgument(&m, name, argument, "<target|all>")
-		if !ok {
-			return m, cmd, true
-		}
-		if strings.EqualFold(argument, "all") {
-			return m, send(m.client, "setup.clear_targets", map[string]any{}), true
-		}
-		return m, send(m.client, "setup.remove_target", map[string]any{"target": argument}), true
-	case "targets":
-		if len(m.snapshot.Targets) == 0 {
-			return m, m.slashInfo("No targets queued; a prompt can use the current directory"), true
-		}
-		return m, m.slashInfo(fmt.Sprintf("%d target(s): %s", m.snapshot.TargetCount, strings.Join(m.snapshot.Targets, ", "))), true
-	case "find":
-		argument, cmd, ok := requiredArgument(&m, name, argument, "<text>")
-		if !ok {
-			return m, cmd, true
-		}
-		return m, send(m.client, "workspace.find", map[string]any{"query": argument}), true
-	case "instruction":
-		if cmd := m.requireSetup(name); cmd != nil {
-			return m, cmd, true
-		}
-		if strings.EqualFold(argument, "clear") {
-			argument = ""
-		} else if argument == "" {
-			return m, m.slashError("Usage: /instruction <text|clear>"), true
-		}
-		return m, send(m.client, "setup.set_instruction", map[string]any{"instruction": argument}), true
-	case "mode", "budget", "turns", "scope", "diff-base":
-		if cmd := m.requireSetup(name); cmd != nil {
-			return m, cmd, true
-		}
-		return m.submitSetupCommand(name, argument)
-	case "agents":
-		if m.snapshot.SetupMode {
-			if argument == "" {
-				return m, m.slashInfo(fmt.Sprintf("Maximum active agents: %d", m.snapshot.MaxAgents)), true
-			}
-			return m.submitSetupCommand(name, argument)
-		}
-		m.focus = focusAgents
-		m.input.Blur()
-		return m, nil, true
+	case "update":
+		return m, send(m.client, "update.start", map[string]any{}), true
+	case "doctor":
+		return m, send(m.client, "doctor.run", map[string]any{}), true
 	case "start":
 		if cmd := m.requireSetup(name); cmd != nil {
 			return m, cmd, true
@@ -388,32 +278,15 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 		}
 		return m, send(m.client, "setup.start", payload), true
 	case "status":
-		key := "missing"
-		if m.snapshot.APIKeyConfigured {
-			key = "configured"
+		return m, send(m.client, "router.status", map[string]any{}), true
+	case "agents":
+		if strings.HasPrefix(strings.ToLower(argument), "stop ") {
+			id := strings.TrimSpace(argument[len("stop "):])
+			return m, send(m.client, "agent.stop", map[string]any{"agent_id": id}), true
 		}
-		return m, m.slashInfo(fmt.Sprintf("%s · model %s · API key %s · %d agent(s)", m.snapshot.ScanState, emptyAs(m.snapshot.Model, "not set"), key, len(m.snapshot.Agents))), true
-	case "viewer":
-		return m, send(m.client, "viewer.open", map[string]any{}), true
-	case "agent":
-		if m.snapshot.SetupMode {
-			return m, m.slashError("/agent is available during a scan"), true
-		}
-		argument, cmd, ok := requiredArgument(&m, name, argument, "<id|name>")
-		if !ok {
-			return m, cmd, true
-		}
-		needle := strings.ToLower(argument)
-		for index, agent := range m.snapshot.Agents {
-			if strings.EqualFold(agent.ID, argument) || strings.EqualFold(agent.Name, argument) || strings.Contains(strings.ToLower(agent.Name), needle) {
-				m.selectedAgent = index
-				m.focus = focusAgents
-				m.ensureAgentVisible()
-				m.refreshViewport()
-				return m, nil, true
-			}
-		}
-		return m, m.slashError("No matching agent: " + argument), true
+		m.focus = focusAgents
+		m.input.Blur()
+		return m, nil, true
 	case "findings":
 		if len(m.snapshot.Vulnerabilities) == 0 {
 			return m, m.slashError("No findings yet"), true
@@ -425,28 +298,20 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 		m.focus = focusChat
 		m.input.Blur()
 		return m, nil, true
-	case "follow":
-		enabled, ok := parseToggle(argument)
+	case "viewer":
+		return m, send(m.client, "viewer.open", map[string]any{}), true
+	case "find":
+		query, cmd, ok := requiredArgument(&m, name, argument, "<text>")
 		if !ok {
-			return m, m.slashError("Usage: /follow <on|off>"), true
+			return m, cmd, true
 		}
-		m.followOutput = enabled
-		if enabled {
-			m.viewport.GotoBottom()
-		}
-		return m, m.slashInfo("Trace follow " + map[bool]string{true: "enabled", false: "disabled"}[enabled]), true
-	case "stop":
-		if m.snapshot.SetupMode || !m.selectedAgentCanStop() {
-			return m, m.slashError("No stoppable agent is selected"), true
-		}
-		m.modalChoice = 1
-		m.openModal(modalStop)
-		return m, nil, true
-	case "clear":
-		m.setupLog = nil
-		m.errorText = ""
-		m.toast = ""
-		m.resizeViewport()
+		return m, send(m.client, "workspace.find", map[string]any{"query": query}), true
+	case "editor":
+		return m, m.externalEditor(), true
+	case "new":
+		return m, send(m.client, "scan.new", map[string]any{}), true
+	case "help":
+		m.openModal(modalHelp)
 		return m, nil, true
 	case "quit":
 		if m.snapshot.SetupMode {
@@ -457,167 +322,29 @@ func (m Model) submitSlashCommand(value string) (tea.Model, tea.Cmd, bool) { //n
 		m.openModal(modalQuit)
 		return m, nil, true
 	}
-	return m, nil, false
-}
-
-func (m Model) submitConfigCommand(name, argument string) (tea.Model, tea.Cmd, bool) {
-	payload := map[string]any{}
-	switch name {
-	case "model":
-		value, _, ok := requiredArgument(&m, name, argument, "<provider/model>")
-		if !ok {
-			m.openModal(modalConfig)
-			return m, nil, true
-		}
-		payload["model"] = value
-	case "apikey":
-		if strings.TrimSpace(argument) == "" {
-			m.openModal(modalAPIKey)
-			return m, nil, true
-		}
-		value, cmd, ok := requiredArgument(&m, name, argument, "<key|clear>")
-		if !ok {
-			return m, cmd, true
-		}
-		if strings.EqualFold(value, "clear") {
-			payload["api_key"] = nil
-		} else {
-			payload["api_key"] = value
-		}
-	case "baseurl":
-		value, cmd, ok := requiredArgument(&m, name, argument, "<url|clear>")
-		if !ok {
-			return m, cmd, true
-		}
-		if strings.EqualFold(value, "clear") {
-			payload["api_base"] = nil
-		} else {
-			payload["api_base"] = value
-		}
-	case "reasoning":
-		value, cmd, ok := requiredArgument(&m, name, argument, "<level>")
-		if !ok {
-			return m, cmd, true
-		}
-		payload["reasoning_effort"] = strings.ToLower(value)
-	case "streaming", "cache":
-		enabled, ok := parseToggle(argument)
-		if !ok {
-			return m, m.slashError("Usage: /" + name + " <on|off>"), true
-		}
-		field := map[string]string{"streaming": "streaming_enabled", "cache": "prompt_cache"}[name]
-		payload[field] = enabled
-	case "timeout", "toolcalls", "images":
-		value, err := strconv.Atoi(strings.TrimSpace(argument))
-		if err != nil || value < 0 || (name == "timeout" && value == 0) {
-			return m, m.slashError("Usage: /" + name + " <non-negative integer>"), true
-		}
-		field := map[string]string{"timeout": "llm_timeout", "toolcalls": "max_tool_calls_per_turn", "images": "max_context_images"}[name]
-		payload[field] = value
-	}
-	return m, send(m.client, "config.update", payload), true
-}
-
-func (m Model) submitSetupCommand(name, argument string) (tea.Model, tea.Cmd, bool) {
-	payload := map[string]any{}
-	switch name {
-	case "mode":
-		payload["scan_mode"] = strings.ToLower(strings.TrimSpace(argument))
-	case "budget":
-		if strings.EqualFold(strings.TrimSpace(argument), "off") {
-			payload["max_budget_usd"] = nil
-		} else {
-			value, err := strconv.ParseFloat(strings.TrimSpace(argument), 64)
-			if err != nil || value <= 0 {
-				return m, m.slashError("Usage: /budget <positive-usd|off>"), true
-			}
-			payload["max_budget_usd"] = value
-		}
-	case "turns", "agents":
-		value, err := strconv.Atoi(strings.TrimSpace(argument))
-		if err != nil || value <= 0 || (name == "agents" && value < 2) {
-			return m, m.slashError("Usage: /" + name + " <positive integer>"), true
-		}
-		field := map[string]string{"turns": "max_turns", "agents": "max_agents"}[name]
-		payload[field] = value
-	case "scope":
-		payload["scope_mode"] = strings.ToLower(strings.TrimSpace(argument))
-	case "diff-base":
-		if strings.EqualFold(strings.TrimSpace(argument), "clear") {
-			payload["diff_base"] = nil
-		} else if strings.TrimSpace(argument) == "" {
-			return m, m.slashError("Usage: /diff-base <ref|clear>"), true
-		} else {
-			payload["diff_base"] = strings.TrimSpace(argument)
-		}
-	}
-	return m, send(m.client, "setup.configure", payload), true
-}
-
-func emptyAs(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
+	return m, m.slashError("Unknown command: /" + name), true
 }
 
 func (m Model) commandHelpView() string {
 	width := min(76, max(44, m.width-4))
 	inner := width - 4
 	title := lipgloss.NewStyle().Bold(true).Foreground(green).Width(inner).Align(lipgloss.Center).Render("Strix Help · command palette")
-	section := func(label, commands string) string {
-		return render.Bold(green).Render(label) + "\n" + render.Col(textColor).Render(commands)
+	rows := make([]string, 0, len(slashCommands))
+	for _, command := range slashCommands {
+		usage := "/" + command.name
+		if command.args != "" {
+			usage += " " + command.args
+		}
+		gap := max(2, 31-lipgloss.Width(usage))
+		rows = append(rows, render.Col(white).Render(usage)+strings.Repeat(" ", gap)+render.Dim().Render(command.description))
 	}
-	body := strings.Join([]string{
-		section("Configure", "/config  /model  /apikey  /baseurl  /routes  /reasoning\n/streaming  /cache  /timeout  /toolcalls  /images"),
-		section("Prepare", "/target  /untarget  /targets  /find  /instruction  /mode\n/budget  /turns  /agents  /scope  /diff-base  /start"),
-		section("Control", "/status  /viewer  /notifications  /storage  /agent  /agents\n/findings  /trace  /follow  /stop  /clear  /quit"),
-		section("Keys", "F1 help · Tab complete/switch · Ctrl+J newline · Ctrl+O viewer\nEsc stop agent · Ctrl+Q quit · arrows navigate"),
-	}, "\n\n")
+	body := render.Bold(green).Render("Commands") + "\n" + strings.Join(rows, "\n") +
+		"\n\n" + render.Bold(green).Render("Keys") + "\n" +
+		render.Col(textColor).Render("F1 help · Tab complete/switch · Ctrl+J newline · Ctrl+O viewer\nEsc stop agent · Ctrl+Q quit · arrows navigate")
 	footer := render.Dim().Render("Type / to search commands · press any key to close")
 	content := title + "\n\n" + lipgloss.NewStyle().Width(inner).Render(body) + "\n\n" + footer
 	return lipgloss.NewStyle().Width(width - 2).Border(lipgloss.RoundedBorder()).
 		BorderForeground(green).Background(black).Padding(1).Render(content)
-}
-
-func (m Model) configurationView() string {
-	width := min(72, max(46, m.width-4))
-	inner := width - 4
-	keyState := render.Col(amber).Render("not set")
-	if m.snapshot.APIKeyConfigured {
-		keyState = render.Col(green).Render("configured (hidden)")
-	}
-	baseURL := emptyAs(m.snapshot.APIBase, "provider default")
-	status := []string{
-		fmt.Sprintf("%-13s %s", "Model", emptyAs(m.snapshot.Model, "not set")),
-		fmt.Sprintf("%-13s %s", "API key", keyState),
-		fmt.Sprintf("%-13s %s", "Base URL", baseURL),
-		fmt.Sprintf("%-13s %s", "Reasoning", m.snapshot.ReasoningEffort),
-		fmt.Sprintf("%-13s %s", "Streaming", onOff(m.snapshot.StreamingEnabled)),
-		fmt.Sprintf("%-13s %s", "Prompt cache", onOff(m.snapshot.PromptCache)),
-		fmt.Sprintf("%-13s %ds · %d tool calls · %d images", "Limits", m.snapshot.LLMTimeout, m.snapshot.MaxToolCallsPerTurn, m.snapshot.MaxContextImages),
-	}
-	for index, line := range status {
-		status[index] = truncate(line, inner)
-	}
-	commands := render.Bold(green).Render("Change from the composer") + "\n" +
-		render.Col(textColor).Render("/model openrouter/openai/gpt-5.4\n/apikey  (opens secure input)\n/baseurl http://localhost:11434/v1\n/reasoning high\n/streaming on · /cache on\n/timeout 300 · /toolcalls 32 · /images 3")
-	warning := ""
-	if m.snapshot.ConfigEnvOverride {
-		warning = "\n\n" + render.Col(amber).Render("Environment variables currently override one or more saved LLM values.")
-	}
-	title := lipgloss.NewStyle().Bold(true).Foreground(green).Width(inner).Align(lipgloss.Center).Render("Model & runtime configuration")
-	footer := render.Dim().Render("Saved privately in ~/.strix/cli-config.json · any key closes")
-	content := title + "\n\n" + strings.Join(status, "\n") + "\n\n" + commands + warning + "\n\n" + footer
-	return lipgloss.NewStyle().Width(width - 2).Border(lipgloss.RoundedBorder()).
-		BorderForeground(green).Background(black).Padding(1).Render(content)
-}
-
-func onOff(value bool) string {
-	if value {
-		return "on"
-	}
-	return "off"
 }
 
 func notificationCommandPayload(argument string) (map[string]any, string) {
@@ -699,25 +426,6 @@ func (m Model) workspaceSearchView() string {
 	}
 	footer := render.Dim().Render(count + " · any key closes")
 	content := title + "\n\n" + header + "\n\n" + strings.Join(rows, "\n") + "\n\n" + footer
-	return lipgloss.NewStyle().Width(width - 2).Border(lipgloss.RoundedBorder()).
-		BorderForeground(dark).Background(black).Padding(1).Render(content)
-}
-
-func (m Model) apiKeyCredentialView() string {
-	width := min(58, max(30, m.width-4))
-	inner := width - 4
-	title := lipgloss.NewStyle().Bold(true).Foreground(green).Width(inner).
-		Align(lipgloss.Center).Render("Model API key")
-	secret := m.apiKeyInput
-	secret.Width = max(10, inner-2)
-	body := render.Dim().Render("The key is masked and never returned to the UI.") +
-		"\n\n" + secret.View()
-	if m.apiKeyError != "" {
-		body += "\n\n" + render.Col(red).Render(truncate(m.apiKeyError, inner))
-	}
-	footer := render.Dim().Render("enter save · esc cancel · /apikey clear removes it")
-	content := title + "\n\n" + lipgloss.NewStyle().Width(inner).Render(body) +
-		"\n\n" + truncate(footer, inner)
 	return lipgloss.NewStyle().Width(width - 2).Border(lipgloss.RoundedBorder()).
 		BorderForeground(dark).Background(black).Padding(1).Render(content)
 }

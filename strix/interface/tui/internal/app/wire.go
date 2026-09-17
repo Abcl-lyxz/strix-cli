@@ -126,10 +126,6 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			_ = json.Unmarshal(result.Result, &data)
 			m.snapshot.ViewerStatus = data.Status
 			m.snapshot.ViewerURL = data.URL
-		case "config.update":
-			if m.snapshot.SetupMode {
-				m.setupMsg("Configuration saved", render.Col(green))
-			}
 		case "setup.configure":
 			if m.snapshot.SetupMode {
 				m.setupMsg("Scan settings updated", render.Col(green))
@@ -164,35 +160,6 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			m.searchTruncated = data.Truncated
 			m.searchMatches = data.Matches
 			m.openModal(modalWorkspaceSearch)
-		case "routes.manage":
-			var data struct {
-				Selected string `json:"selected"`
-				Routes   []struct {
-					Name    string `json:"name"`
-					Model   string `json:"model"`
-					Enabled bool   `json:"enabled"`
-				} `json:"routes"`
-			}
-			if err := json.Unmarshal(result.Result, &data); err != nil {
-				return m.slashError(err.Error())
-			}
-			m.snapshot.SelectedRoute = data.Selected
-			rows := make([]string, 0, len(data.Routes))
-			for _, route := range data.Routes {
-				marker := " "
-				if route.Name == data.Selected {
-					marker = "*"
-				}
-				state := "disabled"
-				if route.Enabled {
-					state = "enabled"
-				}
-				rows = append(rows, fmt.Sprintf("%s %s · %s · %s", marker, route.Name, route.Model, state))
-			}
-			if len(rows) == 0 {
-				rows = append(rows, "No saved routes; legacy model settings are active")
-			}
-			return m.slashInfo(strings.Join(rows, "\n"))
 		case "notifications.manage":
 			var data struct {
 				Unread        int     `json:"unread"`
@@ -222,17 +189,6 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			}
 			if len(rows) == 0 {
 				rows = append(rows, "No notifications")
-			}
-			return m.slashInfo(strings.Join(rows, "\n"))
-		case "storage.show":
-			var data map[string]string
-			if err := json.Unmarshal(result.Result, &data); err != nil {
-				return m.slashError(err.Error())
-			}
-			keys := []string{"run", "database", "transcript", "graph", "log", "global_config", "global_inbox"}
-			rows := make([]string, 0, len(keys))
-			for _, key := range keys {
-				rows = append(rows, key+": "+data[key])
 			}
 			return m.slashInfo(strings.Join(rows, "\n"))
 		}

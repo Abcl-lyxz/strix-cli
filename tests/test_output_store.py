@@ -72,9 +72,7 @@ async def test_bound_and_store_small_output_not_spilled() -> None:
         return f"{WORKSPACE_SPILL_DIR}/{output_id}.txt"
 
     text = "just a few lines\nsecond line"
-    assert await bound_and_store(
-        text, max_lines=100, max_bytes=10_000, writer=writer
-    ) == text
+    assert await bound_and_store(text, max_lines=100, max_bytes=10_000, writer=writer) == text
     assert written == {}
 
 
@@ -86,9 +84,7 @@ async def test_bound_and_store_spills_full_output_to_workspace() -> None:
         return f"{WORKSPACE_SPILL_DIR}/{output_id}.txt"
 
     text = "\n".join(f"secret-line-{i}" for i in range(1000))
-    bounded = await bound_and_store(
-        text, max_lines=10, max_bytes=1_000_000, writer=writer
-    )
+    bounded = await bound_and_store(text, max_lines=10, max_bytes=1_000_000, writer=writer)
 
     assert WORKSPACE_SPILL_DIR in bounded
     assert "exec_command" in bounded
@@ -107,9 +103,7 @@ async def test_workspace_notice_carries_the_returned_path() -> None:
         return f"{WORKSPACE_SPILL_DIR}/{output_id}.txt"
 
     text = "\n".join(f"line-{i}" for i in range(1000))
-    bounded = await bound_and_store(
-        text, max_lines=10, max_bytes=1_000_000, writer=writer
-    )
+    bounded = await bound_and_store(text, max_lines=10, max_bytes=1_000_000, writer=writer)
 
     match = re.search(rf"{re.escape(WORKSPACE_SPILL_DIR)}/([0-9a-f]{{32}})\.txt", bounded)
     assert match is not None, bounded
@@ -130,9 +124,7 @@ async def test_writer_failure_degrades_to_plain_preview() -> None:
         return None
 
     text = "\n".join(f"line-{i}" for i in range(1000))
-    bounded = await bound_and_store(
-        text, max_lines=10, max_bytes=1_000_000, writer=failing_writer
-    )
+    bounded = await bound_and_store(text, max_lines=10, max_bytes=1_000_000, writer=failing_writer)
 
     assert "truncated" in bounded
     assert WORKSPACE_SPILL_DIR not in bounded
@@ -145,9 +137,7 @@ async def test_workspace_preview_honours_byte_budget() -> None:
         return f"{WORKSPACE_SPILL_DIR}/{output_id}.txt"
 
     text = "\n".join("x" * 500 for _ in range(200))
-    bounded = await bound_and_store(
-        text, max_lines=2_000, max_bytes=2_000, writer=writer
-    )
+    bounded = await bound_and_store(text, max_lines=2_000, max_bytes=2_000, writer=writer)
 
     assert WORKSPACE_SPILL_DIR in bounded
     assert len(bounded.encode("utf-8")) <= 2_000

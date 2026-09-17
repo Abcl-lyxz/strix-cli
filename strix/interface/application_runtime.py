@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from strix.bootstrap import create_scan_context
 from strix.config import load_settings
-from strix.config.routes import load_routes
+from strix.config.runtime_routes import load_app_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS
 from strix.core.agents import AgentCoordinator
 from strix.core.hooks import BudgetExceededError
@@ -50,11 +50,11 @@ from strix.utils.resource_paths import get_strix_resource_path
 
 
 if TYPE_CHECKING:
-    import argparse
     import socket
     import subprocess
 
     from strix.application.context import ScanContext
+    from strix.domain.app_state import LaunchState, RunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class GoTuiPreActivationError(RuntimeError):
 
 
 class WorkspaceRuntime:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: LaunchState) -> None:
         self.args = args
         self.live_view = TuiLiveView()
         self.coordinator = AgentCoordinator(
@@ -86,6 +86,7 @@ class WorkspaceRuntime:
         self.report_state: ReportState | None = None
         self.scan_context: ScanContext | None = None
         self.scan_config: dict[str, Any] = {}
+        self.run_config_snapshot: RunConfig | None = None
         self.scan_task: asyncio.Task[None] | None = None
         self.run_lease: RunLease | None = None
         self.scan_error: BaseException | None = None
@@ -120,8 +121,11 @@ class WorkspaceRuntime:
             if run_is_active(run):
                 raise RuntimeError("This run is already owned by a running process")
             record = json.loads((run / "run.json").read_text(encoding="utf-8"))
+            if record.get("schema_version") != 2:
+                raise RuntimeError("Legacy runs are read-only in Strix v2 and cannot be resumed")
         self.scan_task = None
         self.scan_error = None
+        self.run_config_snapshot = None
         self.model_verified = False
         self.verified_connection = None
         self._preflight_failure = None
@@ -181,31 +185,34 @@ class WorkspaceRuntime:
         self.controller.notify_changed()
 
     def init_run_state(self) -> None:
+        frozen = self.run_config_snapshot or self.args.draft.freeze()
+        if self.args.run_name is None:
+            raise RuntimeError("cannot initialize a run before it has a name")
         lease = RunLease(run_dir_for(self.args.run_name))
         lease.acquire()
         self.run_lease = lease
         self.scan_config = {
+            "schema_version": 2,
             "scan_id": self.args.run_name,
-            "targets": self.args.targets_info,
-            "user_instructions": self.args.instruction or "",
+            "targets": list(frozen.targets_info),
+            "user_instructions": frozen.instruction or "",
             "run_name": self.args.run_name,
             "diff_scope": self.args.diff_scope,
-            "scan_mode": self.args.scan_mode,
+            "scan_mode": frozen.scan_mode,
             "non_interactive": False,
             "local_sources": self.args.local_sources or [],
-            "workspace_files": getattr(self.args, "workspace_files", None) or [],
-            "scope_mode": self.args.scope_mode,
-            "diff_base": self.args.diff_base,
+            "workspace_files": list(frozen.workspace_files),
+            "scope_mode": frozen.scope_mode,
+            "diff_base": frozen.diff_base,
             "resume_instruction": self.args.user_explicit_instruction or "",
-            "max_agents": getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
-            "routes": getattr(self.args, "route", None) or [],
+            "max_agents": frozen.max_agents,
             "workspace_mount": getattr(self.args, "workspace_mount", None) or "",
-            "sandbox_profile": getattr(self.args, "sandbox_profile", "web"),
-            "tool_pack": getattr(self.args, "tool_pack", "auto"),
+            "sandbox_profile": frozen.sandbox_profile,
+            "tool_pack": frozen.tool_pack,
             "scope_cidr": getattr(self.args, "scope_cidr", None),
             "network_interface": getattr(self.args, "network_interface", None),
             "packet_rate_limit": getattr(self.args, "packet_rate_limit", None),
-            "workspace_mode": getattr(self.args, "workspace_mode", "read-only"),
+            "workspace_mode": frozen.workspace_mode,
             "workspace_subdir": getattr(self.args, "workspace_subdir", None) or "",
         }
         self.report_state = ReportState(self.scan_config["run_name"])
@@ -283,9 +290,6 @@ class WorkspaceRuntime:
         set_scan_phase("preflight")
         await preflight_model_connection(
             model,
-            selected_routes=[self.controller.selected_route]
-            if self.controller.selected_route
-            else None,
         )
         self.model_verified = True
         self.verified_connection = self._connection_signature()
@@ -307,30 +311,20 @@ class WorkspaceRuntime:
         )
 
     def _connection_signature(self) -> tuple[str, str, str]:
-        routes = load_routes(
-            load_settings(),
-            selected=[self.controller.selected_route] if self.controller.selected_route else None,
-        )
-        route = min(routes, key=lambda r: (r.priority, r.name))
+        routes = load_app_routes()
+        route = min(routes, key=lambda r: (r.quality_tier, r.name))
         key, headers = resolve_route_secrets(route)
-        llm = load_settings().llm
-        secrets = (
-            key or getattr(llm, "api_key", None),
-            headers or getattr(llm, "extra_headers", None),
-        )
+        secrets = (key, headers)
         digest = hashlib.sha256(
             json.dumps(secrets, sort_keys=True, default=str).encode()
         ).hexdigest()
         return route.model, digest, route.base_url or ""
 
     def _configured_model(self) -> str:
-        routes = load_routes(
-            load_settings(),
-            selected=[self.controller.selected_route] if self.controller.selected_route else None,
-        )
+        routes = load_app_routes()
         if not routes:
-            raise ValueError("No model configured. Use /model in the TUI first.")
-        return min(routes, key=lambda route: (route.priority, route.name)).model
+            raise ValueError("No eligible model configured. Use /connect, then /models.")
+        return min(routes, key=lambda route: (route.quality_tier, route.name)).model
 
     def _start_preparation(self) -> asyncio.Task[None]:
         """Kick off the work that runs behind the freshly painted TUI."""
@@ -373,7 +367,9 @@ class WorkspaceRuntime:
             report_error("scan_preparation_failed", exc)
             raise
 
-        vars(self.args).update(vars(candidate))
+        self.args = candidate
+        self.controller.args = candidate
+        self.run_config_snapshot = candidate.draft.freeze()
         self.init_run_state()
         self.start_scan()
 
@@ -388,9 +384,6 @@ class WorkspaceRuntime:
         try:
             await preflight_model_connection(
                 model,
-                selected_routes=[self.controller.selected_route]
-                if self.controller.selected_route
-                else None,
             )
         except Exception as exc:
             logger.exception("Go TUI scan preparation failed")
@@ -404,6 +397,7 @@ class WorkspaceRuntime:
             report_error("scan_preparation_failed", exc)
             self.controller.fail_preparation(str(exc))
             return
+        self.run_config_snapshot = self.args.draft.freeze()
         self.controller.scan_state = "running"
         self.init_run_state()
         self.start_scan()
@@ -413,6 +407,7 @@ class WorkspaceRuntime:
             self.scan_task = asyncio.create_task(self._run_scan())
 
     async def _run_scan(self) -> None:
+        frozen = self.run_config_snapshot or self.args.draft.freeze()
         image = str(load_settings().runtime.image or "strix-sandbox:latest")
         try:
             await run_strix_scan(
@@ -424,9 +419,9 @@ class WorkspaceRuntime:
                 extra_files=read_workspace_files(getattr(self.args, "workspace_files", None)),
                 coordinator=self.coordinator,
                 interactive=True,
-                max_turns=self.args.max_turns,
-                max_agents=getattr(self.args, "max_agents", DEFAULT_MAX_AGENTS),
-                max_budget_usd=self.args.max_budget_usd,
+                max_turns=frozen.max_turns,
+                max_agents=frozen.max_agents,
+                max_budget_usd=frozen.max_budget_usd,
                 event_sink=self.capture_event,
                 mcp_status_sink=self.capture_mcp_status,
                 scan_context=self.scan_context,
@@ -628,7 +623,7 @@ class WorkspaceRuntime:
 
 
 class GoTuiRuntime(WorkspaceRuntime):
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: LaunchState) -> None:
         super().__init__(args)
         self.server = TuiBackendServer(self.controller)
 
@@ -714,5 +709,5 @@ class GoTuiRuntime(WorkspaceRuntime):
         return self.report_state
 
 
-async def run_go_tui(args: argparse.Namespace) -> ReportState | None:
+async def run_go_tui(args: LaunchState) -> ReportState | None:
     return await GoTuiRuntime(args).run()

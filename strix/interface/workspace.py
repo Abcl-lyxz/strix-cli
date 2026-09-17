@@ -11,19 +11,17 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from strix.config.provider_catalog import provider_descriptors, refresh_provider_catalog
-from strix.config.providers import (
-    connect_provider,
-    discover_models,
-    profile_list,
-    update_route_options,
-)
+from rich.console import Console
+
+from strix.config.app_config import get_config_service
+from strix.config.runtime_routes import load_app_routes
 from strix.config.ui import settings_fields, update_setting
 from strix.core.paths import runs_base_dir
 from strix.interface.attachments import complete_paths, describe_attachment
 from strix.interface.connections import connections, update_connection
 from strix.interface.scan_setup import preflight_model_connection
 from strix.interface.viewer.server import build_runs_payload
+from strix.providers import get_provider_registry
 
 
 if TYPE_CHECKING:
@@ -70,19 +68,9 @@ class WorkspaceCommands:
         if command == "settings.list":
             return {"fields": settings_fields()}
         if command == "settings.update":
-            field = str(payload.get("id", ""))
-            if field in {"llm.model", "llm.api_key", "llm.api_base"}:
-                return await c.handle(
-                    "config.update",
-                    {
-                        field.split(".")[1]: payload.get("value"),
-                        "persist": payload.get("persist") is True,
-                    },
-                )
             return update_setting(
                 str(payload.get("id", "")),
                 payload.get("value"),
-                persist=payload.get("persist") is True,
             )
         if command == "mcp.list":
             return {"connections": connections()}
@@ -95,43 +83,170 @@ class WorkspaceCommands:
                 immediate=payload.get("immediate") is True,
             )
             return {"saved": True}
+        if command == "update.start":
+            if c.scan_started and c.scan_state not in {"completed", "failed", "stopped"}:
+                raise RuntimeError("An update cannot be installed during an active scan")
+            from strix.interface.update_check import self_update  # noqa: PLC0415
+
+            output = io.StringIO()
+            succeeded = await asyncio.to_thread(
+                self_update,
+                Console(file=output, color_system=None, force_terminal=False),
+                scan_status=c.scan_state,
+            )
+            message = output.getvalue().strip() or (
+                "Update ready; restart Strix" if succeeded else "Update failed"
+            )
+            return {"updated": succeeded, "message": message[-1_000:]}
+        if command == "doctor.run":
+            from strix.interface.doctor import collect_diagnostics  # noqa: PLC0415
+
+            report = await asyncio.to_thread(collect_diagnostics, check_network=False)
+            checks = report.get("checks", []) if isinstance(report, dict) else []
+            failed = [item for item in checks if isinstance(item, dict) and not item.get("ok")]
+            return {
+                "ok": bool(report.get("ok")) if isinstance(report, dict) else False,
+                "report": report,
+                "message": (
+                    "Doctor checks passed"
+                    if not failed
+                    else (
+                        f"Doctor found {len(failed)} issue(s); "
+                        "use `strix doctor --network` for details"
+                    )
+                ),
+            }
         if command == "providers.list":
+            config = get_config_service().load()
+            registry = get_provider_registry()
+            detected = registry.detected_connections()
+            detected_provider_ids = {item.provider_id for item in detected}
+            providers = []
+            for definition in registry.definitions():
+                item = definition.model_dump(mode="json")
+                if definition.id in detected_provider_ids:
+                    item["auth_methods"] = [
+                        "environment",
+                        *[method for method in item["auth_methods"] if method != "environment"],
+                    ]
+                    item["detected"] = True
+                providers.append(item)
             return {
-                "providers": provider_descriptors(),
-                "profiles": profile_list(),
-                "selected": c.selected_route,
+                "providers": providers,
+                "connections": [
+                    item.model_dump(mode="json") for item in config.connections.values()
+                ],
+                "detected_connections": [item.model_dump(mode="json") for item in detected],
+                "models": [item.model_dump(mode="json") for item in config.models.values()],
             }
-        if command == "providers.refresh":
-            result = await asyncio.to_thread(
-                refresh_provider_catalog, force=payload.get("force") is True
-            )
-            return {
-                "source": result["source"],
-                "providers": provider_descriptors(),
-                "profiles": profile_list(),
-            }
-        if command == "providers.discover":
-            return await asyncio.to_thread(
-                discover_models,
-                str(payload.get("provider_id", "custom")),
-                base_url=str(payload.get("base_url") or ""),
-                api_key=str(payload.get("api_key") or ""),
-                profile=str(payload.get("profile") or ""),
-                refresh=payload.get("refresh") is True,
-            )
         if command == "providers.connect":
-            result = await asyncio.to_thread(connect_provider, payload)
-            c.selected_route = result["name"]
-            c.args.route = [c.selected_route]
+            provider_id = str(payload.get("provider_id") or "")
+            adapter = get_provider_registry().adapter(provider_id)
+            profile = await asyncio.to_thread(adapter.connect, payload)
             if self.runtime is not None:
                 self.runtime.model_verified = False
-            return result
-        if command == "providers.advanced":
-            return update_route_options(payload)
+            return {"connection": profile.model_dump(mode="json"), "saved": True}
+        if command == "providers.disconnect":
+            connection_id = str(payload.get("connection_id") or "")
+            if not connection_id:
+                raise ValueError("connection_id is required")
+            config = get_config_service().load()
+            connection = config.connections.get(connection_id)
+            if connection is None:
+                raise ValueError(f"Unknown connection: {connection_id}")
+            disconnected = await asyncio.to_thread(
+                get_provider_registry().adapter(connection.provider_id).disconnect,
+                connection_id,
+            )
+            return {"disconnected": disconnected}
+        if command in {"models.list", "models.discover"}:
+            config = get_config_service().load()
+            connection_id = str(payload.get("connection_id") or "")
+            if command == "models.discover":
+                if not connection_id:
+                    raise ValueError("Choose a provider connection first")
+                connection = config.connections.get(connection_id)
+                if connection is None:
+                    raise ValueError(f"Unknown connection: {connection_id}")
+                adapter = get_provider_registry().adapter(connection.provider_id)
+                models = await asyncio.to_thread(
+                    adapter.discover_models,
+                    connection,
+                    refresh=payload.get("refresh") is True,
+                )
+                if models:
+                    config = get_config_service().upsert_models(models)
+            return {
+                "connections": [
+                    item.model_dump(mode="json") for item in config.connections.values()
+                ],
+                "models": [item.model_dump(mode="json") for item in config.models.values()],
+            }
+        if command == "models.toggle":
+            model_id = str(payload.get("model_id") or "")
+            enabled = payload.get("enabled")
+            if not model_id or not isinstance(enabled, bool):
+                raise ValueError("model_id and boolean enabled are required")
+            config = get_config_service().load()
+            descriptor = config.models.get(model_id)
+            if descriptor is None:
+                raise ValueError(f"Unknown model: {model_id}")
+            if enabled and (
+                descriptor.supports_tools is not True
+                or descriptor.context_window_tokens is None
+                or descriptor.metadata_confidence == "unknown"
+            ):
+                connection = config.connections.get(descriptor.connection_id)
+                if connection is None:
+                    raise ValueError("The model connection no longer exists")
+                verification = await asyncio.to_thread(
+                    get_provider_registry().adapter(connection.provider_id).verify_capabilities,
+                    connection,
+                    descriptor,
+                )
+                descriptor = descriptor.model_copy(
+                    update={
+                        "supports_tools": verification.supports_tools,
+                        "supports_vision": verification.supports_vision,
+                        "context_window_tokens": verification.context_window_tokens,
+                        "max_output_tokens": verification.max_output_tokens,
+                        "metadata_source": verification.source,
+                        "metadata_confidence": "verified",
+                    }
+                )
+                if (
+                    descriptor.supports_tools is not True
+                    or descriptor.context_window_tokens is None
+                ):
+                    raise ValueError(
+                        "This model has not passed the bounded tool/context capability preflight"
+                    )
+                get_config_service().upsert_models([descriptor])
+            model = get_config_service().set_model_enabled(model_id, enabled)
+            return {"model": model.model_dump(mode="json")}
+        if command == "router.status":
+            config = get_config_service().load()
+            pool = getattr(c.scan_context, "route_pool", None) if c.scan_context else None
+            decision = getattr(pool, "last_decision", None)
+            try:
+                configured_routes = [route.public_dict() for route in load_app_routes()]
+            except ValueError:
+                configured_routes = []
+            return {
+                "policy": config.router.model_dump(mode="json"),
+                "routes": pool.public_status() if pool is not None else configured_routes,
+                "decision": {
+                    "route_id": decision.route_id,
+                    "model": decision.model,
+                    "reason": decision.reason,
+                    "rejected": decision.rejected,
+                }
+                if decision is not None
+                else None,
+            }
         if command == "providers.test":
             await preflight_model_connection(
                 "",
-                selected_routes=[c.selected_route] if c.selected_route else None,
                 check_tools=True,
             )
             return {"verified": True, "tools": True}
@@ -208,18 +323,6 @@ class WorkspaceCommands:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.runtime.scan_task
             return {"stopped": True}
-        if command == "scan.retry":
-            agent = str(payload.get("agent_id") or next(iter(c.live_view.agents), ""))
-            return await c.handle(
-                "agent.send_message",
-                {
-                    "agent_id": agent,
-                    "message": (
-                        "Retry the interrupted turn using the saved results. "
-                        "Do not repeat completed tool actions."
-                    ),
-                },
-            )
         if command in {"scan.new", "scan.resume"}:
             if self.runtime is None:
                 raise RuntimeError("Scan management is unavailable in this viewer")

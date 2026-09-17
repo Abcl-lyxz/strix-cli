@@ -14,8 +14,10 @@ import pytest
 from agents import ModelSettings
 from openai import RateLimitError
 
+from strix.config.app_config import AppConfig
 from strix.core import runner
 from strix.core.agents import AgentCoordinator
+from strix.domain.routes import RouteConfig
 from strix.runtime import session_manager
 from strix.tools.mcp import BearerAuth, McpConnectionConfig, McpConnectionRequest
 
@@ -53,13 +55,20 @@ def _patch_engine_scaffold(
         runtime=types.SimpleNamespace(max_context_images=3),
     )
     monkeypatch.setattr(runner, "load_settings", lambda: settings)
-    monkeypatch.setattr(runner, "configure_sdk_model_defaults", lambda _settings: None)
+    service = types.SimpleNamespace(load=AppConfig)
+    monkeypatch.setattr(runner, "get_config_service", lambda: service)
+    monkeypatch.setattr(
+        runner,
+        "load_app_routes",
+        lambda _service=None: [
+            RouteConfig(name="test", model="openai/gpt-4o", supports_tools=True)
+        ],
+    )
     monkeypatch.setattr(
         runner,
         "uses_chat_completions_tool_schema",
         lambda _model, _settings: False,
     )
-
 
     async def _create_session(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"client": object(), "session": object(), "caido_client": None}

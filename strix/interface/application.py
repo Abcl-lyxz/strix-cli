@@ -10,44 +10,28 @@ import webbrowser
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
-from uuid import uuid4
 
 from strix.application.commands import Command, CommandRegistry
 from strix.bootstrap import create_app_services
-from strix.config import load_settings
-from strix.config import routes as route_config
-from strix.config.routes import (
-    list_saved_routes,
-    load_routes,
-    save_route,
-    set_session_route,
-)
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
-from strix.config.ui import settings_fields, update_setting
-from strix.core.paths import runs_base_dir, runtime_state_dir
-from strix.domain.routes import RouteConfig
-from strix.interface.projectors import WorkspaceProjector, display_api_base
+from strix.core.paths import runs_base_dir
+from strix.interface.projectors import WorkspaceProjector
 from strix.interface.tui.backend.live_view import TuiLiveView
-from strix.interface.tui.backend.messages import send_user_message_to_agent
 from strix.interface.tui.backend.projection import SCAN_MODES, SCOPE_MODES, sanitize_terminal_text
 from strix.interface.viewer.server import bundle_is_built, fresh_authorized_url, serve
 from strix.interface.viewer.workspace import BrowserWorkspace
 from strix.interface.workspace import WorkspaceCommands
-from strix.security import get_secret_store
 from strix.tools.workspace_search import search_local_workspace
 
 
 if TYPE_CHECKING:
-    import argparse
-
     from strix.application.context import AppServices, ScanContext
+    from strix.domain.app_state import LaunchState
     from strix.notifications import Notification
     from strix.report.state import ReportState
 
 
 _STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused"})
-_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _MAX_PROMPT_BYTES = 256 * 1024
 ChangeCallback = Callable[[], None]
 StartCallback = Callable[[], Awaitable[None]]
@@ -60,7 +44,7 @@ class ApplicationController:
 
     def __init__(
         self,
-        args: argparse.Namespace,
+        args: LaunchState,
         *,
         live_view: TuiLiveView | None = None,
         coordinator: Any = None,
@@ -142,8 +126,8 @@ class ApplicationController:
         self._on_verify = on_verify
         self._on_quit = on_quit
         self._on_change = on_change
-        requested_routes = getattr(args, "route", None) or []
-        self.selected_route = str(requested_routes[0]) if requested_routes else ""
+        # Display-only projection of the last automatic router decision.
+        self.selected_route = ""
         self.recovery: dict[str, Any] = {}
         self.notification_service = self.services.notifications
         self._unsubscribe_notifications = self.notification_service.subscribe(self._on_notification)
@@ -158,10 +142,7 @@ class ApplicationController:
             "setup.configure": self._configure_setup,
             "setup.start": self._start,
             "setup.confirm_mount": self._confirm_mount,
-            "config.update": self._update_config,
-            "routes.manage": self._manage_routes,
             "notifications.manage": self._manage_notifications,
-            "storage.show": self._show_storage,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
             "workspace.find": self._find_workspace,
@@ -176,6 +157,10 @@ class ApplicationController:
             "notifications",
             "paths",
             "providers",
+            "models",
+            "router",
+            "update",
+            "doctor",
             "scan",
             "sessions",
             "settings",
@@ -320,25 +305,6 @@ class ApplicationController:
         self.notify_changed()
         return result
 
-    async def _manage_routes(self, payload: dict[str, Any]) -> dict[str, Any]:
-        operation = str(payload.get("operation") or "list")
-        by_name = {r.name.casefold(): r for r in list_saved_routes()}
-        by_name.update(route_config.session_routes())
-        routes = list(by_name.values())
-        if operation == "select":
-            name = self._required_string(payload, "name")
-            route = next((item for item in routes if item.name.casefold() == name.casefold()), None)
-            if route is None:
-                raise ValueError(f"Unknown route: {name}")
-            self.selected_route = route.name
-            set_session_route(route)
-        elif operation != "list":
-            raise ValueError("routes operation must be list or select")
-        return {
-            "selected": self.selected_route,
-            "routes": [route.public_dict() for route in routes],
-        }
-
     async def _manage_notifications(self, payload: dict[str, Any]) -> dict[str, Any]:
         operation = str(payload.get("operation") or "list")
         if operation == "read":
@@ -390,21 +356,6 @@ class ApplicationController:
         self.notification_service.mark_read(item.id)
         # Return a typed UI instruction. The backend never evaluates a shell command.
         return {"action": action.kind, "target": action.target, "label": action.label}
-
-    async def _show_storage(self, _payload: dict[str, Any]) -> dict[str, Any]:
-        run_dir = self.report_state.get_run_dir() if self.report_state is not None else None
-        state_dir = runtime_state_dir(run_dir) if run_dir is not None else None
-        return {
-            "run": str(run_dir) if run_dir else "not created yet",
-            "database": str(state_dir / "agents.db") if state_dir else "not created yet",
-            "transcript": (
-                f"{state_dir / 'agents.db'}#transcript_entries" if state_dir else "not created yet"
-            ),
-            "graph": str(state_dir / "agents.json") if state_dir else "not created yet",
-            "log": str(run_dir / "strix.log") if run_dir else "not created yet",
-            "global_config": str(Path.home() / ".strix" / "cli-config.json"),
-            "global_inbox": str(self.notification_service.path),
-        }
 
     async def _add_target(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._require_setup_mutable()
@@ -515,139 +466,6 @@ class ApplicationController:
             "diff_base": self.diff_base,
         }
 
-    async def _update_config(  # noqa: PLR0912, PLR0915 - one bounded config schema
-        self, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Validate explicit provider edits; apply them at the next model call."""
-        supported = {
-            "persist",
-            "model",
-            "api_key",
-            "api_base",
-            "reasoning_effort",
-            "streaming_enabled",
-            "prompt_cache",
-            "llm_timeout",
-            "max_tool_calls_per_turn",
-            "max_context_images",
-        }
-        unknown = set(payload) - supported
-        if unknown:
-            raise ValueError(f"Unknown configuration setting: {sorted(unknown)[0]}")
-        if not payload:
-            raise ValueError("No configuration setting supplied")
-
-        updates: dict[str, Any] = {}
-        if "model" in payload:
-            updates["STRIX_LLM"] = self._optional_bounded_string(
-                payload["model"], "model", maximum=512
-            )
-        if "api_key" in payload:
-            api_key = self._optional_bounded_string(
-                payload["api_key"], "api_key", maximum=32 * 1024
-            )
-            if api_key is not None and ("\r" in api_key or "\n" in api_key):
-                raise ValueError("api_key must be a single line")
-            updates["LLM_API_KEY"] = api_key
-        if "api_base" in payload:
-            api_base = self._optional_bounded_string(
-                payload["api_base"], "api_base", maximum=2 * 1024
-            )
-            if api_base is not None:
-                parsed = urlparse(api_base)
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    raise ValueError("api_base must be an http:// or https:// URL")
-                if parsed.username is not None or parsed.password is not None:
-                    raise ValueError("api_base must not contain credentials; use /apikey instead")
-            updates["LLM_API_BASE"] = api_base
-        if "reasoning_effort" in payload:
-            value = payload["reasoning_effort"]
-            if not isinstance(value, str) or value not in _REASONING_EFFORTS:
-                raise ValueError(
-                    "reasoning_effort must be one of: " + ", ".join(sorted(_REASONING_EFFORTS))
-                )
-            updates["STRIX_REASONING_EFFORT"] = value
-        for field, alias in (("prompt_cache", "STRIX_PROMPT_CACHE"),):
-            if field in payload:
-                value = payload[field]
-                if not isinstance(value, bool):
-                    raise TypeError(f"{field} must be a boolean")
-                updates[alias] = value
-        if "streaming_enabled" in payload:
-            value = payload["streaming_enabled"]
-            if not isinstance(value, bool):
-                raise TypeError("streaming_enabled must be a boolean")
-            updates["LLM_DISABLE_STREAMING"] = not value
-        for field, alias, allow_zero in (
-            ("llm_timeout", "LLM_TIMEOUT", False),
-            ("max_tool_calls_per_turn", "LLM_MAX_TOOL_CALLS_PER_TURN", True),
-            ("max_context_images", "STRIX_MAX_CONTEXT_IMAGES", True),
-        ):
-            if field in payload:
-                value = payload[field]
-                if (
-                    not isinstance(value, int)
-                    or isinstance(value, bool)
-                    or value < (0 if allow_zero else 1)
-                ):
-                    qualifier = "a non-negative integer" if allow_zero else "a positive integer"
-                    raise ValueError(f"{field} must be {qualifier}")
-                updates[alias] = value
-
-        route_updates = {
-            key: updates.pop(key)
-            for key in tuple(updates)
-            if key in {"STRIX_LLM", "LLM_API_KEY", "LLM_API_BASE"}
-        }
-        persist = payload.get("persist") is True
-        selected = None
-        with contextlib.suppress(ValueError):
-            selected = load_routes(
-                load_settings(), selected=[self.selected_route] if self.selected_route else None
-            )[0]
-        edited = selected
-        if selected is not None and route_updates:
-            edited = RouteConfig.from_dict(selected.to_dict())
-            if "STRIX_LLM" in route_updates:
-                if not route_updates["STRIX_LLM"]:
-                    raise ValueError("A named route model cannot be empty")
-                edited.model = str(route_updates["STRIX_LLM"])
-                edited.model_id = edited.model.partition("/")[2] or edited.model
-            if "LLM_API_BASE" in route_updates:
-                edited.base_url = route_updates["LLM_API_BASE"]
-            if "LLM_API_KEY" in route_updates:
-                ref = f"route.{edited.name}.ui-{uuid4().hex[:12]}"
-                # A session edit must not overwrite a saved connection's credential.
-                get_secret_store().set(ref, str(route_updates["LLM_API_KEY"] or ""))
-                edited.api_key_ref = ref
-                edited.api_key_env = None
-            if persist:
-                save_route(edited, replace=True)
-            set_session_route(edited)
-            self.selected_route = edited.name
-        else:
-            updates.update(route_updates)
-        fields = {f["alias"]: f["id"] for f in settings_fields()}
-        for alias, value in updates.items():
-            update_setting(fields[alias], value, persist=persist)
-        settings = load_settings()
-        return {
-            "saved": persist,
-            "model": edited.model
-            if edited is not None and route_updates
-            else settings.llm.model or "",
-            "api_key_configured": bool(
-                route_updates.get("LLM_API_KEY")
-                or (selected and selected.api_key_ref)
-                or settings.llm.api_key
-            ),
-            "api_base": display_api_base(edited.base_url or "")
-            if edited is not None and route_updates
-            else display_api_base(settings.llm.api_base or ""),
-            "reasoning_effort": settings.llm.reasoning_effort,
-            "selected_route": self.selected_route,
-        }
-
     async def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.scan_started or self._start_in_progress:
             raise RuntimeError("Scan is already starting or running")
@@ -657,14 +475,15 @@ class ApplicationController:
         if not isinstance(mount_working_dir, bool):
             raise TypeError("mount_working_dir must be a boolean")
         try:
-            routes = load_routes(
-                load_settings(),
-                selected=[self.selected_route] if self.selected_route else None,
-            )
+            from strix.config.runtime_routes import load_app_routes  # noqa: PLC0415
+
+            routes = load_app_routes()
         except ValueError as exc:
-            raise ValueError("No model configured. Use /model provider/model in the TUI.") from exc
+            raise ValueError(
+                "No eligible model is configured. Use /connect, then /models."
+            ) from exc
         if not routes:
-            raise ValueError("No model configured. Use /model provider/model in the TUI.")
+            raise ValueError("No eligible model is configured. Use /connect, then /models.")
         if self._on_start is None:
             raise RuntimeError("Scan start is unavailable")
         if not self.targets and not mount_working_dir:
@@ -873,24 +692,12 @@ class ApplicationController:
                 self.viewer_status = "unavailable"
                 return {"status": self.viewer_status, "error": "Viewer UI not built"}
 
-            def steer(agent_id: str, message: str) -> bool:
-                return send_user_message_to_agent(
-                    coordinator=self.coordinator,
-                    loop=self.scan_loop,
-                    live_view=self.live_view,
-                    target_agent_id=agent_id,
-                    message=message,
-                    notify_changed=self.notify_changed,
-                    wait_for_delivery=True,
-                )
-
             self._viewer_bridge = BrowserWorkspace(self, asyncio.get_running_loop())
             httpd, url, _bootstrap_nonce = serve(
                 self.report_state.get_run_dir()
                 if self.report_state
                 else runs_base_dir() / "workspace",
                 open_browser=True,
-                steer_handler=steer,
                 workspace=self._viewer_bridge,
             )
             self._viewer_httpd = httpd

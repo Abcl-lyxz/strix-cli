@@ -13,12 +13,12 @@ type goldenContract struct {
 	Envelopes []Envelope `json:"envelopes"`
 }
 
-func TestProtocolV7SharedGoldenFixture(t *testing.T) {
+func TestProtocolV8SharedGoldenFixture(t *testing.T) {
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate golden test source")
 	}
-	fixture := filepath.Join(filepath.Dir(source), "..", "..", "..", "..", "..", "tests", "fixtures", "protocol_v7_contract.json")
+	fixture := filepath.Join(filepath.Dir(source), "..", "..", "..", "..", "..", "tests", "fixtures", "protocol_v8_contract.json")
 	raw, err := os.ReadFile(fixture)
 	if err != nil {
 		t.Fatal(err)
