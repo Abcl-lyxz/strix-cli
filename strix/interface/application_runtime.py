@@ -11,10 +11,12 @@ import shutil
 import sys
 import time
 from copy import deepcopy
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from strix.bootstrap import create_scan_context
 from strix.config import load_settings
+from strix.config.app_config import get_config_service
 from strix.config.runtime_routes import load_app_routes
 from strix.config.settings import DEFAULT_MAX_AGENTS
 from strix.core.agents import AgentCoordinator
@@ -60,6 +62,11 @@ logger = logging.getLogger(__name__)
 
 _COMPILE_NOTICE = "Compiling the TUI from source (cached after the first run)..."
 _TRANSIENT_PREFLIGHT_RETRY_DELAY = 10.0
+_QUALITY_RANK = {"frontier": 0, "strong": 1, "standard": 2, "economy": 3, "unknown": 4}
+
+
+def _route_quality_key(route: Any) -> tuple[int, str]:
+    return _QUALITY_RANK.get(route.quality_tier, _QUALITY_RANK["unknown"]), route.name
 
 
 def _print_compile_notice(stream: Any) -> None:
@@ -288,9 +295,52 @@ class WorkspaceRuntime:
         model = self._configured_model()
         self.controller.add_message("Verifying model connection...")
         set_scan_phase("preflight")
-        await preflight_model_connection(
-            model,
+        route = None
+        with contextlib.suppress(ValueError):
+            route = next(
+                (candidate for candidate in load_app_routes() if candidate.model == model),
+                None,
+            )
+        needs_capability_probe = route is not None and (
+            route.supports_tools is not True
+            or route.context_window_tokens is None
+            or route.metadata_confidence not in {"verified", "catalog"}
         )
+        probe_routes = [route] if route is not None and needs_capability_probe else None
+        verification = await preflight_model_connection(
+            model,
+            check_tools=needs_capability_probe,
+            routes_override=probe_routes,
+            allow_unverified=needs_capability_probe,
+        )
+        if needs_capability_probe and route is not None and verification is not None:
+            service = get_config_service()
+            descriptor = service.load().models.get(route.name)
+            if descriptor is not None:
+                service.upsert_models(
+                    [
+                        descriptor.model_copy(
+                            update={
+                                "supports_tools": verification.supports_tools,
+                                "supports_vision": (
+                                    verification.supports_vision
+                                    if verification.supports_vision is not None
+                                    else descriptor.supports_vision
+                                ),
+                                "context_window_tokens": (
+                                    verification.context_window_tokens
+                                    or descriptor.context_window_tokens
+                                ),
+                                "max_output_tokens": (
+                                    verification.max_output_tokens or descriptor.max_output_tokens
+                                ),
+                                "metadata_source": verification.source,
+                                "metadata_confidence": "verified",
+                                "verified_at": datetime.now(UTC).isoformat(),
+                            }
+                        )
+                    ]
+                )
         self.model_verified = True
         self.verified_connection = self._connection_signature()
         self._preflight_failure = None
@@ -312,7 +362,7 @@ class WorkspaceRuntime:
 
     def _connection_signature(self) -> tuple[str, str, str]:
         routes = load_app_routes()
-        route = min(routes, key=lambda r: (r.quality_tier, r.name))
+        route = min(routes, key=_route_quality_key)
         key, headers = resolve_route_secrets(route)
         secrets = (key, headers)
         digest = hashlib.sha256(
@@ -324,7 +374,7 @@ class WorkspaceRuntime:
         routes = load_app_routes()
         if not routes:
             raise ValueError("No eligible model configured. Use /connect, then /models.")
-        return min(routes, key=lambda route: (route.quality_tier, route.name)).model
+        return min(routes, key=_route_quality_key).model
 
     def _start_preparation(self) -> asyncio.Task[None]:
         """Kick off the work that runs behind the freshly painted TUI."""

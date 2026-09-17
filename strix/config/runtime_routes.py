@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from strix.config.app_config import ConfigService, get_config_service
 from strix.providers import get_provider_registry
+from strix.providers.policy import quality_tier
 
 
 if TYPE_CHECKING:
@@ -26,7 +27,11 @@ def load_app_routes(service: ConfigService | None = None) -> list[RouteConfig]:
         route.supports_tools = model.supports_tools
         route.supports_vision = model.supports_vision
         route.supports_reasoning = model.supports_reasoning
-        route.quality_tier = model.quality_tier
+        route.quality_tier = (
+            quality_tier(model.provider_id, model.adapter_id, model.model_id)
+            if model.quality_tier == "unknown"
+            else model.quality_tier
+        )
         route.input_cost_per_million = model.input_cost_per_million
         route.output_cost_per_million = model.output_cost_per_million
         route.connection_revision = connection.revision

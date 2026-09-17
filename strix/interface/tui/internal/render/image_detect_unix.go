@@ -9,6 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func terminalCapabilityQueriesSupported() bool { return true }
+
 // waitReadable reports whether the descriptor has input available within the
 // timeout. poll(2) works on a blocking terminal descriptor, which is what a tty
 // is and why os.File read deadlines cannot be used here.

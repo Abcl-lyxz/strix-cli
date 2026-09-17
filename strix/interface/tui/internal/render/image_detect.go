@@ -26,6 +26,10 @@ const etx = 0x03
 // APC "OK" response before the DA1; anything else ignores it. Must run before
 // Bubble Tea takes over stdin.
 func DetectKittyGraphics() {
+	if !terminalCapabilityQueriesSupported() {
+		KittyGraphicsSupported = func() bool { return false }
+		return
+	}
 	supported, interrupted := queryKittyGraphics(os.Stdin, os.Stdout)
 	KittyGraphicsSupported = func() bool { return supported }
 	if interrupted {

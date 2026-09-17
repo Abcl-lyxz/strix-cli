@@ -217,7 +217,7 @@ func (m Model) submitCanonicalCommand(name, argument string) (tea.Model, tea.Cmd
 	case "connect":
 		return m, m.openWorkspace("providers", "Provider connections", "providers.list"), true
 	case "models":
-		return m, m.openWorkspace("model_connections", "Choose a connection", "providers.list"), true
+		return m, m.openWorkspace("models", "Models", "models.list"), true
 	case "router":
 		return m, m.openWorkspace("router", "Automatic router", "router.status"), true
 	case "settings":

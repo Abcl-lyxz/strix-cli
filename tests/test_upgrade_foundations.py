@@ -10,6 +10,7 @@ import pytest
 from strix.config.loader import set_session_field
 from strix.config.provider_catalog import model_metadata, refresh_provider_catalog
 from strix.providers import get_provider_registry
+from strix.providers.policy import quality_tier
 from strix.runtime import profiles
 from strix.tools.proxy.tools import _repair_httpql, _validate_httpql
 from strix.tools.security_jobs.tool import _validate_network_arguments
@@ -42,6 +43,10 @@ def test_unknown_model_uses_conservative_context_limit(
 
     assert metadata["context_window_tokens"] is None
     assert metadata["confidence"] == "unknown"
+
+
+def test_nested_custom_model_id_uses_native_quality_policy() -> None:
+    assert quality_tier("custom", "openai", "openai/gpt-5.4") == "frontier"
 
 
 def test_catalog_refresh_is_atomic_and_keeps_release_recommendations(

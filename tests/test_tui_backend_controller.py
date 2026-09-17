@@ -18,6 +18,8 @@ from strix.config.app_config import (
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.domain.app_state import LaunchState, ScanDraft
 from strix.interface.tui.backend.controller import ApplicationController
+from strix.providers import get_provider_registry
+from strix.providers.base import CapabilityVerification
 
 
 if TYPE_CHECKING:
@@ -191,6 +193,62 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
     snapshot = controller.snapshot()
     assert snapshot["api_key_configured"] is True
     assert "sk-do-not-echo" not in str(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_enabling_unknown_model_uses_live_probe_and_conservative_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = ApplicationController(args())
+    adapter = get_provider_registry().adapter("custom")
+    connection = adapter.connect(
+        {
+            "connection_id": "gateway",
+            "base_url": "https://gateway.invalid/v1",
+            "api_key": "fixture-key",
+        }
+    )
+    get_config_service().upsert_models(
+        [
+            ModelDescriptor(
+                id="gateway:unknown-model",
+                provider_id="custom",
+                connection_id=connection.id,
+                model_id="unknown-model",
+                adapter_id="openai",
+            )
+        ]
+    )
+    observed: dict[str, object] = {}
+
+    async def probe(model_name: str, **kwargs: object) -> CapabilityVerification:
+        observed["model_name"] = model_name
+        observed.update(kwargs)
+        return CapabilityVerification(
+            supports_tools=True,
+            context_window_tokens=32_768,
+            max_output_tokens=8_192,
+            source="live-preflight",
+        )
+
+    monkeypatch.setattr("strix.interface.workspace.preflight_model_connection", probe)
+
+    result = await controller.handle(
+        "models.toggle", {"model_id": "gateway:unknown-model", "enabled": True}
+    )
+
+    saved = get_config_service().load().models["gateway:unknown-model"]
+    assert result["model"]["enabled"] is True
+    assert saved.supports_tools is True
+    assert saved.context_window_tokens == 32_768
+    assert saved.max_output_tokens == 8_192
+    assert saved.metadata_confidence == "verified"
+    assert observed["model_name"] == "openai/unknown-model"
+    assert observed["check_tools"] is True
+    assert observed["allow_unverified"] is True
+    routes_override = observed["routes_override"]
+    assert isinstance(routes_override, list)
+    assert len(routes_override) == 1
 
 
 @pytest.mark.asyncio

@@ -16,7 +16,7 @@ from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.retry import ModelRetryNormalizedError, RetryPolicyContext
 from openai import AsyncOpenAI
 
-from strix.config.app_config import get_config_service
+from strix.config.app_config import ModelDescriptor, get_config_service
 from strix.config.models import (
     DEFAULT_MODEL_RETRY,
     _configure_litellm_compatibility,
@@ -259,6 +259,65 @@ def test_connection_is_saved_without_requiring_a_model() -> None:
     assert connection.id == "gateway"
     assert config.connections["gateway"].options["base_url"] == ("https://gateway.invalid/v1")
     assert config.models == {}
+
+
+def test_repeated_custom_connections_get_distinct_default_ids() -> None:
+    adapter = get_provider_registry().adapter("custom")
+
+    first = adapter.connect({"base_url": "https://one.invalid/v1", "api_key": "fixture-one"})
+    second = adapter.connect({"base_url": "https://two.invalid/v1", "api_key": "fixture-two"})
+
+    assert first.id == "custom"
+    assert second.id == "custom-2"
+    assert set(get_config_service().load().connections) == {"custom", "custom-2"}
+
+
+def test_custom_connection_normalizes_a_chat_completions_endpoint() -> None:
+    profile = (
+        get_provider_registry()
+        .adapter("custom")
+        .connect(
+            {
+                "base_url": "https://gateway.invalid/v1/chat/completions",
+                "api_key": "fixture-key",
+            }
+        )
+    )
+
+    assert profile.options["base_url"] == "https://gateway.invalid/v1"
+
+
+def test_changing_connection_endpoint_discards_stale_discovered_models() -> None:
+    adapter = get_provider_registry().adapter("custom")
+    first = adapter.connect(
+        {
+            "connection_id": "gateway",
+            "base_url": "https://one.invalid/v1",
+            "api_key": "fixture-one",
+        }
+    )
+    get_config_service().upsert_models(
+        [
+            ModelDescriptor(
+                id="gateway:model-a",
+                provider_id="custom",
+                connection_id=first.id,
+                model_id="model-a",
+                adapter_id="openai",
+                enabled=True,
+            )
+        ]
+    )
+
+    adapter.connect(
+        {
+            "connection_id": "gateway",
+            "base_url": "https://two.invalid/v1",
+            "api_key": "fixture-two",
+        }
+    )
+
+    assert get_config_service().load().models == {}
 
 
 def test_connection_key_rotation_deletes_the_old_reference() -> None:

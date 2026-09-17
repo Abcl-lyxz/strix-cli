@@ -16,12 +16,19 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from strix.config.app_config import (
+    ConnectionProfile,
+    ModelDescriptor,
+    get_config_service,
+)
 from strix.config.settings import DEFAULT_MAX_AGENTS, DEFAULT_MAX_TURNS
 from strix.domain.app_state import LaunchState, ScanDraft
+from strix.domain.routes import RouteConfig
 from strix.interface.tui import runtime as go_tui
 from strix.interface.tui import sidecar
 from strix.interface.tui.backend.protocol import PROTOCOL_CAPABILITIES, PROTOCOL_VERSION
 from strix.interface.tui.runtime import GoTuiRuntime
+from strix.providers.base import CapabilityVerification
 from strix.report.state import ReportState
 
 
@@ -391,6 +398,74 @@ def _setup_model(
         "_connection_signature",
         lambda _runtime: (model, "test-secret-digest", ""),
     )
+
+
+def test_setup_preflight_chooses_highest_quality_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(args())
+    monkeypatch.setattr(
+        go_tui,
+        "load_app_routes",
+        lambda: [
+            RouteConfig(name="cheap", model="openai/cheap", quality_tier="economy"),
+            RouteConfig(name="best", model="openai/best", quality_tier="frontier"),
+            RouteConfig(name="middle", model="openai/middle", quality_tier="strong"),
+        ],
+    )
+
+    assert runtime._configured_model() == "openai/best"
+
+
+@pytest.mark.asyncio
+async def test_setup_preflight_repairs_enabled_model_with_unknown_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = get_config_service()
+    service.upsert_connection(
+        ConnectionProfile(
+            id="gateway",
+            provider_id="custom",
+            name="Gateway",
+            options={"base_url": "https://gateway.invalid/v1"},
+        )
+    )
+    service.upsert_models(
+        [
+            ModelDescriptor(
+                id="gateway:custom-model",
+                provider_id="custom",
+                connection_id="gateway",
+                model_id="custom-model",
+                adapter_id="openai",
+                enabled=True,
+            )
+        ]
+    )
+    observed: dict[str, Any] = {}
+
+    async def preflight(model: str, **options: Any) -> CapabilityVerification:
+        observed["model"] = model
+        observed.update(options)
+        return CapabilityVerification(
+            supports_tools=True,
+            context_window_tokens=32_768,
+            max_output_tokens=8_192,
+            source="live-tool-preflight",
+        )
+
+    monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
+    runtime = GoTuiRuntime(args())
+
+    await runtime._preflight_model()
+
+    saved = service.load().models["gateway:custom-model"]
+    assert observed["model"] == "openai/custom-model"
+    assert observed["check_tools"] is True
+    assert observed["allow_unverified"] is True
+    assert saved.supports_tools is True
+    assert saved.context_window_tokens == 32_768
+    assert saved.metadata_confidence == "verified"
 
 
 def _setup_messages(runtime: GoTuiRuntime) -> list[tuple[str, str]]:

@@ -83,7 +83,8 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		}
 		draft := m.takeDraft(envelope.RequestID, result.Command)
 		if !result.OK {
-			if m.modal == modalWorkspace && result.Error != nil {
+			modalFailure := m.modal == modalWorkspace && result.Error != nil
+			if modalFailure {
 				m.dialog.Error = result.Error.Message
 			}
 			m.restoreDraft(draft)
@@ -101,12 +102,15 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			if result.Error != nil && strings.TrimSpace(result.Error.Message) != "" {
 				message = result.Error.Message
 			}
-			// Setup-mode errors live in the scrollback (red), like Python; during
-			// a scan they surface on the status line.
-			if m.snapshot.SetupMode {
-				m.setupMsg(message, render.Col(red))
-			} else {
-				m.errorText = message
+			// A workspace owns its command errors.  Do not also copy the error
+			// into the setup scrollback or global status, where it would survive
+			// after the user closes the modal.
+			if !modalFailure {
+				if m.snapshot.SetupMode {
+					m.setupMsg(message, render.Col(red))
+				} else {
+					m.errorText = message
+				}
 			}
 			return nil
 		}

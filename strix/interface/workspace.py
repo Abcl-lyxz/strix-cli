@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,6 +23,7 @@ from strix.interface.connections import connections, update_connection
 from strix.interface.scan_setup import preflight_model_connection
 from strix.interface.viewer.server import build_runs_payload
 from strix.providers import get_provider_registry
+from strix.providers.policy import quality_tier
 
 
 if TYPE_CHECKING:
@@ -191,6 +193,15 @@ class WorkspaceCommands:
             descriptor = config.models.get(model_id)
             if descriptor is None:
                 raise ValueError(f"Unknown model: {model_id}")
+            descriptor_changed = False
+            inferred_tier = quality_tier(
+                descriptor.provider_id,
+                descriptor.adapter_id,
+                descriptor.model_id,
+            )
+            if descriptor.quality_tier == "unknown" and inferred_tier != "unknown":
+                descriptor = descriptor.model_copy(update={"quality_tier": inferred_tier})
+                descriptor_changed = True
             if enabled and (
                 descriptor.supports_tools is not True
                 or descriptor.context_window_tokens is None
@@ -199,28 +210,80 @@ class WorkspaceCommands:
                 connection = config.connections.get(descriptor.connection_id)
                 if connection is None:
                     raise ValueError("The model connection no longer exists")
+                adapter = get_provider_registry().adapter(connection.provider_id)
                 verification = await asyncio.to_thread(
-                    get_provider_registry().adapter(connection.provider_id).verify_capabilities,
+                    adapter.verify_capabilities,
                     connection,
                     descriptor,
                 )
                 descriptor = descriptor.model_copy(
                     update={
-                        "supports_tools": verification.supports_tools,
-                        "supports_vision": verification.supports_vision,
-                        "context_window_tokens": verification.context_window_tokens,
-                        "max_output_tokens": verification.max_output_tokens,
+                        "supports_tools": (
+                            verification.supports_tools
+                            if verification.supports_tools is not None
+                            else descriptor.supports_tools
+                        ),
+                        "supports_vision": (
+                            verification.supports_vision
+                            if verification.supports_vision is not None
+                            else descriptor.supports_vision
+                        ),
+                        "context_window_tokens": (
+                            verification.context_window_tokens or descriptor.context_window_tokens
+                        ),
+                        "max_output_tokens": (
+                            verification.max_output_tokens or descriptor.max_output_tokens
+                        ),
                         "metadata_source": verification.source,
-                        "metadata_confidence": "verified",
                     }
                 )
+                if descriptor.supports_tools is False:
+                    raise ValueError(
+                        "This model declares that tool calling is unsupported and cannot run "
+                        "Strix agents"
+                    )
                 if (
                     descriptor.supports_tools is not True
                     or descriptor.context_window_tokens is None
+                    or descriptor.metadata_confidence not in {"verified", "catalog"}
                 ):
-                    raise ValueError(
-                        "This model has not passed the bounded tool/context capability preflight"
+                    route = adapter.build_model(connection, descriptor)
+                    route.supports_tools = descriptor.supports_tools
+                    route.supports_vision = descriptor.supports_vision
+                    route.supports_reasoning = descriptor.supports_reasoning
+                    route.quality_tier = descriptor.quality_tier
+                    route.input_cost_per_million = descriptor.input_cost_per_million
+                    route.output_cost_per_million = descriptor.output_cost_per_million
+                    live = await preflight_model_connection(
+                        route.model,
+                        check_tools=True,
+                        routes_override=[route],
+                        allow_unverified=True,
                     )
+                    descriptor = descriptor.model_copy(
+                        update={
+                            "supports_tools": live.supports_tools,
+                            "supports_vision": (
+                                live.supports_vision
+                                if live.supports_vision is not None
+                                else descriptor.supports_vision
+                            ),
+                            # Unknown gateways are deliberately capped at the
+                            # conservative context fallback returned by the live
+                            # probe.  The compactor can now act before overflow
+                            # instead of blocking an otherwise working model.
+                            "context_window_tokens": live.context_window_tokens,
+                            "max_output_tokens": live.max_output_tokens,
+                            "metadata_source": live.source,
+                            "metadata_confidence": "verified",
+                            "verified_at": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                if descriptor.supports_tools is not True:
+                    raise ValueError("The live model probe did not confirm tool calling support")
+                get_config_service().upsert_models([descriptor])
+                descriptor_changed = False
+            if descriptor_changed:
                 get_config_service().upsert_models([descriptor])
             model = get_config_service().set_model_enabled(model_id, enabled)
             return {"model": model.model_dump(mode="json")}

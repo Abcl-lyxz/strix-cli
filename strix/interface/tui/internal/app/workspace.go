@@ -100,6 +100,97 @@ func (m *Model) openForm(title, command string, payload map[string]any, fields .
 	}
 }
 
+func decodedRows(data map[string]any, key string) []map[string]any {
+	rows := []map[string]any{}
+	if values, ok := data[key].([]any); ok {
+		for _, value := range values {
+			if row, ok := value.(map[string]any); ok {
+				copy := make(map[string]any, len(row)+3)
+				for field, item := range row {
+					copy[field] = item
+				}
+				rows = append(rows, copy)
+			}
+		}
+	}
+	return rows
+}
+
+func providerWorkspaceRows(data map[string]any) []map[string]any {
+	rows := []map[string]any{}
+	for _, row := range decodedRows(data, "connections") {
+		row["_kind"] = "connection"
+		row["section"] = "Connected"
+		row["label"] = fmt.Sprintf("%v · %v · connected", row["name"], row["provider_id"])
+		rows = append(rows, row)
+	}
+	for _, row := range decodedRows(data, "providers") {
+		row["_kind"] = "provider"
+		row["section"] = "Add provider"
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func modelWorkspaceRows(data map[string]any) []map[string]any {
+	rows := []map[string]any{}
+	connectionNames := map[string]string{}
+	for _, row := range decodedRows(data, "connections") {
+		id := fmt.Sprint(row["id"])
+		name := fmt.Sprint(row["name"])
+		connectionNames[id] = name
+		row["_kind"] = "connection"
+		row["section"] = "Discover / refresh"
+		row["label"] = fmt.Sprintf("%s · %v", name, row["provider_id"])
+		rows = append(rows, row)
+	}
+	for _, row := range decodedRows(data, "models") {
+		row["_kind"] = "model"
+		connectionID := fmt.Sprint(row["connection_id"])
+		section := connectionNames[connectionID]
+		if section == "" {
+			section = connectionID
+		}
+		row["section"] = "Models · " + section
+		state := "off"
+		if enabled, _ := row["enabled"].(bool); enabled {
+			state = "on"
+		}
+		tier := fmt.Sprint(row["quality_tier"])
+		if tier == "" || tier == "<nil>" {
+			tier = "unknown"
+		}
+		row["label"] = fmt.Sprintf("[%s] %v · %s", state, row["model_id"], tier)
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func workspaceRowIdentity(row map[string]any) string {
+	return fmt.Sprint(row["_kind"]) + "\x00" + fmt.Sprint(row["id"])
+}
+
+func (m Model) selectedWorkspaceIdentity() string {
+	rows := m.filteredWorkspaceRows()
+	if len(rows) == 0 {
+		return ""
+	}
+	return workspaceRowIdentity(rows[min(m.dialog.Index, len(rows)-1)])
+}
+
+func (m *Model) restoreWorkspaceSelection(identity string) {
+	m.dialog.Index = 0
+	if identity == "" {
+		return
+	}
+	for index, row := range m.filteredWorkspaceRows() {
+		if workspaceRowIdentity(row) == identity {
+			m.dialog.Index = index
+			return
+		}
+	}
+}
+
 func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 	switch result.Command {
 	case "settings.list", "providers.list", "models.list", "models.discover", "router.status", "sessions.list", "attachments.list", "paths.complete":
@@ -108,22 +199,19 @@ func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 			m.dialog.Error = err.Error()
 			return nil, true
 		}
-		key := map[string]string{"settings.list": "fields", "providers.list": "providers", "models.list": "models", "models.discover": "models", "router.status": "routes", "sessions.list": "runs", "attachments.list": "attachments", "paths.complete": "paths"}[result.Command]
-		if result.Command == "providers.list" && m.dialog.Kind == "model_connections" {
-			key = "connections"
-		}
-		m.dialog.Rows = nil
-		if values, ok := data[key].([]any); ok {
-			for _, v := range values {
-				if row, ok := v.(map[string]any); ok {
-					m.dialog.Rows = append(m.dialog.Rows, row)
-				}
-			}
-		}
-		if result.Command == "models.discover" {
+		identity := m.selectedWorkspaceIdentity()
+		m.dialog.Error = ""
+		switch result.Command {
+		case "providers.list":
+			m.dialog.Rows = providerWorkspaceRows(data)
+		case "models.list", "models.discover":
+			m.dialog.Rows = modelWorkspaceRows(data)
 			m.dialog.Kind = "models"
+		default:
+			key := map[string]string{"settings.list": "fields", "router.status": "routes", "sessions.list": "runs", "attachments.list": "attachments", "paths.complete": "paths"}[result.Command]
+			m.dialog.Rows = decodedRows(data, key)
 		}
-		m.dialog.Index = 0
+		m.restoreWorkspaceSelection(identity)
 		if e, ok := data["error"].(string); ok {
 			m.dialog.Error = e
 		}
@@ -179,7 +267,22 @@ func (m *Model) workspaceResult(result protocol.CommandResult) (tea.Cmd, bool) {
 		}
 		m.dialog.Index = min(m.dialog.Index, max(0, len(m.dialog.Rows)-1))
 		return nil, true
-	case "mcp.update", "notifications.preferences", "settings.update", "providers.connect", "providers.disconnect", "models.toggle", "providers.test", "attachments.add", "attachments.remove", "scan.new", "scan.resume":
+	case "providers.connect", "providers.disconnect":
+		if m.modal != modalWorkspace {
+			return m.showToast("Provider connections updated"), true
+		}
+		m.dialog = workspaceDialog{Kind: "providers", Title: "Providers", Command: "providers.list", Payload: map[string]any{}}
+		m.dialog.Error = ""
+		return tea.Batch(m.showToast("Provider connections updated"), send(m.client, "providers.list", map[string]any{})), true
+	case "models.toggle":
+		if m.modal != modalWorkspace {
+			return m.showToast("Model availability updated"), true
+		}
+		m.dialog.Kind = "models"
+		m.dialog.Title = "Models"
+		m.dialog.Error = ""
+		return tea.Batch(m.showToast("Model availability updated"), send(m.client, "models.list", map[string]any{})), true
+	case "mcp.update", "notifications.preferences", "settings.update", "providers.test", "attachments.add", "attachments.remove", "scan.new", "scan.resume":
 		m.closeModal()
 		return m.showToast("Updated successfully"), true
 	case "update.start", "doctor.run":
@@ -234,8 +337,9 @@ func (m Model) workspaceView() string {
 	} else {
 		lines = append(lines, "Search: "+m.dialog.Filter)
 		rows := m.filteredWorkspaceRows()
-		start := max(0, m.dialog.Index-height+4)
-		for i := start; i < min(len(rows), start+max(1, height-5)); i++ {
+		slots := max(1, height-5)
+		start := max(0, m.dialog.Index-slots+1)
+		for i := start; i < min(len(rows), start+slots); i++ {
 			marker := "  "
 			if i == m.dialog.Index {
 				marker = "› "
@@ -253,7 +357,14 @@ func (m Model) workspaceView() string {
 			row := rows[min(m.dialog.Index, len(rows)-1)]
 			lines = append(lines, "", fmt.Sprint(row["detail"]), "Ctrl+R read · Ctrl+D dismiss · Ctrl+A action · Ctrl+X clear read")
 		}
-		lines = append(lines, "", "↑↓ select · Enter open · type to filter · Esc back")
+		footer := "↑↓ select · Enter open · type to filter · Esc back"
+		switch m.dialog.Kind {
+		case "providers":
+			footer = "↑↓ select · Enter connect/open models · Ctrl+D disconnect · type to filter · Esc back"
+		case "models":
+			footer = "↑↓ select · Enter refresh/toggle · type to filter · Esc back"
+		}
+		lines = append(lines, "", footer)
 	}
 	if m.dialog.Error != "" {
 		lines = append(lines, lipgloss.NewStyle().Foreground(red).Render(m.dialog.Error))
@@ -355,6 +466,14 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, send(m.client, "notifications.manage", map[string]any{"operation": operation, "id": rows[m.dialog.Index]["id"]})
 		}
+		if key.String() == "ctrl+d" && m.dialog.Kind == "providers" && len(rows) > 0 {
+			row := rows[min(m.dialog.Index, len(rows)-1)]
+			if fmt.Sprint(row["_kind"]) != "connection" {
+				m.dialog.Error = "Select a connected provider to disconnect it"
+				return m, nil
+			}
+			return m, send(m.client, "providers.disconnect", map[string]any{"connection_id": row["id"]})
+		}
 		m.dialog.Filter += key.String()
 		m.dialog.Index = 0
 	case "enter":
@@ -379,7 +498,14 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.openForm(rowLabel(row)+" · "+fmt.Sprint(row["source"])+" · "+fmt.Sprint(row["apply"]), "settings.update", map[string]any{"id": row["id"]}, inputField("value", rowLabel(row), kind, row["value"]))
 		case "providers":
-			fields := []formField{inputField("name", "Connection name", "text", row["id"])}
+			if fmt.Sprint(row["_kind"]) == "connection" {
+				m.dialog = workspaceDialog{Kind: "models", Title: "Models", Command: "models.discover", Payload: map[string]any{"connection_id": row["id"]}}
+				return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"]})
+			}
+			providerID := fmt.Sprint(row["id"])
+			fields := []formField{
+				inputField("name", "Display name", "text", rowLabel(row)),
+			}
 			if methods, ok := row["auth_methods"].([]any); ok && len(methods) > 0 {
 				fields = append(fields, inputField("auth_method", "Authentication method", "text", methods[0]))
 			}
@@ -394,11 +520,11 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
-			m.openForm("Connect "+rowLabel(row), "providers.connect", map[string]any{"provider_id": row["id"]}, fields...)
-		case "model_connections":
-			m.dialog = workspaceDialog{Kind: "models", Title: "Models · " + rowLabel(row), Command: "models.discover", Payload: map[string]any{"connection_id": row["id"]}}
-			return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"]})
+			m.openForm("Connect "+rowLabel(row), "providers.connect", map[string]any{"provider_id": providerID}, fields...)
 		case "models":
+			if fmt.Sprint(row["_kind"]) == "connection" {
+				return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"], "refresh": true})
+			}
 			enabled, _ := row["enabled"].(bool)
 			return m, send(m.client, "models.toggle", map[string]any{"model_id": row["id"], "enabled": !enabled})
 		case "sessions":

@@ -111,7 +111,14 @@ def quality_tier(provider_id: str, adapter_id: str, model_id: str) -> str:
     models = load_policy().get("models", {})
     if not isinstance(models, dict):
         return "unknown"
-    for key in (f"{provider_id}/{model_id}", f"{adapter_id}/{model_id}"):
+    keys = [f"{provider_id}/{model_id}", f"{adapter_id}/{model_id}"]
+    # OpenAI-compatible gateways commonly return an already provider-qualified
+    # model ID (for example ``openai/gpt-5.4``).  Prefixing it with the custom
+    # adapter hid an otherwise exact signed-policy match and reduced every
+    # gateway model to the same ``unknown`` tier.
+    if "/" in model_id:
+        keys.append(model_id)
+    for key in dict.fromkeys(keys):
         entry = models.get(key)
         if isinstance(entry, dict) and entry.get("quality_tier") in {
             "frontier",

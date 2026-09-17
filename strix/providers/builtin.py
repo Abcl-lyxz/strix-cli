@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -37,7 +37,12 @@ def _endpoint(value: str) -> str:
         raise ValueError("Endpoint must be an absolute HTTP or HTTPS URL")
     if parts.username or parts.password or parts.query or parts.fragment:
         raise ValueError("Endpoint cannot contain credentials, a query string, or a fragment")
-    return value.strip().rstrip("/")
+    path = parts.path.rstrip("/")
+    for suffix in ("/chat/completions", "/responses", "/completions"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
 
 
 def _positive_int(value: Any) -> int | None:
@@ -83,7 +88,15 @@ class BuiltinProviderAdapter:
         return found
 
     def connect(self, payload: dict[str, Any]) -> ConnectionProfile:
-        connection_id = str(payload.get("connection_id") or self.spec.id).strip()
+        service = get_config_service()
+        requested_id = str(payload.get("connection_id") or "").strip()
+        connection_id = requested_id or self.spec.id
+        if not requested_id:
+            existing = service.load().connections
+            suffix = 2
+            while connection_id in existing:
+                connection_id = f"{self.spec.id}-{suffix}"
+                suffix += 1
         name = str(payload.get("name") or self.spec.name).strip()
         auth_method = str(payload.get("auth_method") or self.spec.auth_methods[0])
         detected_env = next(
@@ -129,7 +142,7 @@ class BuiltinProviderAdapter:
             auth_source=cast("Any", auth_source),
             options=options,
         )
-        return get_config_service().upsert_connection(
+        return service.upsert_connection(
             profile, secret=api_key if auth_method == "api_key" else None
         )
 

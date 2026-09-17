@@ -192,6 +192,11 @@ class ConfigService:
         store = get_secret_store()
         current = self.load()
         previous = current.connections.get(profile.id)
+        if previous is not None and previous.provider_id != profile.provider_id:
+            raise ValueError(
+                f"Connection ID {profile.id!r} already belongs to provider "
+                f"{previous.provider_id!r}; choose a different connection ID"
+            )
         new_ref = profile.secret_ref
         if secret is not None:
             new_ref = f"v3.connection.{profile.id}.r{(previous.revision + 1) if previous else 1}"
@@ -199,6 +204,12 @@ class ConfigService:
         revision = (previous.revision + 1) if previous else max(1, profile.revision)
         updated = profile.model_copy(update={"secret_ref": new_ref, "revision": revision})
         current.connections[updated.id] = updated
+        if previous is not None and previous.options != updated.options:
+            current.models = {
+                key: value
+                for key, value in current.models.items()
+                if value.connection_id != updated.id
+            }
         try:
             self.save(current)
         except Exception:

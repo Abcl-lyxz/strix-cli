@@ -34,8 +34,8 @@ func TestSlashModelsOpensProviderModelWorkspace(t *testing.T) {
 		t.Fatal("models command was not handled")
 	}
 	envelope := commandFromCmd(t, cmd, connection)
-	if envelope.Type != "providers.list" {
-		t.Fatalf("command type = %q, want providers.list", envelope.Type)
+	if envelope.Type != "models.list" {
+		t.Fatalf("command type = %q, want models.list", envelope.Type)
 	}
 }
 

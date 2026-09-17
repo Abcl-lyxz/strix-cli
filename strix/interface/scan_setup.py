@@ -28,6 +28,8 @@ from strix.interface.targets import (
     stage_api_specs,
     write_fetched_collection,
 )
+from strix.llm.context_budget import context_window, output_limit
+from strix.providers.base import CapabilityVerification
 from strix.utils.api_spec import (
     SpecParseError,
     fetch_postman_collection,
@@ -40,6 +42,7 @@ from strix.utils.api_spec import (
 
 if TYPE_CHECKING:
     from strix.domain.app_state import LaunchState
+    from strix.domain.routes import RouteConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,9 @@ async def preflight_model_connection(  # noqa: PLR0915
     settings: Settings | None = None,
     selected_routes: list[str] | None = None,
     check_tools: bool = False,
-) -> None:
+    routes_override: list[RouteConfig] | None = None,
+    allow_unverified: bool = False,
+) -> CapabilityVerification:
     """Verify the configured model route using the run's real transport mode."""
     from agents.model_settings import ModelSettings
     from agents.models.interface import ModelTracing
@@ -74,7 +79,7 @@ async def preflight_model_connection(  # noqa: PLR0915
     app_config = get_config_service().load()
     route_pool = None
     del selected_routes
-    routes = load_app_routes()
+    routes = list(routes_override) if routes_override is not None else load_app_routes()
     matching = [route for route in routes if not model_name or route.model == model_name]
     if matching:
         policy = app_config.router
@@ -86,7 +91,7 @@ async def preflight_model_connection(  # noqa: PLR0915
             max_attempts_per_turn=policy.max_attempts_per_turn,
             max_consecutive_failed_turns=policy.max_consecutive_failed_turns,
             max_retry_input_multiplier=policy.max_retry_input_multiplier,
-            allow_unknown_capabilities=policy.allow_unknown_capabilities,
+            allow_unknown_capabilities=(policy.allow_unknown_capabilities or allow_unverified),
         )
     if route_pool is None:
         raise ValueError("No eligible model configured. Use /connect, then /models.")
@@ -174,6 +179,14 @@ async def preflight_model_connection(  # noqa: PLR0915
     finally:
         if route_pool is not None:
             await route_pool.close()
+    route = matching[0]
+    return CapabilityVerification(
+        supports_tools=True if check_tools else route.supports_tools,
+        supports_vision=route.supports_vision,
+        context_window_tokens=(route.context_window_tokens or context_window(route.model)),
+        max_output_tokens=route.max_output_tokens or output_limit(route.model),
+        source="live-tool-preflight" if check_tools else "live-connectivity-preflight",
+    )
 
 
 def build_targets_info(args: LaunchState) -> None:

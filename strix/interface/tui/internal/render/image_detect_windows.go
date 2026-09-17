@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+func terminalCapabilityQueriesSupported() bool { return false }
+
 // waitReadable has no console equivalent worth carrying: no Windows terminal
 // implements the kitty graphics protocol, so detection reports no support rather
 // than blocking on a reply that never comes.
