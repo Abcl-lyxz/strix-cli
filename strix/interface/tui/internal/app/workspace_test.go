@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/usestrix/strix/tui/internal/protocol"
 )
 
@@ -27,6 +29,25 @@ func TestWorkspaceSelectionRemainsVisibleAcrossPageBoundary(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("selection %d is outside the rendered window:\n%s", index, view)
 		}
+	}
+}
+
+func TestWorkspaceSelectionUsesSubtleRowHighlight(t *testing.T) {
+	profile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(profile)
+
+	model := inputModel(t)
+	model.width, model.height = 100, 20
+	model.modal = modalWorkspace
+	model.dialog = workspaceDialog{Kind: "models", Title: "Models", Rows: []map[string]any{{"label": "model-a"}}}
+
+	view := model.workspaceView()
+	if !strings.Contains(view, "\x1b[48;2;") {
+		t.Fatalf("selected row has no background highlight: %q", view)
+	}
+	if !strings.Contains(ansi.Strip(view), "› model-a") {
+		t.Fatalf("selected row marker is missing:\n%s", ansi.Strip(view))
 	}
 }
 
@@ -93,7 +114,7 @@ func TestProviderPickerKeepsConnectionsAndUsesProviderNativeForm(t *testing.T) {
 	}
 }
 
-func TestConnectedProviderOpensItsModels(t *testing.T) {
+func TestConnectedProviderOpensActionMenuThenItsModels(t *testing.T) {
 	connection := &recordingConn{}
 	model := inputModel(t)
 	model.client = newClient(connection)
@@ -102,7 +123,13 @@ func TestConnectedProviderOpensItsModels(t *testing.T) {
 		"_kind": "connection", "id": "gateway", "name": "Gateway",
 	}}}
 
-	_, command := model.updateWorkspace(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, command := model.updateWorkspace(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if command != nil || model.dialog.Kind != "provider_actions" || len(model.dialog.Rows) != 3 {
+		t.Fatalf("provider action menu did not open: %#v", model.dialog)
+	}
+
+	_, command = model.updateWorkspace(tea.KeyMsg{Type: tea.KeyEnter})
 	envelope := commandFromCmd(t, command, connection)
 	var payload map[string]any
 	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
@@ -110,6 +137,46 @@ func TestConnectedProviderOpensItsModels(t *testing.T) {
 	}
 	if envelope.Type != "models.discover" || payload["connection_id"] != "gateway" {
 		t.Fatalf("wrong model discovery: %#v", payload)
+	}
+}
+
+func TestProviderDisconnectIsAVisibleActionAndControlChordNeverPollutesSearch(t *testing.T) {
+	connection := &recordingConn{}
+	model := inputModel(t)
+	model.client = newClient(connection)
+	model.modal = modalWorkspace
+	model.dialog = workspaceDialog{Kind: "providers", Rows: []map[string]any{{
+		"_kind": "connection", "id": "gateway", "name": "Gateway",
+	}}}
+
+	updated, command := model.updateWorkspace(tea.KeyMsg{Type: tea.KeyCtrlD})
+	model = updated.(Model)
+	if command != nil || model.dialog.Kind != "provider_actions" || model.dialog.Index != 2 {
+		t.Fatalf("Ctrl+D did not open the visible disconnect action: %#v", model.dialog)
+	}
+	if model.dialog.Filter != "" {
+		t.Fatalf("control chord leaked into search: %q", model.dialog.Filter)
+	}
+
+	_, command = model.updateWorkspace(tea.KeyMsg{Type: tea.KeyEnter})
+	envelope := commandFromCmd(t, command, connection)
+	var payload map[string]any
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Type != "providers.disconnect" || payload["connection_id"] != "gateway" {
+		t.Fatalf("wrong disconnect command: %#v", payload)
+	}
+}
+
+func TestComposerFooterKeepsBorderConnectedAndColorsOnlyTheHintAsText(t *testing.T) {
+	footer := composerFooter(72, green)
+	plain := ansi.Strip(footer)
+	if ansi.StringWidth(plain) != 72 || !strings.HasPrefix(plain, "╰─ ") || !strings.HasSuffix(plain, "╯") {
+		t.Fatalf("composer footer is not a complete 72-cell border: %q", plain)
+	}
+	if !strings.Contains(plain, "[Ctrl+S Send]") || !strings.Contains(plain, "──╯") {
+		t.Fatalf("composer footer lost its hint or closing rule: %q", plain)
 	}
 }
 

@@ -172,7 +172,7 @@ class BuiltinProviderAdapter:
             entries = self._discover_openai(endpoint, credential)
         elif self.spec.model_discovery == "gemini" and endpoint:
             entries = self._discover_gemini(endpoint, credential)
-        if not entries:
+        elif self.spec.model_discovery == "catalog":
             entries = adapter_models(self.spec.adapter_id)
 
         result = [self._descriptor(connection, entry) for entry in entries]

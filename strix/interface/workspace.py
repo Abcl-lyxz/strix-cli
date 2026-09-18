@@ -178,11 +178,18 @@ class WorkspaceCommands:
                 )
                 if models:
                     config = get_config_service().upsert_models(models)
+            visible_connections = list(config.connections.values())
+            visible_models = list(config.models.values())
+            if connection_id:
+                visible_connections = [
+                    item for item in visible_connections if item.id == connection_id
+                ]
+                visible_models = [
+                    item for item in visible_models if item.connection_id == connection_id
+                ]
             return {
-                "connections": [
-                    item.model_dump(mode="json") for item in config.connections.values()
-                ],
-                "models": [item.model_dump(mode="json") for item in config.models.values()],
+                "connections": [item.model_dump(mode="json") for item in visible_connections],
+                "models": [item.model_dump(mode="json") for item in visible_models],
             }
         if command == "models.toggle":
             model_id = str(payload.get("model_id") or "")

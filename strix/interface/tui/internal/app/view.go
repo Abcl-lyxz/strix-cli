@@ -493,6 +493,24 @@ func (m Model) renderChatPane(width, height int, border lipgloss.Color) string {
 	return out
 }
 
+func composerFooter(width int, border lipgloss.Color) string {
+	if width <= 0 {
+		return ""
+	}
+	borderStyle := lipgloss.NewStyle().Foreground(border).Background(black)
+	if width == 1 {
+		return borderStyle.Render("╰")
+	}
+	prefix, corner := "╰─ ", "╯"
+	label := "[Ctrl+S Send] · Enter newline · Ctrl+E expand"
+	available := max(0, width-ansi.StringWidth(prefix)-ansi.StringWidth(corner))
+	label = ansi.Truncate(label, available, "")
+	filler := strings.Repeat("─", max(0, available-ansi.StringWidth(label)))
+	return borderStyle.Render(prefix) +
+		lipgloss.NewStyle().Foreground(textColor).Background(black).Render(label) +
+		borderStyle.Render(filler+corner)
+}
+
 func (m Model) mainView() string {
 	showSidebar, sidebarWidth, chatWidth, chatHeight := m.layout()
 	// Matches tui_styles.tcss: #chat_history border is near-black when idle and
@@ -524,7 +542,7 @@ func (m Model) mainView() string {
 	inputLines := strings.Split(input, "\n")
 	if len(inputLines) > 0 {
 		i := len(inputLines) - 1
-		inputLines[i] = truncate("╰─ [Ctrl+S Send] · Enter newline · Ctrl+E expand", chatWidth)
+		inputLines[i] = composerFooter(chatWidth, inputBorder)
 		input = strings.Join(inputLines, "\n")
 	}
 	leftParts = append(leftParts, input)

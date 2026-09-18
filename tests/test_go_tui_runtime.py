@@ -56,6 +56,13 @@ def args() -> LaunchState:
     )
 
 
+@pytest.fixture(autouse=True)
+def _available_runtime_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runtime lifecycle tests opt into Docker failures explicitly."""
+
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", lambda: None)
+
+
 def test_binary_command_prefers_packaged_sidecar(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -1126,6 +1133,7 @@ async def test_prepare_and_start_reports_ordinary_connection_failures(
 ) -> None:
     runtime = GoTuiRuntime(_direct_launch_args())
     monkeypatch.setattr(runtime, "_configured_model", lambda: "openai/test")
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", lambda: None)
     started: list[str] = []
 
     async def preflight(_model: str, **_options: Any) -> None:
@@ -1153,6 +1161,7 @@ async def test_prepare_and_start_runs_the_scan_after_preparation(
     async def preflight(_model: str, **_options: Any) -> None:
         order.append("preflight")
 
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", lambda: order.append("runtime"))
     monkeypatch.setattr(go_tui, "preflight_model_connection", preflight)
     monkeypatch.setattr(go_tui, "prepare_run", lambda _args: order.append("prepare"))
     monkeypatch.setattr(runtime, "init_run_state", lambda: order.append("state"))
@@ -1160,8 +1169,80 @@ async def test_prepare_and_start_runs_the_scan_after_preparation(
 
     await runtime.prepare_and_start()
 
-    assert order == ["preflight", "prepare", "state", "scan"]
+    assert order == ["runtime", "preflight", "prepare", "state", "scan"]
     assert runtime.controller.scan_state == "running"
+
+
+@pytest.mark.asyncio
+async def test_prepare_and_start_reports_missing_docker_before_model_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(_direct_launch_args())
+    started: list[str] = []
+
+    def unavailable() -> None:
+        raise RuntimeError(
+            "Docker is not running or cannot be reached. "
+            "Start Docker Desktop, then use /start again."
+        )
+
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", unavailable)
+    monkeypatch.setattr(
+        runtime,
+        "_configured_model",
+        lambda: pytest.fail("model preflight ran after runtime failure"),
+    )
+    monkeypatch.setattr(runtime, "start_scan", lambda: started.append("scan"))
+
+    await runtime.prepare_and_start()
+
+    assert started == []
+    assert runtime.controller.scan_state == "failed"
+    assert "Start Docker Desktop" in (runtime.controller.error or "")
+
+
+@pytest.mark.asyncio
+async def test_setup_start_checks_docker_before_model_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(args())
+
+    def unavailable() -> None:
+        raise RuntimeError("Start Docker Desktop before starting a scan")
+
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", unavailable)
+    monkeypatch.setattr(
+        runtime,
+        "_connection_signature",
+        lambda: pytest.fail("model verification started before Docker preflight"),
+    )
+
+    with pytest.raises(RuntimeError, match="Start Docker Desktop"):
+        await runtime.ensure_model_verified()
+
+
+@pytest.mark.asyncio
+async def test_start_from_setup_checks_docker_before_creating_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GoTuiRuntime(args())
+    runtime.controller.targets = ["https://example.invalid"]
+
+    def unavailable() -> None:
+        raise RuntimeError("Start Docker Desktop before starting a scan")
+
+    monkeypatch.setattr(go_tui, "preflight_runtime_backend", unavailable)
+    monkeypatch.setattr(
+        go_tui,
+        "prepare_run",
+        lambda _candidate: pytest.fail("run preparation happened before Docker preflight"),
+    )
+
+    with pytest.raises(RuntimeError, match="Start Docker Desktop"):
+        await runtime.start_from_setup()
+
+    assert runtime.scan_task is None
+    assert runtime.report_state is None
 
 
 def test_sync_fingerprint_tracks_report_revisions(tmp_path: Path) -> None:

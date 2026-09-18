@@ -14,6 +14,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from docker.errors import DockerException
+
 from strix.bootstrap import create_scan_context
 from strix.config import load_settings
 from strix.config.app_config import get_config_service
@@ -25,6 +27,10 @@ from strix.core.ownership import RunLease, run_is_active
 from strix.core.paths import run_dir_for, runs_base_dir, runtime_state_dir
 from strix.core.runner import run_strix_scan
 from strix.interface.application import ApplicationController
+from strix.interface.docker_runtime import (
+    docker_unavailable_message,
+    verify_docker_connection,
+)
 from strix.interface.output import WorkspaceOutput
 from strix.interface.scan_setup import (
     build_targets_info,
@@ -67,6 +73,12 @@ _QUALITY_RANK = {"frontier": 0, "strong": 1, "standard": 2, "economy": 3, "unkno
 
 def _route_quality_key(route: Any) -> tuple[int, str]:
     return _QUALITY_RANK.get(route.quality_tier, _QUALITY_RANK["unknown"]), route.name
+
+
+def preflight_runtime_backend() -> None:
+    settings = load_settings()
+    if settings.runtime.backend == "docker":
+        verify_docker_connection()
 
 
 def _print_compile_notice(stream: Any) -> None:
@@ -271,6 +283,7 @@ class WorkspaceRuntime:
 
     async def ensure_model_verified(self) -> None:
         """Hold a setup launch until the model has answered once."""
+        await asyncio.to_thread(preflight_runtime_backend)
         preflight = self._setup_preflight
         if preflight is not None and not preflight.done():
             await asyncio.shield(preflight)
@@ -385,6 +398,10 @@ class WorkspaceRuntime:
         return asyncio.create_task(self.prepare_and_start())
 
     async def start_from_setup(self) -> None:
+        # The setup screen can verify a model while Docker is stopped. Check the
+        # sandbox only when the user commits to /start, before creating a run or
+        # spending another model request.
+        await asyncio.to_thread(preflight_runtime_backend)
         candidate = deepcopy(self.args)
         candidate.scan_mode = self.controller.scan_mode
         candidate.instruction = self.controller.instruction
@@ -429,8 +446,15 @@ class WorkspaceRuntime:
         The model round trip and run preparation run here rather than before
         launch so the interface appears immediately.
         """
-        model = self._configured_model()
         set_scan_phase("preflight")
+        try:
+            await asyncio.to_thread(preflight_runtime_backend)
+        except Exception as exc:
+            logger.exception("Go TUI runtime preparation failed")
+            report_error("runtime_unavailable", exc)
+            self.controller.fail_preparation(str(exc))
+            return
+        model = self._configured_model()
         try:
             await preflight_model_connection(
                 model,
@@ -491,8 +515,11 @@ class WorkspaceRuntime:
             report_error("unhandled_exception", exc)
             if self.report_state is not None and self.report_state.scan_ended_exit_reason is None:
                 self.report_state.scan_ended_exit_reason = "error"
-            self.scan_error = exc
-            self.controller.error = str(exc)
+            user_error: Exception = exc
+            if isinstance(exc, DockerException):
+                user_error = RuntimeError(docker_unavailable_message())
+            self.scan_error = user_error
+            self.controller.error = str(user_error)
             self.controller.scan_state = "failed"
         finally:
             if self.run_lease is not None:

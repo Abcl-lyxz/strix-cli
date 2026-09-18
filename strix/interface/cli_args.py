@@ -25,7 +25,7 @@ def get_version() -> str:
     try:
         return version("strix-agent")
     except PackageNotFoundError:
-        return "2.0.1"
+        return "2.0.2"
 
 
 def _parser() -> argparse.ArgumentParser:

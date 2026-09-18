@@ -101,3 +101,22 @@ def test_registry_rejects_incompatible_plugin_api() -> None:
     adapter.api_version = 1
     with pytest.raises(ValueError, match="api_version must be 2"):
         ProviderRegistry(load_plugins=False).register(adapter)  # type: ignore[arg-type]
+
+
+def test_live_provider_with_empty_catalog_does_not_inherit_adapter_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ProviderRegistry(load_plugins=False).adapter("custom")
+    connection = adapter.connect(
+        {
+            "base_url": "https://gateway.invalid/v1",
+            "api_key": "fixture-key",
+        }
+    )
+    monkeypatch.setattr(type(adapter), "_discover_openai", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "strix.providers.builtin.adapter_models",
+        lambda _adapter_id: pytest.fail("live discovery must not use adapter-wide models"),
+    )
+
+    assert adapter.discover_models(connection, refresh=True) == []

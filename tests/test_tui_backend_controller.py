@@ -196,6 +196,33 @@ async def test_tui_can_persist_model_credentials_without_exposing_the_key() -> N
 
 
 @pytest.mark.asyncio
+async def test_models_list_scopes_rows_to_the_selected_connection() -> None:
+    service = get_config_service()
+    config = service.load()
+    for connection_id, provider_id in (("first", "custom"), ("second", "openrouter")):
+        config.connections[connection_id] = ConnectionProfile(
+            id=connection_id,
+            provider_id=provider_id,
+            name=connection_id.title(),
+            auth_source="none",
+        )
+        config.models[f"{connection_id}:model"] = ModelDescriptor(
+            id=f"{connection_id}:model",
+            provider_id=provider_id,
+            connection_id=connection_id,
+            model_id=f"{connection_id}-model",
+            adapter_id="openai",
+        )
+    service.save(config)
+    controller = ApplicationController(args())
+
+    result = await controller.handle("models.list", {"connection_id": "second"})
+
+    assert [item["id"] for item in result["connections"]] == ["second"]
+    assert [item["id"] for item in result["models"]] == ["second:model"]
+
+
+@pytest.mark.asyncio
 async def test_enabling_unknown_model_uses_live_probe_and_conservative_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

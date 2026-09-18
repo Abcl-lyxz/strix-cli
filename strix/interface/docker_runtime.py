@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import platform
 import sys
 from typing import Any
 
@@ -13,6 +15,33 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strix.telemetry import report_error
+
+
+def docker_unavailable_message() -> str:
+    if platform.system() == "Windows":
+        return (
+            "Docker is not running or cannot be reached. Start Docker Desktop, wait until "
+            "`docker version` succeeds, then use /start again. Use /doctor for details."
+        )
+    return (
+        "Docker is not running or cannot be reached. Start Docker Engine, verify "
+        "`docker version`, then use /start again. Use /doctor for details."
+    )
+
+
+def verify_docker_connection() -> None:
+    """Fail before scan creation when the local Docker daemon is unavailable."""
+
+    client: Any | None = None
+    try:
+        client = docker.from_env()
+        client.ping()
+    except DockerException as exc:
+        raise RuntimeError(docker_unavailable_message()) from exc
+    finally:
+        if client is not None:
+            with contextlib.suppress(DockerException):
+                client.close()
 
 
 def check_docker_connection() -> Any:

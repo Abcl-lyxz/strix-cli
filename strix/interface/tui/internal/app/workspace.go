@@ -31,6 +31,8 @@ type editorResult struct {
 	Err  error
 }
 
+var workspaceSelectionBackground = lipgloss.Color("#17231b")
+
 func (m Model) sendComposer() (tea.Model, tea.Cmd) {
 	value := m.input.Value()
 	if strings.TrimSpace(value) == "" {
@@ -164,6 +166,24 @@ func modelWorkspaceRows(data map[string]any) []map[string]any {
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+func providerActionsDialog(row map[string]any) workspaceDialog {
+	connectionID := fmt.Sprint(row["id"])
+	name := fmt.Sprint(row["name"])
+	if name == "" || name == "<nil>" {
+		name = connectionID
+	}
+	return workspaceDialog{
+		Kind:  "provider_actions",
+		Title: name,
+		Rows: []map[string]any{
+			{"id": "models", "label": "Manage models"},
+			{"id": "refresh", "label": "Refresh model catalog"},
+			{"id": "disconnect", "label": "Disconnect provider"},
+		},
+		Payload: map[string]any{"connection_id": connectionID},
+	}
 }
 
 func workspaceRowIdentity(row map[string]any) string {
@@ -348,7 +368,15 @@ func (m Model) workspaceView() string {
 			if section, ok := rows[i]["section"].(string); ok {
 				label = section + " / " + label
 			}
-			lines = append(lines, marker+label)
+			line := marker + label
+			if i == m.dialog.Index {
+				line = lipgloss.NewStyle().
+					Width(max(1, width-4)).
+					Foreground(brightWhite).
+					Background(workspaceSelectionBackground).
+					Render(line)
+			}
+			lines = append(lines, line)
 		}
 		if len(rows) == 0 {
 			lines = append(lines, "No items. Press Esc to return.")
@@ -360,7 +388,9 @@ func (m Model) workspaceView() string {
 		footer := "↑↓ select · Enter open · type to filter · Esc back"
 		switch m.dialog.Kind {
 		case "providers":
-			footer = "↑↓ select · Enter connect/open models · Ctrl+D disconnect · type to filter · Esc back"
+			footer = "↑↓ select · Enter manage/connect · type to filter · Esc back"
+		case "provider_actions":
+			footer = "↑↓ select · Enter apply · Esc providers"
 		case "models":
 			footer = "↑↓ select · Enter refresh/toggle · type to filter · Esc back"
 		}
@@ -375,6 +405,10 @@ func (m Model) workspaceView() string {
 
 func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.String() == "esc" {
+		if m.dialog.Kind == "provider_actions" {
+			m.dialog = workspaceDialog{Kind: "providers", Title: "Providers", Command: "providers.list", Payload: map[string]any{}}
+			return m, send(m.client, "providers.list", map[string]any{})
+		}
 		if m.dialog.Kind == "models" && len(m.dialog.Fields) > 0 {
 			m.dialog.Kind = "form"
 			m.dialog.Index = 0
@@ -472,10 +506,14 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.dialog.Error = "Select a connected provider to disconnect it"
 				return m, nil
 			}
-			return m, send(m.client, "providers.disconnect", map[string]any{"connection_id": row["id"]})
+			m.dialog = providerActionsDialog(row)
+			m.dialog.Index = 2
+			return m, nil
 		}
-		m.dialog.Filter += key.String()
-		m.dialog.Index = 0
+		// Control chords are actions, never filter text. Ignoring an action that
+		// does not apply prevents strings such as "ctrl+d" from leaking into the
+		// search box on terminals that report the chord but not its key release.
+		return m, nil
 	case "enter":
 		if len(rows) == 0 {
 			return m, nil
@@ -499,8 +537,8 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openForm(rowLabel(row)+" · "+fmt.Sprint(row["source"])+" · "+fmt.Sprint(row["apply"]), "settings.update", map[string]any{"id": row["id"]}, inputField("value", rowLabel(row), kind, row["value"]))
 		case "providers":
 			if fmt.Sprint(row["_kind"]) == "connection" {
-				m.dialog = workspaceDialog{Kind: "models", Title: "Models", Command: "models.discover", Payload: map[string]any{"connection_id": row["id"]}}
-				return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"]})
+				m.dialog = providerActionsDialog(row)
+				return m, nil
 			}
 			providerID := fmt.Sprint(row["id"])
 			fields := []formField{
@@ -521,6 +559,16 @@ func (m Model) updateWorkspace(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.openForm("Connect "+rowLabel(row), "providers.connect", map[string]any{"provider_id": providerID}, fields...)
+		case "provider_actions":
+			connectionID := fmt.Sprint(m.dialog.Payload["connection_id"])
+			switch fmt.Sprint(row["id"]) {
+			case "models", "refresh":
+				refresh := fmt.Sprint(row["id"]) == "refresh"
+				m.dialog = workspaceDialog{Kind: "models", Title: "Models", Command: "models.discover", Payload: map[string]any{"connection_id": connectionID}}
+				return m, send(m.client, "models.discover", map[string]any{"connection_id": connectionID, "refresh": refresh})
+			case "disconnect":
+				return m, send(m.client, "providers.disconnect", map[string]any{"connection_id": connectionID})
+			}
 		case "models":
 			if fmt.Sprint(row["_kind"]) == "connection" {
 				return m, send(m.client, "models.discover", map[string]any{"connection_id": row["id"], "refresh": true})
